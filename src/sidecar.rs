@@ -37,6 +37,30 @@ pub fn load(pdf: &Path) -> anyhow::Result<Option<Sidecar>> {
     Ok(Some(serde_json::from_slice(&std::fs::read(f)?)?))
 }
 
+/// Window preferences that persist across launches.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Prefs {
+    pub show_sidebar: bool,
+    pub show_markups: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self { show_sidebar: true, show_markups: false }
+    }
+}
+
+pub fn load_prefs() -> Prefs {
+    std::fs::read(dir().join("prefs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+pub fn save_prefs(p: Prefs) {
+    let _ = std::fs::create_dir_all(dir());
+    if let Ok(b) = serde_json::to_vec(&p) {
+        let _ = std::fs::write(dir().join("prefs.json"), b);
+    }
+}
+
 /// Exclusive per-document lock so two windows can't overwrite each other's
 /// markups. `Ok(None)` means another Redline process holds it. Released when
 /// the returned file is dropped or the process exits.

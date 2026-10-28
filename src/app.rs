@@ -121,6 +121,7 @@ pub struct App {
     overview: bool,
     overview_tile: f32,
     overview_cursor: usize,
+    prefs: sidecar::Prefs,
     overview_cols: usize,
     /// Scroll the overview to the cursor on the next frame.
     overview_scroll: bool,
@@ -161,6 +162,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext, path: Option<PathBuf>) -> Self {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let prefs = sidecar::load_prefs();
         let (worker, status) = match Worker::spawn(cc.egui_ctx.clone()) {
             Ok(w) => (Some(w), String::from("Ctrl+O to open a PDF (or drop one here)")),
             Err(e) => (None, format!("PDFium failed to load: {e}")),
@@ -189,11 +191,12 @@ impl App {
             thumbs: HashMap::new(),
             req_thumb: HashSet::new(),
             thumbs_wanted: Vec::new(),
-            show_sidebar: true,
-            show_markups: false,
+            show_sidebar: prefs.show_sidebar,
+            show_markups: prefs.show_markups,
             overview: false,
             overview_tile: 240.0,
             overview_cursor: 0,
+            prefs,
             overview_cols: 1,
             overview_scroll: false,
             sidebar_synced: None,
@@ -1717,17 +1720,34 @@ impl App {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new(format!("Page {}", page + 1)).strong());
                 }
-                let first = text.lines().next().unwrap_or("").trim();
-                let label = if first.is_empty() { kind.to_string() } else { first.to_string() };
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
-                    ui.painter().rect_filled(r, 2.0, Color32::from_rgb(color[0], color[1], color[2]));
-                    let resp = ui.selectable_label(self.selected == Some(*id), { let t = egui::RichText::new(label); if first.is_empty() { t.weak() } else { t } });
-                    let resp = if text.trim().is_empty() { resp } else { resp.on_hover_text(text.as_str()) };
-                    if resp.clicked() {
-                        clicked = Some(*id);
-                    }
-                });
+                // Custom row: swatch + note wrapped to the panel width (max 4 lines).
+                let note = text.trim();
+                let (label, colour) = if note.is_empty() {
+                    (kind.to_string(), ui.visuals().weak_text_color())
+                } else {
+                    (note.replace('\n', " "), ui.visuals().text_color())
+                };
+                let width = ui.available_width();
+                let mut job = egui::text::LayoutJob::simple(label, FontId::proportional(13.0), colour, (width - 26.0).max(40.0));
+                job.wrap.max_rows = 4;
+                job.wrap.overflow_character = Some('…');
+                let galley = ui.painter().layout_job(job);
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y + 6.0), Sense::click());
+                let selected = self.selected == Some(*id);
+                if selected || resp.hovered() {
+                    let bg = if selected { ui.visuals().selection.bg_fill } else { ui.visuals().widgets.hovered.weak_bg_fill };
+                    ui.painter().rect_filled(rect, 3.0, bg);
+                }
+                if resp.has_focus() {
+                    ui.painter().rect_stroke(rect, 3.0, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+                }
+                let sw = Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(9.0, 9.0));
+                ui.painter().rect_filled(sw, 2.0, Color32::from_rgb(color[0], color[1], color[2]));
+                ui.painter().galley(rect.min + vec2(22.0, 3.0), galley, colour);
+                let resp = if note.is_empty() { resp } else { resp.on_hover_text(note) };
+                if resp.clicked() {
+                    clicked = Some(*id);
+                }
             }
             if items.is_empty() {
                 ui.weak("No markups yet.");
@@ -1850,6 +1870,11 @@ impl eframe::App for App {
         self.help(&ctx);
         self.request_renders(&ctx, now);
 
+        let prefs = sidecar::Prefs { show_sidebar: self.show_sidebar, show_markups: self.show_markups };
+        if prefs != self.prefs {
+            self.prefs = prefs;
+            sidecar::save_prefs(prefs);
+        }
         self.now = now;
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
             self.save_sidecar();
