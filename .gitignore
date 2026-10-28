@@ -1,2 +1,4 @@
 /target
 /vendor/*.so
+/vendor/*.dll
+/vendor/PDFIUM-LICENSE

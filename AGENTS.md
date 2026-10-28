@@ -2,11 +2,13 @@
 
 Lean native PDF markup app for senior review of drawings/specs/decks (Rust, egui + PDFium).
 
-- `scripts/fetch-pdfium.sh` downloads `libpdfium.so` into `vendor/` (gitignored); the binary finds it next to itself, in `vendor/`, `~/.local/lib`, or `/usr/lib`.
+- Targets Linux and Windows (1.0+). `scripts/fetch-pdfium.sh` downloads `libpdfium.so` / `pdfium.dll` (Git Bash) into `vendor/` (gitignored); the binary finds it next to itself, in `vendor/`, `~/.local/lib`, or `/usr/lib`. Cross-check Windows code locally with `cargo check --target x86_64-pc-windows-gnu`.
+- Platform specifics live behind `cfg(windows)`: font candidates (`fonts.rs`: Liberation/Noto on Linux, Arial/Segoe on Windows; the first must be Helvetica-metric), data dir (`sidecar::dir`), default author name. Paths are canonicalised with `dunce` (no `\\?\` prefixes).
+- Release: CI (`.github/workflows/build.yml`) tests on Linux + Windows and builds the Inno Setup installer (`installer/redline.iss`); a `v*` tag publishes a GitHub release. Bump `Cargo.toml` and `redline.rc` versions together. Windows builds link the CRT statically (`.cargo/config.toml`).
 - Annotations are stored in page-local *view points* (displayed page, y down). `annot::Annot::prims()` is the single geometry source for both the screen painter (`app.rs`) and the flattened export (`render.rs::export`), so keep them in sync through prims, not separate drawing code.
 - Export maps view→PDF user space with PDFium's own device↔page transform (`ViewToUser`), so /Rotate and CropBox are handled; covered by `export_lands_in_view_coordinates`.
 - Export modes (`render::ExportMode`): Flatten burns prims into page content; Editable writes one Stamp annotation per markup whose appearance is the same prims (`emit_prims` targets either). Existing PDF annotations are never flattened (PDFium's flatten resized pages and dropped comments).
 - Renders come in three layers (`render::Layer`): Base (whole page, power-of-two scale), Patch (sharp visible region after the view settles), Thumb (sidebar/overview). The worker drops queued renders for pages no longer in `Keep`.
 - PDFium is single-threaded here: everything touching it runs on the worker thread in `render.rs`.
-- Markups autosave to `~/.local/share/redline/<stem>-<fnv hash of path>.json`; the source PDF is never modified.
+- Markups autosave to `<data dir>/<stem>-<fnv hash of path>.json` (`~/.local/share/redline` or `%APPDATA%\Redline`) plus `prefs.json`; the source PDF is never modified.
 - Tests: `cargo test`. Real-file export check: `REDLINE_SAMPLE=/path.pdf cargo test --release -- --ignored --nocapture`.

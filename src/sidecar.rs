@@ -11,11 +11,19 @@ pub struct Sidecar {
     pub annots: Vec<Annot>,
 }
 
-fn dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("redline")
+/// ~/.local/share/redline on Linux, %APPDATA%\\Redline on Windows.
+pub fn dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("Redline")
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
+        base.join("redline")
+    }
 }
 
 fn file_for(pdf: &Path) -> PathBuf {
@@ -38,15 +46,18 @@ pub fn load(pdf: &Path) -> anyhow::Result<Option<Sidecar>> {
 }
 
 /// Window preferences that persist across launches.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
 pub struct Prefs {
     pub show_sidebar: bool,
     pub show_markups: bool,
+    /// Name put on editable-export comments; empty = the account name.
+    pub author: String,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { show_sidebar: true, show_markups: false }
+        Self { show_sidebar: true, show_markups: false, author: String::new() }
     }
 }
 
@@ -54,9 +65,9 @@ pub fn load_prefs() -> Prefs {
     std::fs::read(dir().join("prefs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-pub fn save_prefs(p: Prefs) {
+pub fn save_prefs(p: &Prefs) {
     let _ = std::fs::create_dir_all(dir());
-    if let Ok(b) = serde_json::to_vec(&p) {
+    if let Ok(b) = serde_json::to_vec(p) {
         let _ = std::fs::write(dir().join("prefs.json"), b);
     }
 }

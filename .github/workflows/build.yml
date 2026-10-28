@@ -1,0 +1,72 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fonts used by the export tests
+        run: sudo apt-get update -q && sudo apt-get install -yq fonts-liberation fonts-noto-core
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: scripts/fetch-pdfium.sh
+      - run: cargo test --release
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Fetch PDFium
+        shell: bash
+        run: scripts/fetch-pdfium.sh
+      - name: Test (PDFium render + export on Windows)
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:Path += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=${{ steps.ver.outputs.version }} installer\redline.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Redline-${{ steps.ver.outputs.version }}-windows
+          path: |
+            dist/*.exe
+            target/release/redline.exe
+            vendor/pdfium.dll
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Redline-*-windows
+          merge-multiple: true
+          path: artifact
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifact/dist/*.exe \
+            --title "Redline $GITHUB_REF_NAME" \
+            --notes-file docs/release-notes.md

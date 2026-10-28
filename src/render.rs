@@ -346,7 +346,7 @@ fn emit_prims<'a>(
                         Some(i) => match fonts.embedded.get(&i) {
                             Some(t) => *t,
                             None => {
-                                let t = doc.fonts_mut().load_true_type_from_file(crate::fonts::faces()[i].path, true)?;
+                                let t = doc.fonts_mut().load_true_type_from_file(&crate::fonts::faces()[i].path, true)?;
                                 fonts.embedded.insert(i, t);
                                 t
                             }

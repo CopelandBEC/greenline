@@ -122,6 +122,7 @@ pub struct App {
     overview_tile: f32,
     overview_cursor: usize,
     prefs: sidecar::Prefs,
+    prefs_dirty: bool,
     overview_cols: usize,
     /// Scroll the overview to the cursor on the next frame.
     overview_scroll: bool,
@@ -197,6 +198,7 @@ impl App {
             overview_tile: 240.0,
             overview_cursor: 0,
             prefs,
+            prefs_dirty: false,
             overview_cols: 1,
             overview_scroll: false,
             sidebar_synced: None,
@@ -236,7 +238,7 @@ impl App {
         if self.worker.is_none() {
             return;
         }
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         self.commit_edit();
         self.save_sidecar();
         if self.dirty && !self.read_only {
@@ -332,13 +334,14 @@ impl App {
             default
         };
         // Compare real paths so a symlinked folder can't alias the original.
-        let real_out = out.parent().and_then(|d| d.canonicalize().ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
-        if real_out == *src || out.canonicalize().is_ok_and(|o| o == *src) {
+        let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
+        if real_out == *src || dunce::canonicalize(&out).is_ok_and(|o| o == *src) {
             self.toast("Refusing to overwrite the original PDF".into());
             return;
         }
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
-        w.send(Req::Export { src: src.clone(), out, annots, mode, author: author() });
+        let author = if self.prefs.author.trim().is_empty() { default_author() } else { self.prefs.author.trim().to_string() };
+        w.send(Req::Export { src: src.clone(), out, annots, mode, author });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
     }
@@ -1783,7 +1786,7 @@ impl App {
             return;
         }
         let mut open = true;
-        egui::Window::new("Shortcuts").open(&mut open).resizable(false).show(ctx, |ui| {
+        egui::Window::new(format!("Redline {} — shortcuts", env!("CARGO_PKG_VERSION"))).open(&mut open).resizable(false).show(ctx, |ui| {
             egui::Grid::new("keys").striped(true).show(ui, |ui| {
                 let rows = [
                     ("C", "Callout: press on the target, drag to where the note goes (click = quick note)"),
@@ -1811,7 +1814,16 @@ impl App {
                     ui.end_row();
                 }
             });
-            ui.weak("Markups autosave as you go; the original PDF is never modified.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Your name on editable-export comments:");
+                let hint = default_author();
+                if ui.add(egui::TextEdit::singleline(&mut self.prefs.author).hint_text(hint).desired_width(180.0)).changed() {
+                    self.prefs_dirty = true;
+                }
+            });
+            ui.weak(format!("Markups autosave to {} as you go; the original PDF is never modified.", sidecar::dir().display()));
+            ui.weak(format!("Redline {}", env!("CARGO_PKG_VERSION")));
         });
         if !open {
             self.show_help = false;
@@ -1870,10 +1882,11 @@ impl eframe::App for App {
         self.help(&ctx);
         self.request_renders(&ctx, now);
 
-        let prefs = sidecar::Prefs { show_sidebar: self.show_sidebar, show_markups: self.show_markups };
-        if prefs != self.prefs {
-            self.prefs = prefs;
-            sidecar::save_prefs(prefs);
+        if (self.show_sidebar, self.show_markups) != (self.prefs.show_sidebar, self.prefs.show_markups) || self.prefs_dirty {
+            self.prefs.show_sidebar = self.show_sidebar;
+            self.prefs.show_markups = self.show_markups;
+            self.prefs_dirty = false;
+            sidecar::save_prefs(&self.prefs);
         }
         self.now = now;
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
@@ -1927,20 +1940,27 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
     }
 }
 
-/// Name stamped on editable-export comments: $REDLINE_AUTHOR, else the account's
-/// full name from /etc/passwd, else the login name.
-fn author() -> String {
+/// Default name on editable-export comments when none is set in Shortcuts:
+/// $REDLINE_AUTHOR, else the account's full name (Linux /etc/passwd), else the login name.
+fn default_author() -> String {
     if let Ok(a) = std::env::var("REDLINE_AUTHOR") {
         return a;
     }
-    let user = std::env::var("USER").unwrap_or_default();
-    std::fs::read_to_string("/etc/passwd")
-        .ok()
-        .and_then(|p| {
-            p.lines().find(|l| l.split(':').next() == Some(user.as_str())).and_then(|l| l.split(':').nth(4)).map(|g| g.split(',').next().unwrap_or("").to_string())
-        })
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or(user)
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        let user = std::env::var("USER").unwrap_or_default();
+        std::fs::read_to_string("/etc/passwd")
+            .ok()
+            .and_then(|p| {
+                p.lines().find(|l| l.split(':').next() == Some(user.as_str())).and_then(|l| l.split(':').nth(4)).map(|g| g.split(',').next().unwrap_or("").to_string())
+            })
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(user)
+    }
 }
 
 fn text_of(a: &Annot) -> &str {

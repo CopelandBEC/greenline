@@ -5,18 +5,36 @@ use skrifa::instance::{LocationRef, Size};
 use skrifa::{FontRef, MetadataProvider};
 use std::sync::OnceLock;
 
-/// In preference order. Liberation Sans is metric-compatible with Helvetica.
-const CANDIDATES: [&str; 6] = [
-    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-];
+/// In preference order. The first face is metric-compatible with Helvetica
+/// (Liberation Sans on Linux, Arial on Windows), so screen layout matches export.
+#[cfg(not(windows))]
+fn candidates() -> Vec<String> {
+    [
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+        // Debian/Ubuntu layout
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+#[cfg(windows)]
+fn candidates() -> Vec<String> {
+    let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    ["arial.ttf", "segoeui.ttf", "seguisym.ttf"].iter().map(|f| format!(r"{dir}\Fonts\{f}")).collect()
+}
 
 pub struct Face {
-    pub path: &'static str,
+    pub path: String,
     data: Vec<u8>,
 }
 
@@ -44,7 +62,7 @@ impl Face {
 pub fn faces() -> &'static [Face] {
     static FACES: OnceLock<Vec<Face>> = OnceLock::new();
     FACES.get_or_init(|| {
-        CANDIDATES.iter().filter_map(|p| std::fs::read(p).ok().map(|data| Face { path: p, data })).collect()
+        candidates().into_iter().filter_map(|path| std::fs::read(&path).ok().map(|data| Face { path, data })).collect()
     })
 }
 
