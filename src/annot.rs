@@ -269,6 +269,28 @@ impl Annot {
         (best - self.width / 2.0).max(0.0)
     }
 
+    /// Whether a marquee `r` crosses the markup: its drawn lines, text box or
+    /// highlight. Like clicking, the empty inside of a rectangle doesn't count.
+    pub fn touches(&self, r: Rect) -> bool {
+        if !self.bounds().intersects(r) {
+            return false;
+        }
+        if self.text_box().is_some_and(|b| b.intersects(r)) {
+            return true;
+        }
+        if let Kind::Highlight { rect } = &self.kind {
+            if rect.intersects(r) {
+                return true;
+            }
+        }
+        let r = r.expand(self.width / 2.0);
+        self.prims().iter().any(|prim| match prim {
+            Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
+            Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
+            Prim::Text { .. } => false,
+        })
+    }
+
     pub fn prims(&self) -> Vec<Prim> {
         let c = self.color;
         let w = self.width;
@@ -446,6 +468,31 @@ fn polyline_dist(pts: &[Pos2], closed: bool, p: Pos2) -> f32 {
     best
 }
 
+/// Liang–Barsky: does segment `a`–`b` pass through `r`?
+fn seg_hits(a: Pos2, b: Pos2, r: Rect) -> bool {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (p, q) in [(-d.x, a.x - r.min.x), (d.x, r.max.x - a.x), (-d.y, a.y - r.min.y), (d.y, r.max.y - a.y)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else if p < 0.0 {
+            t0 = t0.max(q / p);
+        } else {
+            t1 = t1.min(q / p);
+        }
+    }
+    t0 <= t1
+}
+
+fn polyline_hits(pts: &[Pos2], closed: bool, r: Rect) -> bool {
+    if pts.len() == 1 {
+        return r.contains(pts[0]);
+    }
+    pts.windows(2).any(|w| seg_hits(w[0], w[1], r)) || (closed && pts.len() > 2 && seg_hits(pts[pts.len() - 1], pts[0], r))
+}
+
 /// Ramer–Douglas–Peucker simplification for pen strokes.
 pub fn simplify(pts: &[Pos2], eps: f32) -> Vec<Pos2> {
     if pts.len() < 3 {
@@ -496,6 +543,24 @@ mod tests {
         assert_eq!(text_lines("Short", 12.0, r.width()).len(), 1);
         a.widen_for_edit();
         assert!((a.text_box().unwrap().width() - default_box_w(12.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn marquee_touches_lines_not_empty_space() {
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, kind };
+        let box_at = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), vec2(10.0, 10.0));
+        let diag = ann(Kind::Line { a: pos2(0.0, 0.0), b: pos2(100.0, 100.0) });
+        assert!(diag.touches(box_at(45.0, 45.0)));
+        assert!(!diag.touches(box_at(80.0, 5.0)), "inside the bounding box but off the line");
+        assert!(diag.touches(Rect::from_min_max(pos2(-10.0, -10.0), pos2(200.0, 200.0))), "fully enclosed");
+        let rect = ann(Kind::Rect { rect: Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0)) });
+        assert!(!rect.touches(box_at(45.0, 45.0)), "empty interior");
+        assert!(rect.touches(box_at(95.0, 45.0)), "crosses the edge");
+        let hl = ann(Kind::Highlight { rect: Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 20.0)) });
+        assert!(hl.touches(box_at(45.0, 5.0)));
+        let note = ann(Kind::Text { pos: pos2(200.0, 200.0), box_w: 100.0, text: "Check".into(), size: 12.0 });
+        assert!(note.touches(box_at(220.0, 205.0)));
+        assert!(!note.touches(box_at(0.0, 300.0)));
     }
 
     #[test]

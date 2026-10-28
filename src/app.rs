@@ -11,6 +11,8 @@ use std::path::PathBuf;
 const GAP: f32 = 12.0;
 const MAX_BASE_PX: f32 = 4096.0;
 const HIT_PX: f32 = 7.0;
+/// Selection outlines, handles and marquee.
+const SEL: Color32 = Color32::from_rgb(0, 150, 255);
 /// Thumbnail render size (physical px on the long side) and cache cap.
 const THUMB_PX: f32 = 420.0;
 const MAX_THUMBS: usize = 400;
@@ -81,8 +83,11 @@ enum Drag {
     Pan,
     Create { page: usize, start: Pos2, cur: Pos2 },
     Pen { page: usize, pts: Vec<Pos2> },
-    Move { id: u64, last: Pos2, before: Vec<Annot>, moved: bool },
+    /// Moves the selected markups on `page` together.
+    Move { page: usize, ids: Vec<u64>, last: Pos2, before: Vec<Annot>, moved: bool },
     Handle { id: u64, handle: Handle, before: Vec<Annot> },
+    /// Rubber-band selection; adds whatever it crosses on release.
+    Marquee { page: usize, start: Pos2, cur: Pos2 },
     /// Swallow the rest of a gesture (e.g. the click that committed a text edit).
     Ignore,
 }
@@ -139,7 +144,8 @@ pub struct App {
     tool_color: HashMap<Tool, usize>,
     width: f32,
     text_size: f32,
-    selected: Option<u64>,
+    /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
+    selected: Vec<u64>,
     drag: Drag,
     editing: Option<u64>,
     edit_needs_focus: bool,
@@ -168,7 +174,15 @@ impl App {
             Ok(w) => (Some(w), String::from("Ctrl+O to open a PDF (or drop one here)")),
             Err(e) => (None, format!("PDFium failed to load: {e}")),
         };
-        let mut app = Self {
+        let mut app = Self::with(worker, status, prefs);
+        if let Some(p) = path {
+            app.open(p);
+        }
+        app
+    }
+
+    fn with(worker: Option<Worker>, status: String, prefs: sidecar::Prefs) -> Self {
+        Self {
             worker,
             status,
             status_until: f64::INFINITY,
@@ -211,7 +225,7 @@ impl App {
             tool_color: HashMap::from([(Tool::Highlight, 5)]),
             width: 2.0,
             text_size: 12.0,
-            selected: None,
+            selected: Vec::new(),
             drag: Drag::None,
             editing: None,
             edit_needs_focus: false,
@@ -224,11 +238,7 @@ impl App {
             now: 0.0,
             save_retry_at: 0.0,
             failed: HashSet::new(),
-        };
-        if let Some(p) = path {
-            app.open(p);
         }
-        app
     }
 
     // -----------------------------------------------------------------------
@@ -261,7 +271,7 @@ impl App {
         self.failed.clear();
         self.undo.clear();
         self.redo.clear();
-        self.selected = None;
+        self.selected.clear();
         self.editing = None;
         self.drag = Drag::None;
         self.annots = Vec::new();
@@ -661,14 +671,14 @@ impl App {
         }
         self.editing = Some(id);
         self.edit_needs_focus = true;
-        self.selected = Some(id);
+        self.selected = vec![id];
     }
 
     fn commit_edit(&mut self) {
         if let Some(id) = self.editing.take() {
             if self.find(id).is_some_and(|a| text_of(a).trim().is_empty()) {
                 self.annots.retain(|a| a.id != id);
-                self.selected = None;
+                self.selected.retain(|&s| s != id);
             } else if let Some(a) = self.find_mut(id) {
                 a.fit_box_w();
             }
@@ -678,13 +688,34 @@ impl App {
 
     fn hit(&self, page: usize, p: Pos2) -> Option<u64> {
         let tol = HIT_PX / self.zoom;
-        // Prefer the selected one, then topmost.
-        if let Some(sel) = self.selected.and_then(|id| self.find(id)) {
-            if sel.page == page && sel.distance(p) <= tol {
-                return Some(sel.id);
-            }
+        let mut hits = self.annots.iter().rev().filter(|a| a.page == page && a.distance(p) <= tol);
+        // Prefer a selected one, then topmost.
+        hits.clone().find(|a| self.selected.contains(&a.id)).or_else(|| hits.next()).map(|a| a.id)
+    }
+
+    /// The selected markup when exactly one is selected (handles, text editing).
+    fn sole(&self) -> Option<&Annot> {
+        match self.selected[..] {
+            [id] => self.find(id),
+            _ => None,
         }
-        self.annots.iter().rev().filter(|a| a.page == page).find(|a| a.distance(p) <= tol).map(|a| a.id)
+    }
+
+    /// The most recently selected markup that still exists.
+    fn lead(&self) -> Option<&Annot> {
+        self.selected.iter().rev().find_map(|&id| self.find(id))
+    }
+
+    fn lead_text_size(&self) -> Option<f32> {
+        self.selected.iter().rev().filter_map(|&id| self.find(id)).find_map(|a| a.text_size())
+    }
+
+    fn toggle_selected(&mut self, id: u64) {
+        if self.selected.contains(&id) {
+            self.selected.retain(|&s| s != id);
+        } else {
+            self.selected.push(id);
+        }
     }
 
     fn handles(a: &Annot) -> Vec<(Handle, Pos2)> {
@@ -707,7 +738,7 @@ impl App {
     }
 
     fn hit_handle(&self, page: usize, p: Pos2) -> Option<(u64, Handle)> {
-        let a = self.selected.and_then(|id| self.find(id))?;
+        let a = self.sole()?;
         if a.page != page {
             return None;
         }
@@ -732,18 +763,31 @@ impl App {
     }
 
     fn delete_selected(&mut self) {
-        if let Some(id) = self.selected.take() {
+        if !self.selected.is_empty() {
             self.snapshot();
-            self.annots.retain(|a| a.id != id);
+            let sel = std::mem::take(&mut self.selected);
+            self.annots.retain(|a| !sel.contains(&a.id));
             self.changed();
         }
+    }
+
+    /// Applies `f` to every selected markup as one undo step.
+    fn edit_selected(&mut self, mut f: impl FnMut(&mut Annot)) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.snapshot();
+        for a in self.annots.iter_mut().filter(|a| self.selected.contains(&a.id)) {
+            f(a);
+        }
+        self.changed();
     }
 
     fn undo(&mut self) {
         self.commit_edit();
         if let Some(prev) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.annots, prev));
-            self.selected = None;
+            self.selected.clear();
             self.changed();
         }
     }
@@ -751,7 +795,7 @@ impl App {
     fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.annots, next));
-            self.selected = None;
+            self.selected.clear();
             self.changed();
         }
     }
@@ -760,35 +804,23 @@ impl App {
         self.commit_edit();
         self.tool = t;
         if t != Tool::Select {
-            self.selected = None;
+            self.selected.clear();
         }
     }
 
     fn set_color(&mut self, idx: usize) {
         self.tool_color.insert(self.tool, idx);
-        if let Some(id) = self.selected {
-            self.snapshot();
-            if let Some(a) = self.find_mut(id) {
-                a.color = COLORS[idx].0;
-            }
-            self.changed();
-        }
+        self.edit_selected(|a| a.color = COLORS[idx].0);
     }
 
     fn set_width(&mut self, w: f32) {
         self.width = w.clamp(0.5, 12.0);
-        if let Some(id) = self.selected {
-            self.snapshot();
-            let w = self.width;
-            if let Some(a) = self.find_mut(id) {
-                a.width = w;
-            }
-            self.changed();
-        }
+        let w = self.width;
+        self.edit_selected(|a| a.width = w);
     }
 
     fn step_text_size(&mut self, dir: i32) {
-        let cur = self.selected.and_then(|id| self.find(id)).and_then(|a| a.text_size()).unwrap_or(self.text_size);
+        let cur = self.lead_text_size().unwrap_or(self.text_size);
         let i = TEXT_SIZES.iter().position(|&s| s >= cur).unwrap_or(TEXT_SIZES.len() - 1) as i32;
         let next = TEXT_SIZES[(i + dir).clamp(0, TEXT_SIZES.len() as i32 - 1) as usize];
         self.set_text_size(next);
@@ -796,16 +828,12 @@ impl App {
 
     fn set_text_size(&mut self, s: f32) {
         self.text_size = s;
-        if let Some(id) = self.selected {
-            if self.find(id).and_then(|a| a.text_size()).is_some() {
-                self.snapshot();
-                if let Some(a) = self.find_mut(id) {
-                    if let Kind::Callout { size, .. } | Kind::Text { size, .. } = &mut a.kind {
-                        *size = s;
-                    }
+        if self.lead_text_size().is_some() {
+            self.edit_selected(|a| {
+                if let Kind::Callout { size, .. } | Kind::Text { size, .. } = &mut a.kind {
+                    *size = s;
                 }
-                self.changed();
-            }
+            });
         }
     }
 
@@ -838,17 +866,25 @@ impl App {
             if pressed(Key::Y) {
                 self.redo();
             }
-            if pressed(Key::D) {
-                if let Some(a) = self.selected.and_then(|id| self.find(id)).cloned() {
-                    self.snapshot();
+            if pressed(Key::D) && !self.selected.is_empty() {
+                self.snapshot();
+                let d = vec2(12.0, 12.0) / self.zoom.max(0.1);
+                let copies: Vec<Annot> = self.annots.iter().filter(|a| self.selected.contains(&a.id)).cloned().collect();
+                self.selected.clear();
+                for a in copies {
                     let id = self.next_id;
                     self.next_id += 1;
                     let mut b = Annot { id, ..a };
-                    b.translate(vec2(12.0, 12.0) / self.zoom.max(0.1));
+                    b.translate(d);
                     self.annots.push(b);
-                    self.selected = Some(id);
-                    self.changed();
+                    self.selected.push(id);
                 }
+                self.changed();
+            }
+            if pressed(Key::A) && !self.pages.is_empty() && !self.overview {
+                let page = self.current_page();
+                self.set_tool(Tool::Select);
+                self.selected = self.annots.iter().filter(|a| a.page == page).map(|a| a.id).collect();
             }
             if pressed(Key::Num0) {
                 self.fit_width();
@@ -879,7 +915,7 @@ impl App {
             if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
                 self.annots = before;
             }
-            if self.selected.is_some() { self.selected = None } else { self.set_tool(Tool::Select) }
+            if !self.selected.is_empty() { self.selected.clear() } else { self.set_tool(Tool::Select) }
         }
         for (i, k) in COLOR_KEYS.iter().enumerate() {
             if pressed(*k) {
@@ -896,7 +932,7 @@ impl App {
             self.delete_selected();
         }
         if pressed(Key::Enter) {
-            if let Some(id) = self.selected.filter(|id| self.find(*id).is_some_and(|a| a.text_size().is_some())) {
+            if let Some(id) = self.sole().filter(|a| a.text_size().is_some()).map(|a| a.id) {
                 self.snapshot();
                 self.start_edit(id);
             }
@@ -950,6 +986,8 @@ impl App {
         let (hover, scroll, zoom_delta, space, press_origin, latest) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.smooth_scroll_delta, i.zoom_delta(), i.key_down(Key::Space), i.pointer.press_origin(), i.pointer.latest_pos())
         });
+        // Ctrl or Shift adds to / toggles the selection.
+        let add = ctx.input(|i| i.modifiers.command || i.modifiers.shift);
 
         if resp.hovered() {
             if zoom_delta != 1.0 {
@@ -989,7 +1027,7 @@ impl App {
         // Primary button.
         if resp.drag_started_by(PointerButton::Primary) {
             let start = press_origin.unwrap_or_default();
-            self.begin_drag(start, space);
+            self.begin_drag(start, space, add);
         }
         if resp.dragged_by(PointerButton::Primary) {
             if let Some(p) = latest {
@@ -1004,7 +1042,7 @@ impl App {
         }
         if resp.clicked_by(PointerButton::Primary) {
             if let Some(p) = resp.interact_pointer_pos() {
-                self.click(p, resp.double_clicked());
+                self.click(p, resp.double_clicked(), add);
             }
         }
 
@@ -1028,7 +1066,7 @@ impl App {
         }
     }
 
-    fn begin_drag(&mut self, start: Pos2, space: bool) {
+    fn begin_drag(&mut self, start: Pos2, space: bool, add: bool) {
         if self.editing.is_some() {
             self.commit_edit();
             self.drag = Drag::Ignore;
@@ -1048,11 +1086,20 @@ impl App {
                 if let Some((id, handle)) = self.hit_handle(page, p) {
                     Drag::Handle { id, handle, before: self.annots.clone() }
                 } else if let Some(id) = self.hit(page, p) {
-                    self.selected = Some(id);
-                    Drag::Move { id, last: p, before: self.annots.clone(), moved: false }
+                    if !self.selected.contains(&id) {
+                        if !add {
+                            self.selected.clear();
+                        }
+                        self.selected.push(id);
+                    }
+                    // Markups selected on other pages stay put.
+                    let ids = self.annots.iter().filter(|a| a.page == page && self.selected.contains(&a.id)).map(|a| a.id).collect();
+                    Drag::Move { page, ids, last: p, before: self.annots.clone(), moved: false }
                 } else {
-                    self.selected = None;
-                    Drag::Pan
+                    if !add {
+                        self.selected.clear();
+                    }
+                    Drag::Marquee { page, start: p, cur: p }
                 }
             }
             Tool::Pen => Drag::Pen { page, pts: vec![p] },
@@ -1062,25 +1109,25 @@ impl App {
 
     fn update_drag(&mut self, screen: Pos2, delta: Vec2) {
         let page = match &self.drag {
-            Drag::Create { page, .. } | Drag::Pen { page, .. } => Some(*page),
-            Drag::Move { id, .. } | Drag::Handle { id, .. } => self.find(*id).map(|a| a.page),
+            Drag::Create { page, .. } | Drag::Pen { page, .. } | Drag::Move { page, .. } | Drag::Marquee { page, .. } => Some(*page),
+            Drag::Handle { id, .. } => self.find(*id).map(|a| a.page),
             _ => None,
         };
         let p = page.map(|pg| self.screen_to_page(pg, screen)).unwrap_or_default();
         let min_step = 1.0 / self.zoom;
         match &mut self.drag {
             Drag::Pan => self.offset -= delta / self.zoom,
-            Drag::Create { cur, .. } => *cur = p,
+            Drag::Create { cur, .. } | Drag::Marquee { cur, .. } => *cur = p,
             Drag::Pen { pts, .. } => {
                 if pts.last().is_none_or(|l| (*l - p).length() >= min_step) {
                     pts.push(p);
                 }
             }
-            Drag::Move { id, last, moved, .. } => {
-                let (id, d) = (*id, p - *last);
+            Drag::Move { ids, last, moved, .. } => {
+                let d = p - *last;
                 *last = p;
                 *moved = true;
-                if let Some(a) = self.annots.iter_mut().find(|a| a.id == id) {
+                for a in self.annots.iter_mut().filter(|a| ids.contains(&a.id)) {
                     a.translate(d);
                 }
             }
@@ -1116,25 +1163,40 @@ impl App {
                 self.redo.clear();
                 self.changed();
             }
+            Drag::Marquee { page, start, cur } => {
+                let r = Rect::from_two_pos(start, cur);
+                for a in self.annots.iter().filter(|a| a.page == page && a.touches(r)) {
+                    if !self.selected.contains(&a.id) {
+                        self.selected.push(a.id);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    fn click(&mut self, screen: Pos2, double: bool) {
+    fn click(&mut self, screen: Pos2, double: bool, add: bool) {
         if self.editing.is_some() {
             self.commit_edit();
             return;
         }
         let Some(page) = self.page_at(screen) else {
-            self.selected = None;
+            if !add {
+                self.selected.clear();
+            }
             return;
         };
         let p = self.screen_to_page(page, screen);
         match self.tool {
+            Tool::Select if add => {
+                if let Some(id) = self.hit(page, p) {
+                    self.toggle_selected(id);
+                }
+            }
             Tool::Select => {
-                self.selected = self.hit(page, p);
+                self.selected = self.hit(page, p).into_iter().collect();
                 if double {
-                    if let Some(id) = self.selected.filter(|id| self.find(*id).is_some_and(|a| a.text_size().is_some())) {
+                    if let Some(id) = self.sole().filter(|a| a.text_size().is_some()).map(|a| a.id) {
                         self.snapshot();
                         self.start_edit(id);
                     }
@@ -1145,7 +1207,7 @@ impl App {
                 // Clicking an existing markup with a drawing tool selects it for quick edits.
                 if let Some(id) = self.hit(page, p) {
                     self.tool = Tool::Select;
-                    self.selected = Some(id);
+                    self.selected = vec![id];
                 }
             }
         }
@@ -1268,17 +1330,27 @@ impl App {
                     let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 1.0);
                 }
+                Drag::Marquee { page, start, cur } if *page == i => {
+                    let r = Rect::from_two_pos(self.page_to_screen(i, *start), self.page_to_screen(i, *cur));
+                    pp.rect(r, 0.0, SEL.gamma_multiply(0.12), Stroke::new(1.0, SEL), egui::StrokeKind::Middle);
+                }
                 _ => {}
             }
-            // Selection.
-            if let Some(a) = self.selected.and_then(|id| self.find(id)).filter(|a| a.page == i) {
+            // Selection, plus what a marquee in progress would add.
+            let marquee = match &self.drag {
+                Drag::Marquee { page, start, cur } if *page == i => Some(Rect::from_two_pos(*start, *cur)),
+                _ => None,
+            };
+            let sole = self.sole().map(|a| a.id);
+            for a in self.annots.iter().filter(|a| a.page == i && (self.selected.contains(&a.id) || marquee.is_some_and(|r| a.touches(r)))) {
                 let b = a.bounds();
                 let r = Rect::from_min_max(self.page_to_screen(i, b.min), self.page_to_screen(i, b.max)).expand(3.0);
-                let sel = Color32::from_rgb(0, 150, 255);
-                pp.rect_stroke(r, 0.0, Stroke::new(1.0, sel), egui::StrokeKind::Outside);
-                for (_, hp) in Self::handles(a) {
-                    let c = self.page_to_screen(i, hp);
-                    painter.rect(Rect::from_center_size(c, Vec2::splat(8.0)), 1.0, Color32::WHITE, Stroke::new(1.5, sel), egui::StrokeKind::Middle);
+                pp.rect_stroke(r, 0.0, Stroke::new(1.0, SEL), egui::StrokeKind::Outside);
+                if sole == Some(a.id) {
+                    for (_, hp) in Self::handles(a) {
+                        let c = self.page_to_screen(i, hp);
+                        painter.rect(Rect::from_center_size(c, Vec2::splat(8.0)), 1.0, Color32::WHITE, Stroke::new(1.5, SEL), egui::StrokeKind::Middle);
+                    }
                 }
             }
         }
@@ -1399,7 +1471,7 @@ impl App {
                 }
             }
             ui.separator();
-            let cur = self.selected.and_then(|id| self.find(id)).map(|a| a.color).unwrap_or(self.color());
+            let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
             for (i, (c, name)) in COLORS.iter().enumerate() {
                 let col = Color32::from_rgb(c[0], c[1], c[2]);
                 let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
@@ -1418,7 +1490,7 @@ impl App {
                 self.set_width(w);
             }
             ui.label("Text");
-            let cur_size = self.selected.and_then(|id| self.find(id)).and_then(|a| a.text_size()).unwrap_or(self.text_size);
+            let cur_size = self.lead_text_size().unwrap_or(self.text_size);
             egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("{cur_size} pt")).show_ui(ui, |ui| {
                 for s in TEXT_SIZES {
                     if ui.selectable_label(s == cur_size, format!("{s} pt")).clicked() {
@@ -1445,6 +1517,10 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} markups", self.annots.len()));
                 ui.separator();
+                if self.selected.len() > 1 {
+                    ui.label(format!("{} selected", self.selected.len()));
+                    ui.separator();
+                }
             }
             if self.read_only && self.path.is_some() {
                 ui.colored_label(Color32::from_rgb(230, 80, 60), format!("NOT AUTOSAVING: {}", self.read_only_why));
@@ -1697,7 +1773,7 @@ impl App {
         self.commit_edit();
         self.overview = false;
         self.set_tool(Tool::Select);
-        self.selected = Some(id);
+        self.selected = vec![id];
         self.offset = c.to_vec2() - self.canvas.size() / (2.0 * self.zoom);
     }
 
@@ -1736,7 +1812,7 @@ impl App {
                 job.wrap.overflow_character = Some('…');
                 let galley = ui.painter().layout_job(job);
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y + 6.0), Sense::click());
-                let selected = self.selected == Some(*id);
+                let selected = self.selected.contains(id);
                 if selected || resp.hovered() {
                     let bg = if selected { ui.visuals().selection.bg_fill } else { ui.visuals().widgets.hovered.weak_bg_fill };
                     ui.painter().rect_filled(rect, 3.0, bg);
@@ -1757,7 +1833,13 @@ impl App {
             }
         });
         if let Some(id) = clicked {
-            self.focus_annot(id);
+            if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                self.commit_edit();
+                self.set_tool(Tool::Select);
+                self.toggle_selected(id);
+            } else {
+                self.focus_annot(id);
+            }
         }
     }
 
@@ -1794,8 +1876,10 @@ impl App {
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
                     ("V or Esc", "Select: drag to move, handles to resize, double-click or Enter to edit text"),
+                    ("Ctrl/Shift+click", "Add to or remove from selection (also in the markup list)"),
+                    ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("1–6", "Colour (applies to selection)"),
+                    ("1–6", "Colour (applies to all selected)"),
                     ("[ ]", "Line width   ·   { } text size"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -1987,4 +2071,73 @@ fn install_fonts(ctx: &egui::Context) {
     family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(helv(), family);
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One 600×800 page drawn at 100% with its top-left at the canvas origin,
+    /// so screen points equal page points.
+    fn app() -> App {
+        let mut app = App::with(None, String::new(), sidecar::Prefs::default());
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.doc_w = 600.0;
+        app.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
+        app.set_tool(Tool::Select);
+        app
+    }
+
+    fn rect(app: &mut App, x: f32, y: f32) -> u64 {
+        app.add(0, Kind::Rect { rect: Rect::from_min_size(pos2(x, y), vec2(100.0, 100.0)) })
+    }
+
+    fn drag(app: &mut App, from: Pos2, to: Pos2, add: bool) {
+        app.begin_drag(from, false, add);
+        app.update_drag(to, to - from);
+        app.end_drag();
+    }
+
+    #[test]
+    fn click_and_modifier_click_select() {
+        let mut app = app();
+        let (a, b) = (rect(&mut app, 100.0, 100.0), rect(&mut app, 300.0, 300.0));
+        app.click(pos2(100.0, 150.0), false, false);
+        assert_eq!(app.selected, vec![a]);
+        app.click(pos2(300.0, 350.0), false, true);
+        assert_eq!(app.selected, vec![a, b]);
+        app.click(pos2(300.0, 350.0), false, true);
+        assert_eq!(app.selected, vec![a], "modifier-click toggles off");
+        app.click(pos2(300.0, 350.0), false, false);
+        assert_eq!(app.selected, vec![b], "plain click replaces");
+        app.click(pos2(550.0, 50.0), false, false);
+        assert!(app.selected.is_empty(), "click on empty page clears");
+    }
+
+    #[test]
+    fn marquee_selects_and_group_moves() {
+        let mut app = app();
+        let (a, b) = (rect(&mut app, 100.0, 100.0), rect(&mut app, 300.0, 300.0));
+        let c = rect(&mut app, 450.0, 600.0);
+        drag(&mut app, pos2(50.0, 50.0), pos2(420.0, 420.0), false);
+        assert_eq!(app.selected, vec![a, b]);
+        drag(&mut app, pos2(440.0, 580.0), pos2(470.0, 620.0), true);
+        assert_eq!(app.selected, vec![a, b, c], "modifier marquee adds");
+
+        app.selected = vec![a, b];
+        let before = app.offset;
+        drag(&mut app, pos2(100.0, 150.0), pos2(110.0, 170.0), false);
+        assert_eq!(app.offset, before, "no pan");
+        assert_eq!(app.find(a).unwrap().bounds().min, pos2(108.0, 118.0));
+        assert_eq!(app.find(b).unwrap().bounds().min, pos2(308.0, 318.0));
+        assert_eq!(app.find(c).unwrap().bounds().min, pos2(448.0, 598.0), "unselected stays");
+
+        app.set_color(2);
+        assert!(app.annots.iter().filter(|x| x.id != c).all(|x| x.color == COLORS[2].0));
+        app.delete_selected();
+        assert_eq!(app.annots.iter().map(|x| x.id).collect::<Vec<_>>(), vec![c]);
+        app.undo();
+        assert_eq!(app.annots.len(), 3, "delete is one undo step");
+    }
 }
