@@ -426,6 +426,15 @@ mod tests {
     use crate::annot::{Annot, Kind};
     use egui::Rect;
 
+    /// PDFium can be bound only once per process and isn't thread-safe: tests
+    /// share one instance and take turns using it.
+    pub(super) static PDFIUM_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn test_pdfium() -> &'static Pdfium {
+        static PDFIUM: std::sync::OnceLock<Pdfium> = std::sync::OnceLock::new();
+        PDFIUM.get_or_init(|| Pdfium::new(Pdfium::bind_to_library(find_pdfium().unwrap()).unwrap()))
+    }
+
     fn annot(page: usize, kind: Kind) -> Annot {
         Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None }
     }
@@ -434,7 +443,8 @@ mod tests {
     /// re-renders the result and checks the marks land where the viewer drew them.
     #[test]
     fn export_lands_in_view_coordinates() {
-        let pdfium = Pdfium::new(Pdfium::bind_to_library(find_pdfium().unwrap()).unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
         let dir = std::env::temp_dir().join(format!("redline-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.pdf");
@@ -467,7 +477,7 @@ mod tests {
             annots.push(annot(p, Kind::Text { pos: pos2(40.0, 200.0), box_w: 300.0, text: "WWWWWWWWWWWWWWWWWW".into(), size: 14.0 }));
         }
         for mode in [ExportMode::Flatten, ExportMode::Editable] {
-        export(&pdfium, &src, &out, &annots, mode, "test").unwrap();
+        export(pdfium, &src, &out, &annots, mode, "test").unwrap();
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         for p in 0..4 {
@@ -524,13 +534,14 @@ mod tests {
         }
         data.extend(format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF").as_bytes());
 
-        let pdfium = Pdfium::new(Pdfium::bind_to_library(find_pdfium().unwrap()).unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
         let dir = std::env::temp_dir().join(format!("redline-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         std::fs::write(&src, &data).unwrap();
         let note = annot(0, Kind::Text { pos: pos2(300.0, 300.0), box_w: 400.0, text: "Δ ≥ 5\u{a0}mm, ⌀ 25 ☐ ok".into(), size: 20.0 });
-        assert_eq!(export(&pdfium, &src, &out, &[note], ExportMode::Flatten, "test").unwrap(), 0);
+        assert_eq!(export(pdfium, &src, &out, &[note], ExportMode::Flatten, "test").unwrap(), 0);
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
@@ -548,6 +559,7 @@ mod tests {
 
 #[cfg(test)]
 mod sample {
+    use super::tests::{test_pdfium, PDFIUM_TESTS};
     use super::*;
     use crate::annot::{Annot, Kind};
 
@@ -557,7 +569,8 @@ mod sample {
     fn export_real_document() {
         let src = PathBuf::from(std::env::var("REDLINE_SAMPLE").unwrap());
         let out = src.with_file_name("sample_markup.pdf");
-        let pdfium = Pdfium::new(Pdfium::bind_to_library(find_pdfium().unwrap()).unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
         let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None };
         let annots = vec![
             mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0 }),
@@ -566,7 +579,7 @@ mod sample {
         ];
         for (mode, out) in [(ExportMode::Flatten, out.clone()), (ExportMode::Editable, src.with_file_name("sample_markup_editable.pdf"))] {
             let t = std::time::Instant::now();
-            export(&pdfium, &src, &out, &annots, mode, "test").unwrap();
+            export(pdfium, &src, &out, &annots, mode, "test").unwrap();
             eprintln!("{mode:?}: exported {} in {:?}", out.display(), t.elapsed());
         }
     }
