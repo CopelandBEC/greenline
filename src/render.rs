@@ -9,18 +9,33 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
+/// What a render is for: the whole page, a sharp patch of the visible area, or a thumbnail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Layer {
+    Base,
+    Patch,
+    Thumb,
+}
+
+/// Pages the viewer still wants; queued renders for other pages are dropped.
+#[derive(Default)]
+pub struct Keep {
+    pub base: HashSet<usize>,
+    pub thumbs: HashSet<usize>,
+}
+
 pub enum Req {
     Open { generation: u64, path: PathBuf },
     /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
-    Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], patch: bool },
-    Export { src: PathBuf, out: PathBuf, annots: Vec<Annot> },
+    Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
+    Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
 }
 
 pub enum Resp {
     Opened { generation: u64, pages: Vec<Vec2> },
     OpenFailed { generation: u64, error: String },
-    Rendered { generation: u64, page: usize, scale: f32, origin: [i32; 2], patch: bool, image: egui::ColorImage },
-    RenderFailed { generation: u64, page: usize, patch: bool, error: String },
+    Rendered { generation: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: egui::ColorImage },
+    RenderFailed { generation: u64, page: usize, layer: Layer, error: String },
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
 }
@@ -28,8 +43,7 @@ pub enum Resp {
 pub struct Worker {
     tx: mpsc::Sender<Req>,
     pub rx: mpsc::Receiver<Resp>,
-    /// Pages the viewer still cares about; base renders for other pages are skipped.
-    pub keep: Arc<Mutex<HashSet<usize>>>,
+    pub keep: Arc<Mutex<Keep>>,
 }
 
 impl Worker {
@@ -37,7 +51,7 @@ impl Worker {
         let lib = find_pdfium()?;
         let (tx, req_rx) = mpsc::channel();
         let (resp_tx, rx) = mpsc::channel();
-        let keep = Arc::new(Mutex::new(HashSet::new()));
+        let keep = Arc::new(Mutex::new(Keep::default()));
         let keep2 = keep.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new().name("pdfium".into()).spawn(move || {
@@ -86,7 +100,7 @@ fn run(
     pdfium: &Pdfium,
     rx: mpsc::Receiver<Req>,
     tx: mpsc::Sender<Resp>,
-    keep: Arc<Mutex<HashSet<usize>>>,
+    keep: Arc<Mutex<Keep>>,
     ctx: egui::Context,
 ) {
     let mut doc: Option<(u64, PdfDocument)> = None;
@@ -114,18 +128,18 @@ fn run(
                     Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
                 }
             }
-            Req::Render { generation, page, scale, origin, size, patch } => {
+            Req::Render { generation, page, scale, origin, size, layer } => {
                 let Some((g, d)) = &doc else { continue };
                 if *g != generation {
                     continue;
                 }
                 match render_region(d, page, scale, origin, size) {
-                    Ok(image) => Resp::Rendered { generation, page, scale, origin, patch, image },
-                    Err(e) => Resp::RenderFailed { generation, page, patch, error: e.to_string() },
+                    Ok(image) => Resp::Rendered { generation, page, scale, origin, layer, image },
+                    Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
                 }
             }
-            Req::Export { src, out, annots } => {
-                Resp::Exported(export(pdfium, &src, &out, &annots).map(|n| (out, n)).map_err(|e| e.to_string()))
+            Req::Export { src, out, annots, mode, author } => {
+                Resp::Exported(export(pdfium, &src, &out, &annots, mode, &author).map(|n| (out, n)).map_err(|e| e.to_string()))
             }
         };
         if tx.send(resp).is_err() {
@@ -135,8 +149,9 @@ fn run(
     }
 }
 
-/// Open/Export first, then the newest patch, then base renders the viewer still wants.
-fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<HashSet<usize>>) -> Option<Req> {
+/// Open/Export first, then the newest patch, then base renders the viewer still
+/// wants, then wanted thumbnails.
+fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
     if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. })) {
         return queue.remove(i);
     }
@@ -144,19 +159,26 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<HashSet<usize>>) -> Opti
     let mut seen = HashSet::new();
     let mut kept = VecDeque::new();
     while let Some(r) = queue.pop_back() {
-        if let Req::Render { page, patch, .. } = &r {
-            if !seen.insert((*page, *patch)) {
+        if let Req::Render { page, layer, .. } = &r {
+            if !seen.insert((*page, *layer)) {
                 continue;
             }
         }
         kept.push_front(r);
     }
     *queue = kept;
-    if let Some(i) = queue.iter().rposition(|r| matches!(r, Req::Render { patch: true, .. })) {
+    if let Some(i) = queue.iter().rposition(|r| matches!(r, Req::Render { layer: Layer::Patch, .. })) {
         return queue.remove(i);
     }
     let keep = keep.lock().unwrap();
-    queue.retain(|r| matches!(r, Req::Render { page, .. } if keep.contains(page)));
+    queue.retain(|r| match r {
+        Req::Render { page, layer: Layer::Base, .. } => keep.base.contains(page),
+        Req::Render { page, layer: Layer::Thumb, .. } => keep.thumbs.contains(page),
+        _ => true,
+    });
+    if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Base, .. })) {
+        return queue.remove(i);
+    }
     queue.pop_front()
 }
 
@@ -272,15 +294,85 @@ fn font_runs(text: &str) -> (Vec<(Option<usize>, String)>, usize) {
     (runs, missing)
 }
 
-/// Writes `annots` onto a copy of `src` as page content and saves it to `out`.
-/// Returns how many characters had no font. Annotations already in the PDF are
-/// left as they are (PDFium's flatten can resize pages and drop comments).
-pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot]) -> anyhow::Result<usize> {
+/// How markups are written into the exported PDF.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExportMode {
+    /// Burned into the page content: what you see is what everyone gets.
+    Flatten,
+    /// One stamp annotation per markup, with the identical appearance and the
+    /// note text as its comment, so Bluebeam/Acrobat users can move, reply to or delete them.
+    Editable,
+}
+
+/// Fonts for text prims: built-in Helvetica plus system faces embedded on demand.
+struct TextFonts {
+    helvetica: PdfFontToken,
+    embedded: std::collections::HashMap<usize, PdfFontToken>,
+    missing: usize,
+}
+
+/// Adds `prims` (page view points) to `objects` — a page's content or an
+/// annotation's appearance — mapped into PDF user space by `m`.
+fn emit_prims<'a>(
+    doc: &mut PdfDocument<'a>,
+    objects: &mut impl PdfPageObjectsCommon<'a>,
+    m: &ViewToUser,
+    prims: Vec<Prim>,
+    fonts: &mut TextFonts,
+) -> anyhow::Result<()> {
+    // Unit vectors for upright text: baseline runs along +u, glyph "up" is -v.
+    let (ux, uy) = (m.u.normalized(), (-m.v).normalized());
+    let k = m.u.length();
+    for prim in prims {
+        match prim {
+            Prim::Stroke { pts, closed, width, color: c } if pts.len() >= 2 => {
+                let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
+                let obj = path_object(doc, &pts, closed, Some((c, width * k)), None)?;
+                objects.add_path_object(obj)?;
+            }
+            Prim::Fill { pts, color: c, alpha, outline } if pts.len() >= 3 => {
+                let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
+                let outline = outline.map(|(oc, w)| (oc, w * k));
+                let obj = path_object(doc, &pts, true, outline, Some(color(c, alpha)))?;
+                objects.add_path_object(obj)?;
+            }
+            Prim::Text { origin, text, size, color: c } => {
+                let (runs, lost) = font_runs(&text);
+                fonts.missing += lost;
+                let mut x = 0.0;
+                for (key, run) in runs {
+                    let f = match key {
+                        None => fonts.helvetica,
+                        Some(i) => match fonts.embedded.get(&i) {
+                            Some(t) => *t,
+                            None => {
+                                let t = doc.fonts_mut().load_true_type_from_file(crate::fonts::faces()[i].path, true)?;
+                                fonts.embedded.insert(i, t);
+                                t
+                            }
+                        },
+                    };
+                    let o = m.map(origin) + ux * (x * k);
+                    x += crate::annot::text_width(&run, size);
+                    let mut obj = PdfPageTextObject::new(doc, &run, f, PdfPoints::new(size * k))?;
+                    obj.set_fill_color(color(c, 255))?;
+                    obj.apply_matrix(PdfMatrix::new(ux.x, ux.y, uy.x, uy.y, o.x, o.y))?;
+                    objects.add_text_object(obj)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Writes `annots` onto a copy of `src` and saves it to `out`. Returns how many
+/// characters had no font. Annotations already in the PDF are left as they are
+/// (PDFium's flatten can resize pages and drop comments).
+pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot], mode: ExportMode, author: &str) -> anyhow::Result<usize> {
     let mut doc = pdfium.load_pdf_from_file(src, None)?;
     let helvetica = doc.fonts_mut().helvetica();
-    // System fonts are embedded only when a line needs them (Δ, ≥, ☐…).
-    let mut embedded: std::collections::HashMap<usize, PdfFontToken> = Default::default();
-    let mut missing = 0;
+    let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
     let n = doc.pages().len();
 
     let mut pages: Vec<usize> = annots.iter().map(|a| a.page).collect();
@@ -292,49 +384,24 @@ pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot]) -> anyh
         }
         let mut page = doc.pages().get(pi as PdfPageIndex)?;
         let m = ViewToUser::for_page(&page)?;
-        // Unit vectors for upright text: baseline runs along +u, glyph "up" is -v.
-        let (ux, uy) = (m.u.normalized(), (-m.v).normalized());
         for a in annots.iter().filter(|a| a.page == pi) {
-            for prim in a.prims() {
-                match prim {
-                    Prim::Stroke { pts, closed, width, color: c } if pts.len() >= 2 => {
-                        let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
-                        let w = width * m.u.length();
-                        let obj = path_object(&doc, &pts, closed, Some((c, w)), None)?;
-                        page.objects_mut().add_path_object(obj)?;
+            match mode {
+                ExportMode::Flatten => emit_prims(&mut doc, page.objects_mut(), &m, a.prims(), &mut fonts)?,
+                ExportMode::Editable => {
+                    let b = a.bounds().expand(a.width + 2.0);
+                    let corners = [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()].map(|p| m.map(p));
+                    let (mut lo, mut hi) = (corners[0], corners[0]);
+                    for c in &corners[1..] {
+                        lo = lo.min(*c);
+                        hi = hi.max(*c);
                     }
-                    Prim::Fill { pts, color: c, alpha, outline } if pts.len() >= 3 => {
-                        let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
-                        let outline = outline.map(|(oc, w)| (oc, w * m.u.length()));
-                        let obj = path_object(&doc, &pts, true, outline, Some(color(c, alpha)))?;
-                        page.objects_mut().add_path_object(obj)?;
-                    }
-                    Prim::Text { origin, text, size, color: c } => {
-                        let k = m.u.length();
-                        let (runs, lost) = font_runs(&text);
-                        missing += lost;
-                        let mut x = 0.0;
-                        for (key, run) in runs {
-                            let f = match key {
-                                None => helvetica,
-                                Some(i) => match embedded.get(&i) {
-                                    Some(t) => *t,
-                                    None => {
-                                        let t = doc.fonts_mut().load_true_type_from_file(crate::fonts::faces()[i].path, true)?;
-                                        embedded.insert(i, t);
-                                        t
-                                    }
-                                },
-                            };
-                            let o = m.map(origin) + ux * (x * k);
-                            x += crate::annot::text_width(&run, size);
-                            let mut obj = PdfPageTextObject::new(&doc, &run, f, PdfPoints::new(size * k))?;
-                            obj.set_fill_color(color(c, 255))?;
-                            obj.apply_matrix(PdfMatrix::new(ux.x, ux.y, uy.x, uy.y, o.x, o.y))?;
-                            page.objects_mut().add_text_object(obj)?;
-                        }
-                    }
-                    _ => {}
+                    let mut stamp = page.annotations_mut().create_stamp_annotation()?;
+                    stamp.set_bounds(PdfRect::new(PdfPoints::new(lo.y), PdfPoints::new(lo.x), PdfPoints::new(hi.y), PdfPoints::new(hi.x)))?;
+                    stamp.set_creator(author)?;
+                    stamp.set_is_printed(true)?;
+                    let note = a.text().trim();
+                    stamp.set_contents(if note.is_empty() { a.kind_name() } else { note })?;
+                    emit_prims(&mut doc, stamp.objects_mut(), &m, a.prims(), &mut fonts)?;
                 }
             }
         }
@@ -350,7 +417,7 @@ pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot]) -> anyh
         let _ = std::fs::remove_file(&tmp);
     }
     saved?;
-    Ok(missing)
+    Ok(fonts.missing)
 }
 
 #[cfg(test)]
@@ -399,17 +466,23 @@ mod tests {
             annots.push(annot(p, Kind::Highlight { rect: probe }));
             annots.push(annot(p, Kind::Text { pos: pos2(40.0, 200.0), box_w: 300.0, text: "WWWWWWWWWWWWWWWWWW".into(), size: 14.0 }));
         }
-        export(&pdfium, &src, &out, &annots).unwrap();
+        for mode in [ExportMode::Flatten, ExportMode::Editable] {
+        export(&pdfium, &src, &out, &annots, mode, "test").unwrap();
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         for p in 0..4 {
             let page = doc.pages().get(p as PdfPageIndex).unwrap();
-            assert_eq!(page.annotations().len(), 0);
+            let expected = if mode == ExportMode::Editable { 2 } else { 0 };
+            assert_eq!(page.annotations().len(), expected, "{mode:?}");
+            for a in page.annotations().iter() {
+                assert!(a.is_printed(), "editable markups must print");
+                assert_eq!(a.creator().as_deref(), Some("test"));
+            }
             let (w, h) = (page.width().value.round() as usize, page.height().value.round() as usize);
             let img = render_region(&doc, p, 1.0, [0, 0], [w, h]).unwrap();
             let px = |x: usize, y: usize| img.pixels[y * w + x];
             let c = px(90, 80);
-            assert!(c.r() > 200 && c.g() < 230 && c.g() > 100, "page {p}: highlight centre {c:?}");
+            assert!(c.r() > 200 && c.g() < 230 && c.g() > 100, "{mode:?} page {p}: highlight centre {c:?}");
             let outside = px(200, 80);
             assert!(outside.g() > 245, "page {p}: outside highlight {outside:?}");
             // Text runs left-to-right as displayed: ink along the line, little above/below.
@@ -417,8 +490,9 @@ mod tests {
                 (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| px(x, y).g() < 120).count()
             };
             let line = ink(50, 250, 205, 222);
-            assert!(line > 300, "page {p}: text ink {line}");
+            assert!(line > 300, "{mode:?} page {p}: text ink {line}");
             assert!(ink(50, 250, 230, 280) < 10, "page {p}: ink below text line");
+        }
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -456,7 +530,7 @@ mod tests {
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         std::fs::write(&src, &data).unwrap();
         let note = annot(0, Kind::Text { pos: pos2(300.0, 300.0), box_w: 400.0, text: "Δ ≥ 5\u{a0}mm, ⌀ 25 ☐ ok".into(), size: 20.0 });
-        assert_eq!(export(&pdfium, &src, &out, &[note]).unwrap(), 0);
+        assert_eq!(export(&pdfium, &src, &out, &[note], ExportMode::Flatten, "test").unwrap(), 0);
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
@@ -490,8 +564,10 @@ mod sample {
             mk(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(500.0, 420.0), pos2(700.0, 560.0)) }),
             mk(3, Kind::Highlight { rect: egui::Rect::from_min_max(pos2(100.0, 100.0), pos2(400.0, 160.0)) }),
         ];
-        let t = std::time::Instant::now();
-        export(&pdfium, &src, &out, &annots).unwrap();
-        eprintln!("exported {} in {:?}", out.display(), t.elapsed());
+        for (mode, out) in [(ExportMode::Flatten, out.clone()), (ExportMode::Editable, src.with_file_name("sample_markup_editable.pdf"))] {
+            let t = std::time::Instant::now();
+            export(&pdfium, &src, &out, &annots, mode, "test").unwrap();
+            eprintln!("{mode:?}: exported {} in {:?}", out.display(), t.elapsed());
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::annot::{self, Annot, Kind, Prim, Rgb};
-use crate::render::{Req, Resp, Worker};
+use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
 use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, FontFamily, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke,
@@ -11,6 +11,9 @@ use std::path::PathBuf;
 const GAP: f32 = 12.0;
 const MAX_BASE_PX: f32 = 4096.0;
 const HIT_PX: f32 = 7.0;
+/// Thumbnail render size (physical px on the long side) and cache cap.
+const THUMB_PX: f32 = 420.0;
+const MAX_THUMBS: usize = 400;
 const SCROLL_SPEED: f32 = 1.8;
 /// Scroll acceleration: after SCROLL_ACCEL_DELAY s of continuous scrolling in one
 /// direction, speed ramps up by SCROLL_ACCEL_RATE x/s to at most SCROLL_ACCEL_MAX x.
@@ -109,6 +112,20 @@ pub struct App {
     patch: HashMap<usize, PageTex>,
     req_base: HashMap<usize, f32>,
     req_patch: HashMap<usize, (f32, [i32; 2], [usize; 2])>,
+    thumbs: HashMap<usize, PageTex>,
+    req_thumb: HashSet<usize>,
+    /// Thumbnails drawn this frame (sidebar or overview); requested after layout.
+    thumbs_wanted: Vec<usize>,
+    show_sidebar: bool,
+    show_markups: bool,
+    overview: bool,
+    overview_tile: f32,
+    overview_cursor: usize,
+    overview_cols: usize,
+    /// Scroll the overview to the cursor on the next frame.
+    overview_scroll: bool,
+    /// Page the sidebar last scrolled to, so it follows the view without fighting the user.
+    sidebar_synced: Option<usize>,
 
     annots: Vec<Annot>,
     next_id: u64,
@@ -169,6 +186,17 @@ impl App {
             patch: HashMap::new(),
             req_base: HashMap::new(),
             req_patch: HashMap::new(),
+            thumbs: HashMap::new(),
+            req_thumb: HashSet::new(),
+            thumbs_wanted: Vec::new(),
+            show_sidebar: true,
+            show_markups: false,
+            overview: false,
+            overview_tile: 240.0,
+            overview_cursor: 0,
+            overview_cols: 1,
+            overview_scroll: false,
+            sidebar_synced: None,
             annots: Vec::new(),
             next_id: 1,
             undo: Vec::new(),
@@ -220,6 +248,11 @@ impl App {
         self.patch.clear();
         self.req_base.clear();
         self.req_patch.clear();
+        self.thumbs.clear();
+        self.req_thumb.clear();
+        self.thumbs_wanted.clear();
+        self.overview = false;
+        self.sidebar_synced = None;
         self.failed.clear();
         self.undo.clear();
         self.redo.clear();
@@ -277,11 +310,12 @@ impl App {
         self.path.as_ref().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
-    fn export(&mut self, ask: bool) {
+    fn export(&mut self, mode: ExportMode, ask: bool) {
         self.commit_edit();
         let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-        let default = src.with_file_name(format!("{stem}_markup.pdf"));
+        let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
+        let default = src.with_file_name(format!("{stem}{suffix}.pdf"));
         let out = if ask {
             let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(default.file_name().unwrap().to_string_lossy());
             if let Some(dir) = src.parent() {
@@ -301,7 +335,7 @@ impl App {
             return;
         }
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
-        w.send(Req::Export { src: src.clone(), out, annots });
+        w.send(Req::Export { src: src.clone(), out, annots, mode, author: author() });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
     }
@@ -340,25 +374,33 @@ impl App {
                     self.status = format!("Could not open: {error}");
                     self.path = None;
                 }
-                Resp::Rendered { generation, page, scale, origin, patch, image } if generation == self.generation => {
+                Resp::Rendered { generation, page, scale, origin, layer, image } if generation == self.generation => {
                     let size = image.size;
-                    let opts = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
-                    let tex = ctx.load_texture(format!("p{page}{patch}"), image, if patch { TextureOptions::LINEAR } else { opts });
+                    let mip = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
+                    let opts = if layer == Layer::Patch { TextureOptions::LINEAR } else { mip };
+                    let tex = ctx.load_texture(format!("p{page}{layer:?}"), image, opts);
                     let t = PageTex { tex, scale, origin, size };
-                    if patch {
-                        self.req_patch.remove(&page);
-                        self.patch.insert(page, t);
-                    } else {
-                        self.req_base.remove(&page);
-                        self.base.insert(page, t);
+                    match layer {
+                        Layer::Patch => {
+                            self.req_patch.remove(&page);
+                            self.patch.insert(page, t);
+                        }
+                        Layer::Base => {
+                            self.req_base.remove(&page);
+                            self.base.insert(page, t);
+                        }
+                        Layer::Thumb => {
+                            self.req_thumb.remove(&page);
+                            self.thumbs.insert(page, t);
+                        }
                     }
                 }
-                Resp::RenderFailed { generation, page, patch, error } if generation == self.generation => {
-                    if patch {
-                        self.req_patch.remove(&page);
-                    } else {
-                        self.req_base.remove(&page);
-                    }
+                Resp::RenderFailed { generation, page, layer, error } if generation == self.generation => {
+                    match layer {
+                        Layer::Patch => self.req_patch.remove(&page).is_some(),
+                        Layer::Base => self.req_base.remove(&page).is_some(),
+                        Layer::Thumb => self.req_thumb.remove(&page),
+                    };
                     self.failed.insert(page);
                     self.toast(format!("Page {} failed to render: {error}", page + 1));
                 }
@@ -482,13 +524,34 @@ impl App {
             }
         }
         want.sort_by_key(|&i| (i as i64 - cur as i64).abs());
+        if self.overview {
+            want.clear();
+        }
+        let mut thumbs_wanted = std::mem::take(&mut self.thumbs_wanted);
+        thumbs_wanted.retain(|&i| i < self.pages.len());
         {
             let mut keep = w.keep.lock().unwrap();
-            keep.clear();
-            keep.extend(want.iter().copied());
+            keep.base = want.iter().copied().collect();
+            keep.thumbs = thumbs_wanted.iter().copied().collect();
+        }
+        self.req_thumb.retain(|k| thumbs_wanted.contains(k));
+        for &i in &thumbs_wanted {
+            if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
+                continue;
+            }
+            let s = self.pages[i];
+            let scale = THUMB_PX / s.x.max(s.y);
+            let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
+            w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
+            self.req_thumb.insert(i);
+        }
+        if self.thumbs.len() > MAX_THUMBS {
+            self.thumbs.retain(|k, _| thumbs_wanted.contains(k));
         }
         let keep_tex: HashSet<usize> = want.iter().flat_map(|&i| i.saturating_sub(2)..=i + 2).collect();
-        self.base.retain(|k, _| keep_tex.contains(k));
+        if !self.overview {
+            self.base.retain(|k, _| keep_tex.contains(k));
+        }
         self.patch.retain(|k, _| vis.contains(k));
         // The worker drops requests for pages that left `keep`; forget them so they are re-sent.
         self.req_base.retain(|k, _| want.contains(k));
@@ -505,12 +568,15 @@ impl App {
             let have = self.base.get(&i).map(|t| t.scale);
             if have != Some(scale) && self.req_base.get(&i) != Some(&scale) {
                 let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
-                w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, patch: false });
+                w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Base });
                 self.req_base.insert(i, scale);
             }
         }
 
         // Sharp patch of the visible region once the view settles.
+        if self.overview {
+            return;
+        }
         if now - self.last_view_change < 0.12 {
             ctx.request_repaint_after(std::time::Duration::from_millis(130));
             return;
@@ -538,7 +604,7 @@ impl App {
             let key = (need, [x0, y0], [(x1 - x0) as usize, (y1 - y0) as usize]);
             let have = self.patch.get(&i).map(|t| (t.scale, t.origin, t.size));
             if have != Some(key) && self.req_patch.get(&i) != Some(&key) {
-                w.send(Req::Render { generation: self.generation, page: i, scale: need, origin: key.1, size: key.2, patch: true });
+                w.send(Req::Render { generation: self.generation, page: i, scale: need, origin: key.1, size: key.2, layer: Layer::Patch });
                 self.req_patch.insert(i, key);
             }
         }
@@ -757,7 +823,8 @@ impl App {
                 }
             }
             if pressed(Key::E) {
-                self.export(shift);
+                let alt = ctx.input(|i| i.modifiers.alt);
+                self.export(if alt { ExportMode::Editable } else { ExportMode::Flatten }, shift);
             }
             if pressed(Key::Z) {
                 if shift { self.redo() } else { self.undo() }
@@ -781,6 +848,20 @@ impl App {
                 self.fit_width();
             }
             return;
+        }
+        if pressed(Key::O) && !self.pages.is_empty() {
+            self.toggle_overview();
+            return;
+        }
+        if self.overview {
+            self.overview_keys(ctx);
+            return;
+        }
+        if pressed(Key::S) {
+            self.show_sidebar = !self.show_sidebar;
+        }
+        if pressed(Key::M) {
+            self.show_markups = !self.show_markups;
         }
         for (t, _, k) in TOOLS {
             if pressed(k) {
@@ -1134,40 +1215,6 @@ impl App {
         self.text_k.unwrap()
     }
 
-    fn paint_prims(&self, painter: &Painter, page: usize, prims: &[Prim], k: (f32, f32), alpha_mul: f32) {
-        let z = self.zoom;
-        let col = |c: Rgb, a: u8| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (a as f32 * alpha_mul) as u8);
-        let map = |pts: &[Pos2]| pts.iter().map(|p| self.page_to_screen(page, *p)).collect::<Vec<_>>();
-        for prim in prims {
-            match prim {
-                Prim::Stroke { pts, closed, width, color } => {
-                    let s = Stroke::new((width * z).max(1.0), col(*color, 255));
-                    let pts = map(pts);
-                    if *closed {
-                        painter.add(Shape::closed_line(pts, s));
-                    } else {
-                        painter.add(Shape::line(pts, s));
-                    }
-                }
-                Prim::Fill { pts, color, alpha, outline } => {
-                    let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(1.0), col(c, 255))).unwrap_or(Stroke::NONE);
-                    painter.add(Shape::convex_polygon(map(pts), col(*color, *alpha), stroke));
-                }
-                Prim::Text { origin, text, size, color } => {
-                    let fs = size * z * k.0;
-                    if fs < 2.0 {
-                        let o = self.page_to_screen(page, *origin);
-                        let w = annot::text_width(text, *size) * z;
-                        painter.line_segment([o - vec2(0.0, fs * 0.3), o + vec2(w, -fs * 0.3)], Stroke::new(1.0, col(*color, 120)));
-                        continue;
-                    }
-                    let o = self.page_to_screen(page, *origin);
-                    painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv()), col(*color, 255));
-                }
-            }
-        }
-    }
-
     fn paint(&mut self, ui: &mut Ui) {
         let painter = ui.painter_at(self.canvas);
         painter.rect_filled(self.canvas, 0.0, Color32::from_gray(64));
@@ -1200,7 +1247,7 @@ impl App {
                         pp.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
                     }
                 }
-                self.paint_prims(&pp, i, &prims, k, 1.0);
+                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0);
             }
             // Live preview.
             match &self.drag {
@@ -1208,12 +1255,12 @@ impl App {
                     let preview = self.preview_kind(*start, *cur);
                     if let Some(kind) = preview {
                         let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None };
-                        self.paint_prims(&pp, i, &a.prims(), k, 0.7);
+                        paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.7);
                     }
                 }
                 Drag::Pen { page, pts } if *page == i => {
                     let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None };
-                    self.paint_prims(&pp, i, &a.prims(), k, 1.0);
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 1.0);
                 }
                 _ => {}
             }
@@ -1312,9 +1359,31 @@ impl App {
                     self.open(p);
                 }
             }
-            let can_export = self.path.is_some();
-            if ui.add_enabled(can_export, egui::Button::new("Export flattened")).on_hover_text("Ctrl+E → <name>_markup.pdf   (Ctrl+Shift+E: Save As)").clicked() {
-                self.export(false);
+            ui.add_enabled_ui(self.path.is_some(), |ui| {
+                ui.menu_button("Export", |ui| {
+                    if ui.button("Flattened PDF   (Ctrl+E)").on_hover_text("Markups burned in → <name>_markup.pdf").clicked() {
+                        self.export(ExportMode::Flatten, false);
+                    }
+                    if ui.button("Flattened PDF as…   (Ctrl+Shift+E)").clicked() {
+                        self.export(ExportMode::Flatten, true);
+                    }
+                    if ui.button("Editable PDF   (Ctrl+Alt+E)").on_hover_text("Each markup a movable comment in Bluebeam/Acrobat → <name>_markup_editable.pdf").clicked() {
+                        self.export(ExportMode::Editable, false);
+                    }
+                    if ui.button("Comment list (CSV)").on_hover_text("<name>_comments.csv: page, type, comment").clicked() {
+                        self.export_csv();
+                    }
+                });
+            });
+            ui.separator();
+            if ui.selectable_label(self.show_sidebar, "Pages S").on_hover_text("Thumbnail sidebar").clicked() {
+                self.show_sidebar = !self.show_sidebar;
+            }
+            if ui.selectable_label(self.overview, "Overview O").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
+                self.toggle_overview();
+            }
+            if ui.selectable_label(self.show_markups, "Markups M").on_hover_text("List of markups").clicked() {
+                self.show_markups = !self.show_markups;
             }
             ui.separator();
             for (t, label, k) in TOOLS {
@@ -1435,6 +1504,260 @@ impl App {
             });
     }
 
+    // -----------------------------------------------------------------------
+    // Thumbnails, overview, markup list
+
+    fn markup_count(&self, page: usize) -> usize {
+        self.annots.iter().filter(|a| a.page == page).count()
+    }
+
+    /// Height/width of the tallest page, so thumbnail slots are uniform.
+    fn max_aspect(&self) -> f32 {
+        self.pages.iter().map(|s| s.y / s.x.max(1.0)).fold(0.2, f32::max).min(1.6)
+    }
+
+    /// Draws page `i` fitted inside `slot`, with its markups and a count badge.
+    fn paint_thumb(&mut self, ui: &Ui, slot: Rect, i: usize, current: bool) {
+        self.thumbs_wanted.push(i);
+        let s = self.pages[i];
+        let z = (slot.width() / s.x).min(slot.height() / s.y);
+        let r = Rect::from_center_size(slot.center(), s * z);
+        let painter = ui.painter_at(slot.expand(4.0));
+        painter.rect_filled(r.translate(vec2(1.5, 2.0)), 0.0, Color32::from_black_alpha(80));
+        painter.rect_filled(r, 0.0, Color32::WHITE);
+        if let Some(t) = self.thumbs.get(&i) {
+            painter.image(t.tex.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        let k = self.text_k.unwrap_or((1.0, 0.8));
+        let clip = painter.with_clip_rect(r);
+        for a in self.annots.iter().filter(|a| a.page == i) {
+            paint_prims(&clip, r.min, z, &a.prims(), k, 1.0);
+        }
+        if current {
+            painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, ui.visuals().selection.stroke.color), egui::StrokeKind::Outside);
+        }
+        let n = self.markup_count(i);
+        if n > 0 {
+            let c = pos2(r.max.x - 9.0, r.min.y + 9.0);
+            painter.circle_filled(c, 9.0, Color32::from_rgb(220, 30, 30));
+            painter.text(c, Align2::CENTER_CENTER, n.to_string(), FontId::proportional(11.0), Color32::WHITE);
+        }
+    }
+
+    fn sidebar(&mut self, ui: &mut Ui) {
+        let w = (ui.available_width() - 8.0).max(40.0);
+        let slot_h = w * self.max_aspect();
+        let row_h = slot_h + 24.0;
+        let cur = self.current_page();
+        let n = self.pages.len();
+        // Follow the main view: scroll the strip when the current page changes.
+        let follow = self.sidebar_synced != Some(cur);
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if follow {
+            let top = (cur as f32 * (row_h + ui.spacing().item_spacing.y) - ui.available_height() / 2.0 + row_h / 2.0).max(0.0);
+            area = area.vertical_scroll_offset(top);
+            self.sidebar_synced = Some(cur);
+        }
+        area.show_rows(ui, row_h, n, |ui, range| {
+            for i in range {
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                let slot = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(w, slot_h));
+                self.paint_thumb(ui, slot, i, i == cur);
+                ui.painter().text(pos2(rect.center().x, rect.max.y - 9.0), Align2::CENTER_CENTER, (i + 1).to_string(), FontId::proportional(12.0), ui.visuals().text_color());
+                if resp.clicked() {
+                    self.goto_page(i);
+                    self.sidebar_synced = Some(i);
+                }
+            }
+        });
+    }
+
+    fn toggle_overview(&mut self) {
+        self.commit_edit();
+        // Its release will land in the other view: keep a move/resize already
+        // made (recorded for undo and autosave), drop a half-drawn new markup.
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        if !matches!(self.drag, Drag::None) {
+            self.drag = Drag::Ignore;
+        }
+        self.overview = !self.overview;
+        if self.overview {
+            self.overview_cursor = self.current_page();
+            self.overview_scroll = true;
+        }
+    }
+
+    fn overview_keys(&mut self, ctx: &egui::Context) {
+        let n = self.pages.len();
+        if n == 0 {
+            return;
+        }
+        let cols = self.overview_cols.max(1);
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        let mut c = self.overview_cursor as i64;
+        if pressed(Key::ArrowRight) {
+            c += 1;
+        }
+        if pressed(Key::ArrowLeft) {
+            c -= 1;
+        }
+        if pressed(Key::ArrowDown) || pressed(Key::PageDown) {
+            c += cols as i64;
+        }
+        if pressed(Key::ArrowUp) || pressed(Key::PageUp) {
+            c -= cols as i64;
+        }
+        if pressed(Key::Home) {
+            c = 0;
+        }
+        if pressed(Key::End) {
+            c = n as i64 - 1;
+        }
+        let c = c.clamp(0, n as i64 - 1) as usize;
+        if c != self.overview_cursor {
+            self.overview_cursor = c;
+            self.overview_scroll = true;
+        }
+        if pressed(Key::Enter) || pressed(Key::Space) {
+            self.overview = false;
+            self.goto_page(c);
+        } else if pressed(Key::Escape) {
+            self.overview = false;
+        }
+    }
+
+    fn overview_grid(&mut self, ui: &mut Ui) {
+        if let Some(h) = ui.input(|i| i.pointer.hover_pos()) {
+            let z = ui.input(|i| i.zoom_delta());
+            if z != 1.0 && ui.max_rect().contains(h) {
+                self.overview_tile = (self.overview_tile * z).clamp(100.0, 900.0);
+            }
+        }
+        let gap = 18.0;
+        let tile = self.overview_tile;
+        let slot_h = tile * self.max_aspect();
+        let row_h = slot_h + 26.0;
+        let cols = (((ui.available_width() + gap) / (tile + gap)).floor() as usize).max(1);
+        self.overview_cols = cols;
+        let n = self.pages.len();
+        let rows = n.div_ceil(cols);
+        let cur = self.overview_cursor;
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if std::mem::take(&mut self.overview_scroll) {
+            let row = cur / cols;
+            let top = (row as f32 * (row_h + ui.spacing().item_spacing.y) - ui.available_height() / 2.0 + row_h / 2.0).max(0.0);
+            area = area.vertical_scroll_offset(top);
+        }
+        let mut open = None;
+        area.show_rows(ui, row_h, rows, |ui, range| {
+            for row in range {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for i in row * cols..((row + 1) * cols).min(n) {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(tile, row_h), Sense::click());
+                        let slot = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(tile, slot_h));
+                        self.paint_thumb(ui, slot, i, i == cur);
+                        let label = match self.markup_count(i) {
+                            0 => format!("{}", i + 1),
+                            m => format!("{}  ·  {m} markup{}", i + 1, if m == 1 { "" } else { "s" }),
+                        };
+                        ui.painter().text(pos2(rect.center().x, rect.max.y - 10.0), Align2::CENTER_CENTER, label, FontId::proportional(13.0), ui.visuals().text_color());
+                        if resp.hovered() {
+                            ui.painter().rect_stroke(slot.expand(3.0), 3.0, Stroke::new(1.0, ui.visuals().weak_text_color()), egui::StrokeKind::Outside);
+                        }
+                        if resp.clicked() {
+                            open = Some(i);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(i) = open {
+            self.overview = false;
+            self.goto_page(i);
+        }
+    }
+
+    /// Selects a markup and scrolls it into the middle of the view.
+    fn focus_annot(&mut self, id: u64) {
+        let Some(a) = self.find(id) else { return };
+        if a.page >= self.pages.len() {
+            self.toast(format!("That markup is on page {}, which this PDF doesn't have", a.page + 1));
+            return;
+        }
+        let c = self.page_doc_rect(a.page).min + a.bounds().center().to_vec2();
+        self.commit_edit();
+        self.overview = false;
+        self.set_tool(Tool::Select);
+        self.selected = Some(id);
+        self.offset = c.to_vec2() - self.canvas.size() / (2.0 * self.zoom);
+    }
+
+    fn markup_list(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.strong(format!("Markups ({})", self.annots.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(self.path.is_some(), egui::Button::new("CSV")).on_hover_text("Save comment list → <name>_comments.csv").clicked() {
+                    self.export_csv();
+                }
+            });
+        });
+        ui.separator();
+        let mut order: Vec<&Annot> = self.annots.iter().collect();
+        order.sort_by(|a, b| (a.page, a.bounds().min.y as i64, a.bounds().min.x as i64).cmp(&(b.page, b.bounds().min.y as i64, b.bounds().min.x as i64)));
+        let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), a.text().to_string())).collect();
+        let mut clicked = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut last_page = None;
+            for (id, page, color, kind, text) in &items {
+                if last_page != Some(*page) {
+                    last_page = Some(*page);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(format!("Page {}", page + 1)).strong());
+                }
+                let first = text.lines().next().unwrap_or("").trim();
+                let label = if first.is_empty() { kind.to_string() } else { first.to_string() };
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().rect_filled(r, 2.0, Color32::from_rgb(color[0], color[1], color[2]));
+                    let resp = ui.selectable_label(self.selected == Some(*id), { let t = egui::RichText::new(label); if first.is_empty() { t.weak() } else { t } });
+                    let resp = if text.trim().is_empty() { resp } else { resp.on_hover_text(text.as_str()) };
+                    if resp.clicked() {
+                        clicked = Some(*id);
+                    }
+                });
+            }
+            if items.is_empty() {
+                ui.weak("No markups yet.");
+            }
+        });
+        if let Some(id) = clicked {
+            self.focus_annot(id);
+        }
+    }
+
+    /// Writes `<name>_comments.csv` next to the PDF: one row per markup, in page order.
+    fn export_csv(&mut self) {
+        self.commit_edit();
+        let Some(src) = &self.path else { return };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let out = src.with_file_name(format!("{stem}_comments.csv"));
+        let mut order: Vec<&Annot> = self.annots.iter().collect();
+        order.sort_by(|a, b| (a.page, a.bounds().min.y as i64, a.bounds().min.x as i64).cmp(&(b.page, b.bounds().min.y as i64, b.bounds().min.x as i64)));
+        let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let mut csv = String::from("No,Page,Type,Colour,Comment\n");
+        for (n, a) in order.iter().enumerate() {
+            let colour = COLORS.iter().find(|(c, _)| *c == a.color).map(|(_, name)| *name).unwrap_or("Custom");
+            csv += &format!("{},{},{},{},{}\n", n + 1, a.page + 1, a.kind_name(), colour, q(a.text().trim()));
+        }
+        match std::fs::write(&out, csv) {
+            Ok(()) => self.toast(format!("Comment list → {}", out.display())),
+            Err(e) => self.toast(format!("Could not write {}: {e}", out.display())),
+        }
+    }
+
     fn help(&mut self, ctx: &egui::Context) {
         if !self.show_help {
             return;
@@ -1454,6 +1777,9 @@ impl App {
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
                     ("Ctrl+E", "Export flattened PDF next to original (Ctrl+Shift+E: Save As)"),
+                    ("Ctrl+Alt+E", "Export editable PDF (markups as movable comments for Bluebeam/Acrobat)"),
+                    ("S / O / M", "Page thumbnails / overview of all pages / markup list"),
+                    ("In overview", "Arrows move, Enter opens, Ctrl+wheel resizes, O or Esc closes"),
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
@@ -1485,6 +1811,17 @@ impl eframe::App for App {
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
+        let has_doc = !self.pages.is_empty();
+        if has_doc && self.show_sidebar && !self.overview {
+            egui::Panel::left("thumbs").resizable(true).default_size(170.0).size_range(90.0..=420.0).show(ui, |ui| self.sidebar(ui));
+        }
+        if self.show_markups {
+            egui::Panel::right("markups").resizable(true).default_size(280.0).size_range(180.0..=600.0).show(ui, |ui| self.markup_list(ui));
+        }
+        if self.overview && has_doc {
+            self.shortcuts(&ctx);
+            egui::CentralPanel::default().show(ui, |ui| self.overview_grid(ui));
+        } else {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
             if rect != self.canvas {
@@ -1507,6 +1844,7 @@ impl eframe::App for App {
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), Color32::from_gray(200));
             }
         });
+        }
         self.text_editor(&ctx);
         self.goto_overlay(&ctx);
         self.help(&ctx);
@@ -1525,6 +1863,59 @@ impl eframe::App for App {
         self.commit_edit();
         self.save_sidecar();
     }
+}
+
+/// Paints prims for a page whose top-left is at `origin` on screen, drawn at
+/// `z` screen points per PDF point. `k` is the text calibration from `text_metrics`.
+fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32, f32), alpha_mul: f32) {
+    let col = |c: Rgb, a: u8| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], (a as f32 * alpha_mul) as u8);
+    let to = |p: Pos2| origin + p.to_vec2() * z;
+    let map = |pts: &[Pos2]| pts.iter().map(|p| to(*p)).collect::<Vec<_>>();
+    let min_w = if z < 0.3 { 0.7 } else { 1.0 };
+    for prim in prims {
+        match prim {
+            Prim::Stroke { pts, closed, width, color } => {
+                let s = Stroke::new((width * z).max(min_w), col(*color, 255));
+                let pts = map(pts);
+                if *closed {
+                    painter.add(Shape::closed_line(pts, s));
+                } else {
+                    painter.add(Shape::line(pts, s));
+                }
+            }
+            Prim::Fill { pts, color, alpha, outline } => {
+                let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
+                painter.add(Shape::convex_polygon(map(pts), col(*color, *alpha), stroke));
+            }
+            Prim::Text { origin: o, text, size, color } => {
+                let fs = size * z * k.0;
+                let o = to(*o);
+                if fs < 3.0 {
+                    // Too small to read: a grey bar where the line of text is.
+                    let w = annot::text_width(text, *size) * z;
+                    painter.line_segment([o - vec2(0.0, fs * 0.3), o + vec2(w, -fs * 0.3)], Stroke::new(fs.max(0.7), col(*color, 120)));
+                    continue;
+                }
+                painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv()), col(*color, 255));
+            }
+        }
+    }
+}
+
+/// Name stamped on editable-export comments: $REDLINE_AUTHOR, else the account's
+/// full name from /etc/passwd, else the login name.
+fn author() -> String {
+    if let Ok(a) = std::env::var("REDLINE_AUTHOR") {
+        return a;
+    }
+    let user = std::env::var("USER").unwrap_or_default();
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|p| {
+            p.lines().find(|l| l.split(':').next() == Some(user.as_str())).and_then(|l| l.split(':').nth(4)).map(|g| g.split(',').next().unwrap_or("").to_string())
+        })
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(user)
 }
 
 fn text_of(a: &Annot) -> &str {

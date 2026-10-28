@@ -179,6 +179,27 @@ impl Annot {
         }
     }
 
+    /// Note text ("" for shapes).
+    pub fn text(&self) -> &str {
+        match &self.kind {
+            Kind::Callout { text, .. } | Kind::Text { text, .. } => text,
+            _ => "",
+        }
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            Kind::Callout { .. } => "Callout",
+            Kind::Text { .. } => "Text",
+            Kind::Cloud { .. } => "Cloud",
+            Kind::Rect { .. } => "Rectangle",
+            Kind::Highlight { .. } => "Highlight",
+            Kind::Arrow { .. } => "Arrow",
+            Kind::Line { .. } => "Line",
+            Kind::Pen { .. } => "Pen",
+        }
+    }
+
     pub fn text_mut(&mut self) -> Option<&mut String> {
         match &mut self.kind {
             Kind::Callout { text, .. } | Kind::Text { text, .. } => Some(text),
@@ -196,7 +217,8 @@ impl Annot {
     pub fn bounds(&self) -> Rect {
         let w = self.width.max(1.0);
         match &self.kind {
-            Kind::Callout { anchor, .. } => self.text_box().unwrap().union(Rect::from_center_size(*anchor, Vec2::splat(1.0))),
+            // The leader lies between box and anchor; the arrowhead spreads up to arrow_len around the anchor.
+            Kind::Callout { anchor, .. } => self.text_box().unwrap().union(Rect::from_center_size(*anchor, Vec2::splat(2.0 * arrow_len(w)))),
             Kind::Text { .. } => self.text_box().unwrap(),
             Kind::Cloud { rect } => rect.expand(cloud_radius(*rect) + w),
             Kind::Rect { rect } | Kind::Highlight { rect } => rect.expand(w),
