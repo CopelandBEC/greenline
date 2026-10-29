@@ -18,10 +18,13 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Rust
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
 | `1`–`6`, `[` `]`, `{` `}` | Colour, line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
+| `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
+| `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
+| Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
 | `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original |
 | `F1` | All shortcuts, and your name for exported comments |
 
-Markups autosave (`%APPDATA%\Redline` on Windows, `~/.local/share/redline` on Linux); the source PDF is never modified.
+Markups autosave (`%APPDATA%\Redline` on Windows, `~/.local/share/redline` on Linux); the source PDF is never modified. Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.
 
 ## Build and release
 

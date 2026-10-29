@@ -26,13 +26,18 @@ pub fn dir() -> PathBuf {
     }
 }
 
-fn file_for(pdf: &Path) -> PathBuf {
-    // FNV-1a: stable across Rust versions, unlike DefaultHasher.
+/// FNV-1a: stable across Rust versions, unlike DefaultHasher.
+pub fn fnv(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in pdf.as_os_str().as_encoded_bytes() {
+    for b in bytes {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
+    h
+}
+
+fn file_for(pdf: &Path) -> PathBuf {
+    let h = fnv(pdf.as_os_str().as_encoded_bytes());
     let stem = pdf.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     dir().join(format!("{stem}-{h:016x}.json"))
 }
@@ -51,13 +56,16 @@ pub fn load(pdf: &Path) -> anyhow::Result<Option<Sidecar>> {
 pub struct Prefs {
     pub show_sidebar: bool,
     pub show_markups: bool,
+    pub show_stamps: bool,
     /// Name put on editable-export comments; empty = the account name.
     pub author: String,
+    /// chrono format for the stamp panel's date.
+    pub date_format: String,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { show_sidebar: true, show_markups: false, author: String::new() }
+        Self { show_sidebar: true, show_markups: false, show_stamps: false, author: String::new(), date_format: "%m/%d/%Y".into() }
     }
 }
 

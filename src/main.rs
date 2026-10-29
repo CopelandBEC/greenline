@@ -6,6 +6,7 @@ mod app;
 mod fonts;
 mod render;
 mod sidecar;
+mod stamps;
 
 fn main() -> eframe::Result {
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);

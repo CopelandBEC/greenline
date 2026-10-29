@@ -5,7 +5,7 @@
 use crate::annot::{Annot, Prim, Rgb};
 use egui::{pos2, vec2, Pos2, Vec2};
 use pdfium_render::prelude::*;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -138,9 +138,12 @@ fn run(
                     Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
                 }
             }
-            Req::Export { src, out, annots, mode, author } => {
-                Resp::Exported(export(pdfium, &src, &out, &annots, mode, &author).map(|n| (out, n)).map_err(|e| e.to_string()))
-            }
+            Req::Export { src, out, annots, mode, author } => Resp::Exported(
+                load_images(&annots)
+                    .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
+                    .map(|n| (out, n))
+                    .map_err(|e| e.to_string()),
+            ),
         };
         if tx.send(resp).is_err() {
             return;
@@ -304,6 +307,43 @@ pub enum ExportMode {
     Editable,
 }
 
+/// Highest resolution an image is embedded at, for its placed size.
+const IMAGE_DPI: f32 = 600.0;
+
+/// Library images used by `annots`, decoded. A missing one fails the export
+/// rather than sending out a sheet without its seal.
+fn load_images(annots: &[Annot]) -> anyhow::Result<HashMap<String, image::RgbaImage>> {
+    let mut out = HashMap::new();
+    for a in annots {
+        if let crate::annot::Kind::Image { image, name, .. } = &a.kind {
+            if !out.contains_key(image) {
+                let img = crate::stamps::decode(image).map_err(|e| anyhow::anyhow!("stamp \"{name}\" on page {}: {e}", a.page + 1))?;
+                out.insert(image.clone(), img);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Images for image prims, downsampled to `IMAGE_DPI` at their placed size
+/// (cached, since a stamp copied to every sheet has the same size on each).
+struct Images<'i> {
+    src: &'i HashMap<String, image::RgbaImage>,
+    scaled: HashMap<(String, u32, u32), image::DynamicImage>,
+}
+
+impl Images<'_> {
+    fn get(&mut self, name: &str, size_pt: Vec2) -> anyhow::Result<&image::DynamicImage> {
+        let img = self.src.get(name).ok_or_else(|| anyhow::anyhow!("image {name} not loaded"))?;
+        let k = (size_pt.x.max(size_pt.y) / 72.0 * IMAGE_DPI / img.width().max(img.height()) as f32).min(1.0);
+        let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
+        Ok(self.scaled.entry((name.to_string(), w, h)).or_insert_with(|| {
+            let img = if (w, h) == img.dimensions() { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3) };
+            image::DynamicImage::ImageRgba8(img)
+        }))
+    }
+}
+
 /// Fonts for text prims: built-in Helvetica plus system faces embedded on demand.
 struct TextFonts {
     helvetica: PdfFontToken,
@@ -319,6 +359,7 @@ fn emit_prims<'a>(
     m: &ViewToUser,
     prims: Vec<Prim>,
     fonts: &mut TextFonts,
+    images: &mut Images,
 ) -> anyhow::Result<()> {
     // Unit vectors for upright text: baseline runs along +u, glyph "up" is -v.
     let (ux, uy) = (m.u.normalized(), (-m.v).normalized());
@@ -360,6 +401,14 @@ fn emit_prims<'a>(
                     objects.add_text_object(obj)?;
                 }
             }
+            Prim::Image { rect, image } => {
+                // Image space is the unit square with the picture's top edge at y = 1.
+                let (bl, br, tl) = (m.map(rect.left_bottom()), m.map(rect.right_bottom()), m.map(rect.left_top()));
+                let img = images.get(&image, rect.size() * k)?;
+                let mut obj = PdfPageImageObject::new(doc, img)?;
+                obj.apply_matrix(PdfMatrix::new(br.x - bl.x, br.y - bl.y, tl.x - bl.x, tl.y - bl.y, bl.x, bl.y))?;
+                objects.add_image_object(obj)?;
+            }
             _ => {}
         }
     }
@@ -369,10 +418,19 @@ fn emit_prims<'a>(
 /// Writes `annots` onto a copy of `src` and saves it to `out`. Returns how many
 /// characters had no font. Annotations already in the PDF are left as they are
 /// (PDFium's flatten can resize pages and drop comments).
-pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot], mode: ExportMode, author: &str) -> anyhow::Result<usize> {
+pub fn export(
+    pdfium: &Pdfium,
+    src: &Path,
+    out: &Path,
+    annots: &[Annot],
+    images: &HashMap<String, image::RgbaImage>,
+    mode: ExportMode,
+    author: &str,
+) -> anyhow::Result<usize> {
     let mut doc = pdfium.load_pdf_from_file(src, None)?;
     let helvetica = doc.fonts_mut().helvetica();
     let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
+    let mut images = Images { src: images, scaled: HashMap::new() };
     let n = doc.pages().len();
 
     let mut pages: Vec<usize> = annots.iter().map(|a| a.page).collect();
@@ -386,7 +444,7 @@ pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot], mode: E
         let m = ViewToUser::for_page(&page)?;
         for a in annots.iter().filter(|a| a.page == pi) {
             match mode {
-                ExportMode::Flatten => emit_prims(&mut doc, page.objects_mut(), &m, a.prims(), &mut fonts)?,
+                ExportMode::Flatten => emit_prims(&mut doc, page.objects_mut(), &m, a.prims(), &mut fonts, &mut images)?,
                 ExportMode::Editable => {
                     let b = a.bounds().expand(a.width + 2.0);
                     let corners = [b.left_top(), b.right_top(), b.right_bottom(), b.left_bottom()].map(|p| m.map(p));
@@ -399,9 +457,8 @@ pub fn export(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot], mode: E
                     stamp.set_bounds(PdfRect::new(PdfPoints::new(lo.y), PdfPoints::new(lo.x), PdfPoints::new(hi.y), PdfPoints::new(hi.x)))?;
                     stamp.set_creator(author)?;
                     stamp.set_is_printed(true)?;
-                    let note = a.text().trim();
-                    stamp.set_contents(if note.is_empty() { a.kind_name() } else { note })?;
-                    emit_prims(&mut doc, stamp.objects_mut(), &m, a.prims(), &mut fonts)?;
+                    stamp.set_contents(a.label().trim())?;
+                    emit_prims(&mut doc, stamp.objects_mut(), &m, a.prims(), &mut fonts, &mut images)?;
                 }
             }
         }
@@ -436,7 +493,7 @@ mod tests {
     }
 
     fn annot(page: usize, kind: Kind) -> Annot {
-        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None }
+        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None, group: None }
     }
 
     /// Exports onto pages with every /Rotate value and an offset CropBox, then
@@ -477,7 +534,7 @@ mod tests {
             annots.push(annot(p, Kind::Text { pos: pos2(40.0, 200.0), box_w: 300.0, text: "WWWWWWWWWWWWWWWWWW".into(), size: 14.0 }));
         }
         for mode in [ExportMode::Flatten, ExportMode::Editable] {
-        export(pdfium, &src, &out, &annots, mode, "test").unwrap();
+        export(pdfium, &src, &out, &annots, &HashMap::new(), mode, "test").unwrap();
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         for p in 0..4 {
@@ -504,6 +561,58 @@ mod tests {
             assert!(ink(50, 250, 230, 280) < 10, "page {p}: ink below text line");
         }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Stamps land in place on rotated pages, keep their transparency (the
+    /// highlight shows through), stay upright, and the file stays small.
+    #[test]
+    fn export_images_with_alpha_and_orientation() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("redline-test3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        for r in [PdfPageRenderRotation::None, PdfPageRenderRotation::Degrees90] {
+            let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+            page.set_rotation(r);
+        }
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+
+        // 200x100 px: top half opaque blue, bottom half transparent.
+        let img = image::RgbaImage::from_fn(200, 100, |_, y| if y < 50 { image::Rgba([0, 0, 255, 255]) } else { image::Rgba([0, 0, 0, 0]) });
+        let images = HashMap::from([("ab.png".to_string(), img)]);
+        let rect = Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 200.0));
+        let mut annots = Vec::new();
+        for p in 0..2 {
+            annots.push(annot(p, Kind::Highlight { rect }));
+            annots.push(annot(p, Kind::Image { rect, image: "ab.png".into(), name: "Seal".into() }));
+        }
+        for mode in [ExportMode::Flatten, ExportMode::Editable] {
+            export(pdfium, &src, &out, &annots, &images, mode, "test").unwrap();
+            let size = std::fs::metadata(&out).unwrap().len();
+            assert!(size < 40_000, "{mode:?}: image stored uncompressed? {size} bytes");
+            let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+            for p in 0..2 {
+                let page = doc.pages().get(p as PdfPageIndex).unwrap();
+                if mode == ExportMode::Editable {
+                    let contents: Vec<_> = page.annotations().iter().filter_map(|a| a.contents()).collect();
+                    assert!(contents.iter().any(|c| c == "Seal"), "{contents:?}");
+                }
+                let (w, h) = (page.width().value.round() as usize, page.height().value.round() as usize);
+                let img = render_region(&doc, p, 1.0, [0, 0], [w, h]).unwrap();
+                let px = |x: usize, y: usize| img.pixels[y * w + x];
+                let top = px(200, 125);
+                assert!(top.b() > 200 && top.r() < 60 && top.g() < 60, "{mode:?} page {p}: opaque top half {top:?}");
+                let bottom = px(200, 175);
+                assert!(bottom.r() > 200 && bottom.g() < 230 && bottom.b() < 230, "{mode:?} page {p}: highlight shows through {bottom:?}");
+                assert!(px(200, 250).g() > 245, "{mode:?} page {p}: nothing outside");
+            }
+        }
+        let missing = annot(0, Kind::Image { rect, image: "ab.png".into(), name: "Seal".into() });
+        assert!(export(pdfium, &src, &out, &[missing], &HashMap::new(), ExportMode::Flatten, "test").is_err(), "missing image must fail");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -541,7 +650,7 @@ mod tests {
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         std::fs::write(&src, &data).unwrap();
         let note = annot(0, Kind::Text { pos: pos2(300.0, 300.0), box_w: 400.0, text: "Δ ≥ 5\u{a0}mm, ⌀ 25 ☐ ok".into(), size: 20.0 });
-        assert_eq!(export(pdfium, &src, &out, &[note], ExportMode::Flatten, "test").unwrap(), 0);
+        assert_eq!(export(pdfium, &src, &out, &[note], &HashMap::new(), ExportMode::Flatten, "test").unwrap(), 0);
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
@@ -571,7 +680,7 @@ mod sample {
         let out = src.with_file_name("sample_markup.pdf");
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None };
+        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None };
         let annots = vec![
             mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0 }),
             mk(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(500.0, 420.0), pos2(700.0, 560.0)) }),
@@ -579,7 +688,7 @@ mod sample {
         ];
         for (mode, out) in [(ExportMode::Flatten, out.clone()), (ExportMode::Editable, src.with_file_name("sample_markup_editable.pdf"))] {
             let t = std::time::Instant::now();
-            export(pdfium, &src, &out, &annots, mode, "test").unwrap();
+            export(pdfium, &src, &out, &annots, &HashMap::new(), mode, "test").unwrap();
             eprintln!("{mode:?}: exported {} in {:?}", out.display(), t.elapsed());
         }
     }

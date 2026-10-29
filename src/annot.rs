@@ -21,6 +21,9 @@ pub struct Annot {
     /// this while editing and is shrunk to fit the text on commit.
     #[serde(default)]
     pub wrap_w: Option<f32>,
+    /// Markups sharing a group id on one page select and move together.
+    #[serde(default)]
+    pub group: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +38,9 @@ pub enum Kind {
     Arrow { a: Pos2, b: Pos2 },
     Line { a: Pos2, b: Pos2 },
     Pen { pts: Vec<Pos2> },
+    /// Stamp or signature from the image library (`stamps`), drawn into `rect`.
+    /// `image` is the stored file's name; `name` is what the markup list shows.
+    Image { rect: Rect, image: String, name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +50,8 @@ pub enum Prim {
     Fill { pts: Vec<Pos2>, color: Rgb, alpha: u8, outline: Option<(Rgb, f32)> },
     /// One line of Helvetica text; `origin` is the left end of the baseline.
     Text { origin: Pos2, text: String, size: f32, color: Rgb },
+    /// Library image stretched over `rect` (it keeps its aspect when resized).
+    Image { rect: Rect, image: String },
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
@@ -179,6 +187,15 @@ impl Annot {
         }
     }
 
+    /// What lists and exported comments call it: the note, the image name, or the kind.
+    pub fn label(&self) -> &str {
+        match &self.kind {
+            Kind::Image { name, .. } if !name.trim().is_empty() => name,
+            _ if !self.text().trim().is_empty() => self.text(),
+            _ => self.kind_name(),
+        }
+    }
+
     /// Note text ("" for shapes).
     pub fn text(&self) -> &str {
         match &self.kind {
@@ -197,6 +214,7 @@ impl Annot {
             Kind::Arrow { .. } => "Arrow",
             Kind::Line { .. } => "Line",
             Kind::Pen { .. } => "Pen",
+            Kind::Image { .. } => "Stamp",
         }
     }
 
@@ -222,6 +240,7 @@ impl Annot {
             Kind::Text { .. } => self.text_box().unwrap(),
             Kind::Cloud { rect } => rect.expand(cloud_radius(*rect) + w),
             Kind::Rect { rect } | Kind::Highlight { rect } => rect.expand(w),
+            Kind::Image { rect, .. } => *rect,
             Kind::Arrow { a, b } | Kind::Line { a, b } => Rect::from_two_pos(*a, *b).expand(arrow_len(w) + w),
             Kind::Pen { pts } => {
                 let mut r = Rect::NOTHING;
@@ -236,7 +255,7 @@ impl Annot {
     pub fn translate(&mut self, d: Vec2) {
         match &mut self.kind {
             Kind::Callout { pos, .. } | Kind::Text { pos, .. } => *pos += d,
-            Kind::Cloud { rect } | Kind::Rect { rect } | Kind::Highlight { rect } => *rect = rect.translate(d),
+            Kind::Cloud { rect } | Kind::Rect { rect } | Kind::Highlight { rect } | Kind::Image { rect, .. } => *rect = rect.translate(d),
             Kind::Arrow { a, b } | Kind::Line { a, b } => {
                 *a += d;
                 *b += d;
@@ -252,7 +271,7 @@ impl Annot {
                 return 0.0;
             }
         }
-        if let Kind::Highlight { rect } = &self.kind {
+        if let Kind::Highlight { rect } | Kind::Image { rect, .. } = &self.kind {
             if rect.contains(p) {
                 return 0.0;
             }
@@ -262,6 +281,10 @@ impl Annot {
             let (pts, closed) = match &prim {
                 Prim::Stroke { pts, closed, .. } => (pts, *closed),
                 Prim::Fill { pts, .. } => (pts, true),
+                Prim::Image { rect, .. } => {
+                    best = best.min(polyline_dist(&rect_pts(*rect), true, p));
+                    continue;
+                }
                 Prim::Text { .. } => continue,
             };
             best = best.min(polyline_dist(pts, closed, p));
@@ -278,7 +301,7 @@ impl Annot {
         if self.text_box().is_some_and(|b| b.intersects(r)) {
             return true;
         }
-        if let Kind::Highlight { rect } = &self.kind {
+        if let Kind::Highlight { rect } | Kind::Image { rect, .. } = &self.kind {
             if rect.intersects(r) {
                 return true;
             }
@@ -287,7 +310,7 @@ impl Annot {
         self.prims().iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
             Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
-            Prim::Text { .. } => false,
+            Prim::Text { .. } | Prim::Image { .. } => false,
         })
     }
 
@@ -318,6 +341,7 @@ impl Annot {
             Kind::Arrow { a, b } => arrow_prims(&mut out, *a, *b, w, c),
             Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c }),
             Kind::Pen { pts } => out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c }),
+            Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
         }
         out
     }
@@ -332,6 +356,20 @@ fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb) {
         let y = r.min.y + pad(size) + i as f32 * line_h(size) + ascent(size);
         out.push(Prim::Text { origin: pos2(x, y), text: line, size, color });
     }
+}
+
+/// Rect with one corner at `fixed`, reaching towards `p`, with width/height
+/// `aspect`: the larger of the two drags wins.
+pub fn aspect_rect(fixed: Pos2, p: Pos2, aspect: f32) -> Rect {
+    let d = p - fixed;
+    let (mut w, mut h) = (d.x.abs(), d.y.abs());
+    if w > h * aspect {
+        h = w / aspect;
+    } else {
+        w = h * aspect;
+    }
+    let (w, h) = if w < 4.0 { (4.0, 4.0 / aspect) } else { (w, h) };
+    Rect::from_two_pos(fixed, fixed + vec2(d.x.signum() * w, d.y.signum() * h))
 }
 
 pub fn rect_pts(r: Rect) -> Vec<Pos2> {
@@ -534,7 +572,7 @@ mod tests {
 
     #[test]
     fn fit_box_shrinks_and_keeps_callout_edge() {
-        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0 } };
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0 } };
         let right = a.text_box().unwrap().max.x;
         a.fit_box_w();
         let r = a.text_box().unwrap();
@@ -547,7 +585,7 @@ mod tests {
 
     #[test]
     fn marquee_touches_lines_not_empty_space() {
-        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, kind };
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind };
         let box_at = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), vec2(10.0, 10.0));
         let diag = ann(Kind::Line { a: pos2(0.0, 0.0), b: pos2(100.0, 100.0) });
         assert!(diag.touches(box_at(45.0, 45.0)));
@@ -561,6 +599,25 @@ mod tests {
         let note = ann(Kind::Text { pos: pos2(200.0, 200.0), box_w: 100.0, text: "Check".into(), size: 12.0 });
         assert!(note.touches(box_at(220.0, 205.0)));
         assert!(!note.touches(box_at(0.0, 300.0)));
+    }
+
+    #[test]
+    fn aspect_rect_keeps_shape_and_corner() {
+        let r = aspect_rect(pos2(100.0, 100.0), pos2(40.0, 90.0), 2.0);
+        assert_eq!(r.max, pos2(100.0, 100.0), "fixed corner stays");
+        assert!((r.width() - 60.0).abs() < 1e-3 && (r.height() - 30.0).abs() < 1e-3, "{r:?}");
+        let r = aspect_rect(pos2(0.0, 0.0), pos2(10.0, 50.0), 2.0);
+        assert!((r.width() - 100.0).abs() < 1e-3 && (r.height() - 50.0).abs() < 1e-3, "{r:?}");
+    }
+
+    #[test]
+    fn image_hits_inside_and_labels_by_name() {
+        let a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Image { rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)), image: "x.png".into(), name: "NC seal".into() } };
+        assert_eq!(a.distance(pos2(30.0, 30.0)), 0.0);
+        assert!((a.distance(pos2(100.0, 30.0)) - 39.0).abs() < 1e-3, "outline distance less half the line width");
+        assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
+        assert_eq!(a.bounds(), Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)));
+        assert_eq!(a.label(), "NC seal");
     }
 
     #[test]
