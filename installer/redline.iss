@@ -1,9 +1,9 @@
 ; Inno Setup script for the Windows installer. Built by .github/workflows/build.yml:
-;   iscc /DAppVersion=1.2.0 installer\redline.iss
+;   iscc /DAppVersion=1.2.1 installer\redline.iss
 ; Per-user install (no admin rights needed).
 
 #ifndef AppVersion
-  #define AppVersion "1.2.0"
+  #define AppVersion "1.2.1"
 #endif
 
 [Setup]

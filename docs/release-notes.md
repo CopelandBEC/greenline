@@ -1,7 +1,10 @@
-Redline 1.2 — fast PDF markup for drawing, spec and deck review.
+Redline 1.2.1 — fast PDF markup for drawing, spec and deck review.
 
-**Install (Windows 10/11, 64-bit):** download `Redline-1.2.0-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over an earlier version keeps your markups.
+**Install (Windows 10/11, 64-bit):** download `Redline-1.2.1-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over an earlier version keeps your markups.
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
+
+**Fixed in 1.2.1**
+- Linux: the Open, Export as… and Add… (seal/signature) file dialogs no longer make the desktop report Redline as "not responding" while they're open.
 
 **New in 1.2: stamp and sign drawing sets**
 - Press `I` (or **Stamps** in the toolbar) for the stamp panel, which shares the right side with the markup list.

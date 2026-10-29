@@ -8,6 +8,7 @@ use egui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 const GAP: f32 = 12.0;
 const MAX_BASE_PX: f32 = 4096.0;
@@ -25,6 +26,15 @@ const SCROLL_ACCEL_RATE: f64 = 4.0;
 const SCROLL_ACCEL_MAX: f64 = 8.0;
 /// A pause longer than this (or reversing direction) resets acceleration.
 const SCROLL_STREAK_GAP: f64 = 0.25;
+
+/// A file dialog to show. Dialogs run on their own thread so the window keeps
+/// answering the compositor (Wayland flags a blocked one as not responding).
+enum Pick {
+    Open,
+    /// Save-as for an export of this source PDF.
+    Export(ExportMode, PathBuf),
+    Images(stamps::Use),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tool {
@@ -201,6 +211,10 @@ pub struct App {
     /// When and on what the last arrow-key nudge happened, so a run of them is one undo step.
     last_nudge: (f64, Vec<u64>),
     failed: HashSet<usize>,
+    /// Dialog asked for this frame; opened at the end of `ui()`, which has the window handle.
+    ask: Option<Pick>,
+    /// The open dialog's answer (no paths if cancelled).
+    dialog: Option<mpsc::Receiver<(Pick, Vec<PathBuf>)>>,
 }
 
 impl App {
@@ -288,6 +302,8 @@ impl App {
             save_retry_at: 0.0,
             last_nudge: (f64::NEG_INFINITY, Vec::new()),
             failed: HashSet::new(),
+            ask: None,
+            dialog: None,
         }
     }
 
@@ -378,22 +394,16 @@ impl App {
 
     fn export(&mut self, mode: ExportMode, ask: bool) {
         self.commit_edit();
-        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
-        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
-        let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
-        let default = src.with_file_name(format!("{stem}{suffix}.pdf"));
-        let out = if ask {
-            let mut d = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name(default.file_name().unwrap().to_string_lossy());
-            if let Some(dir) = src.parent() {
-                d = d.set_directory(dir);
-            }
-            match d.save_file() {
-                Some(p) => p,
-                None => return,
-            }
+        let Some(src) = &self.path else { return };
+        if ask {
+            self.ask = Some(Pick::Export(mode, src.clone()));
         } else {
-            default
-        };
+            self.export_to(mode, default_export(src, mode));
+        }
+    }
+
+    fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
+        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
         // Compare real paths so a symlinked folder can't alias the original.
         let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
         if real_out == *src || dunce::canonicalize(&out).is_ok_and(|o| o == *src) {
@@ -405,6 +415,67 @@ impl App {
         w.send(Req::Export { src: src.clone(), out, annots, mode, author });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
+    }
+
+    /// Opens the dialog asked for this frame, unless one is already up.
+    fn show_dialog(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(pick) = self.ask.take() else { return };
+        if self.dialog.is_some() {
+            return;
+        }
+        let d = rfd::FileDialog::new().set_parent(frame);
+        let d = match &pick {
+            Pick::Open => d.add_filter("PDF", &["pdf"]),
+            Pick::Export(mode, src) => {
+                let name = default_export(src, *mode).file_name().unwrap().to_string_lossy().into_owned();
+                let d = d.add_filter("PDF", &["pdf"]).set_file_name(name);
+                match src.parent() {
+                    Some(dir) => d.set_directory(dir),
+                    None => d,
+                }
+            }
+            Pick::Images(_) => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let paths = match pick {
+                Pick::Open => d.pick_file().into_iter().collect(),
+                Pick::Export(..) => d.save_file().into_iter().collect(),
+                Pick::Images(_) => d.pick_files().unwrap_or_default(),
+            };
+            tx.send((pick, paths)).ok();
+            ctx.request_repaint();
+        });
+        self.dialog = Some(rx);
+    }
+
+    fn poll_dialog(&mut self) {
+        let Some(rx) = &self.dialog else { return };
+        let (pick, paths) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => (Pick::Open, Vec::new()),
+        };
+        self.dialog = None;
+        match pick {
+            Pick::Open => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.open(p);
+                }
+            }
+            // Only if the same PDF is still open.
+            Pick::Export(mode, src) => {
+                if let Some(out) = paths.into_iter().next().filter(|_| self.path.as_ref() == Some(&src)) {
+                    self.export_to(mode, out);
+                }
+            }
+            Pick::Images(kind) => {
+                if !paths.is_empty() {
+                    self.import_images(kind, paths);
+                }
+            }
+        }
     }
 
     fn save_sidecar(&mut self) {
@@ -957,9 +1028,7 @@ impl App {
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
         if cmd {
             if pressed(Key::O) {
-                if let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
-                    self.open(p);
-                }
+                self.ask = Some(Pick::Open);
             }
             if pressed(Key::E) {
                 let alt = ctx.input(|i| i.modifiers.alt);
@@ -1506,8 +1575,7 @@ impl App {
         }
     }
 
-    fn import_images(&mut self, kind: stamps::Use) {
-        let Some(paths) = rfd::FileDialog::new().add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]).pick_files() else { return };
+    fn import_images(&mut self, kind: stamps::Use, paths: Vec<PathBuf>) {
         let mut msgs = Vec::new();
         for p in paths {
             let file = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1794,9 +1862,7 @@ impl App {
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open").on_hover_text("Ctrl+O").clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
-                    self.open(p);
-                }
+                self.ask = Some(Pick::Open);
             }
             ui.add_enabled_ui(self.path.is_some(), |ui| {
                 ui.menu_button("Export", |ui| {
@@ -2151,7 +2217,7 @@ impl App {
                     ui.strong(if kind == stamps::Use::Stamp { "Seals" } else { "Signatures" });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Add…").on_hover_text("PNG or JPEG. A scan's white background is made transparent.").clicked() {
-                            self.import_images(kind);
+                            self.ask = Some(Pick::Images(kind));
                         }
                     });
                 });
@@ -2443,10 +2509,11 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.poll_worker(&ctx);
+        self.poll_dialog();
 
         if let Some(p) = ctx.input(|i| i.raw.dropped_files.iter().next().map(|f| f.path().to_path_buf())) {
             self.open(p);
@@ -2495,6 +2562,7 @@ impl eframe::App for App {
         self.goto_overlay(&ctx);
         self.help(&ctx);
         self.request_renders(&ctx, now);
+        self.show_dialog(&ctx, frame);
 
         let shown = (self.show_sidebar, self.show_markups, self.show_stamps);
         if shown != (self.prefs.show_sidebar, self.prefs.show_markups, self.prefs.show_stamps) || self.prefs_dirty {
@@ -2570,6 +2638,12 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
 
 /// Default name on editable-export comments when none is set in Shortcuts:
 /// $REDLINE_AUTHOR, else the account's full name (Linux /etc/passwd), else the login name.
+fn default_export(src: &std::path::Path, mode: ExportMode) -> PathBuf {
+    let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+    let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
+    src.with_file_name(format!("{stem}{suffix}.pdf"))
+}
+
 fn default_author() -> String {
     if let Ok(a) = std::env::var("REDLINE_AUTHOR") {
         return a;
