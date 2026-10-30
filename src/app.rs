@@ -61,10 +61,11 @@ const TOOLS: [(Tool, &str, Key); 9] = [
     (Tool::Pen, "Pen", Key::P),
 ];
 
+/// The first is the default for new markups: Copeland medium green.
 const COLORS: [(Rgb, &str); 6] = [
+    ([0x6B, 0x9A, 0x1E], "Green"),
     ([228, 0, 0], "Red"),
     ([0, 88, 220], "Blue"),
-    ([0, 140, 60], "Green"),
     ([20, 20, 20], "Black"),
     ([240, 120, 0], "Orange"),
     ([255, 214, 0], "Yellow"),
@@ -222,6 +223,7 @@ impl App {
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let prefs = sidecar::load_prefs();
+        crate::theme::install(&cc.egui_ctx, prefs.theme);
         let (worker, status) = match Worker::spawn(cc.egui_ctx.clone()) {
             Ok(w) => (Some(w), String::from("Ctrl+O to open a PDF (or drop one here)")),
             Err(e) => (None, format!("PDFium failed to load: {e}")),
@@ -348,7 +350,7 @@ impl App {
         let mut why = None;
         match sidecar::lock(&path) {
             Ok(Some(l)) => self.lock = Some(l),
-            Ok(None) => why = Some("open in another Redline window".to_string()),
+            Ok(None) => why = Some("open in another Greenline window".to_string()),
             Err(e) => why = Some(format!("could not lock markups file ({e})")),
         }
         match sidecar::load(&path) {
@@ -379,7 +381,7 @@ impl App {
         self.doc_h = y;
         self.fit_pending = true;
         let name = self.file_name();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Redline")));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Greenline")));
         let n = self.annots.len();
         if self.read_only {
             self.toast(format!("{name}: {} pages", self.pages.len()));
@@ -1685,7 +1687,7 @@ impl App {
 
     fn paint(&mut self, ui: &mut Ui) {
         let painter = ui.painter_at(self.canvas);
-        painter.rect_filled(self.canvas, 0.0, Color32::from_gray(64));
+        painter.rect_filled(self.canvas, 0.0, crate::theme::canvas(ui.visuals()));
         let k = self.text_metrics(&painter);
         let shadow = Color32::from_black_alpha(90);
         for i in self.visible_pages() {
@@ -1822,7 +1824,7 @@ impl App {
         let mut text = text_of(a).to_string();
         let needs_focus = std::mem::take(&mut self.edit_needs_focus);
         
-        let resp = egui::Area::new(egui::Id::new("redline-edit"))
+        let resp = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -1832,7 +1834,7 @@ impl App {
                 ui.set_max_width(w);
                 ui.add(
                     egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(("redline-edit", self.generation, id)))
+                        .id(egui::Id::new(("greenline-edit", self.generation, id)))
                         .frame(egui::Frame::NONE)
                         .margin(egui::Margin::ZERO)
                         .desired_width(width.max(20.0))
@@ -2001,7 +2003,7 @@ impl App {
 
     fn goto_overlay(&self, ctx: &egui::Context) {
         let Some(s) = &self.goto else { return };
-        egui::Area::new(egui::Id::new("redline-goto"))
+        egui::Area::new(egui::Id::new("greenline-goto"))
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_TOP, vec2(0.0, 70.0))
             .show(ctx, |ui| {
@@ -2046,12 +2048,12 @@ impl App {
             paint_prims(&clip, r.min, z, &a.prims(), k, 1.0, &self.textures);
         }
         if current {
-            painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, ui.visuals().selection.stroke.color), egui::StrokeKind::Outside);
+            painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, crate::theme::accent(ui.visuals())), egui::StrokeKind::Outside);
         }
         let n = self.markup_count(i);
         if n > 0 {
             let c = pos2(r.max.x - 9.0, r.min.y + 9.0);
-            painter.circle_filled(c, 9.0, Color32::from_rgb(220, 30, 30));
+            painter.circle_filled(c, 9.0, crate::theme::accent(ui.visuals()));
             painter.text(c, Align2::CENTER_CENTER, n.to_string(), FontId::proportional(11.0), Color32::WHITE);
         }
     }
@@ -2459,7 +2461,7 @@ impl App {
             return;
         }
         let mut open = true;
-        egui::Window::new(format!("Redline {} — shortcuts", env!("CARGO_PKG_VERSION"))).open(&mut open).resizable(false).show(ctx, |ui| {
+        egui::Window::new(format!("Greenline {} — shortcuts", env!("CARGO_PKG_VERSION"))).open(&mut open).resizable(false).show(ctx, |ui| {
             egui::Grid::new("keys").striped(true).show(ui, |ui| {
                 let rows = [
                     ("C", "Callout: press on the target, drag to where the note goes (click = quick note)"),
@@ -2499,8 +2501,17 @@ impl App {
                     self.prefs_dirty = true;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Appearance:");
+                for (t, name) in [(egui::ThemePreference::System, "System"), (egui::ThemePreference::Light, "Light"), (egui::ThemePreference::Dark, "Dark")] {
+                    if ui.selectable_value(&mut self.prefs.theme, t, name).changed() {
+                        ctx.set_theme(t);
+                        self.prefs_dirty = true;
+                    }
+                }
+            });
             ui.weak(format!("Markups autosave to {} as you go; the original PDF is never modified.", sidecar::dir().display()));
-            ui.weak(format!("Redline {}", env!("CARGO_PKG_VERSION")));
+            ui.weak(format!("Greenline {}", env!("CARGO_PKG_VERSION")));
         });
         if !open {
             self.show_help = false;
@@ -2522,8 +2533,14 @@ impl eframe::App for App {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
         let has_doc = !self.pages.is_empty();
+        let sheets = crate::theme::sheets(ui.visuals());
         if has_doc && self.show_sidebar && !self.overview {
-            egui::Panel::left("thumbs").resizable(true).default_size(170.0).size_range(90.0..=420.0).show(ui, |ui| self.sidebar(ui));
+            egui::Panel::left("thumbs")
+                .resizable(true)
+                .default_size(170.0)
+                .size_range(90.0..=420.0)
+                .frame(egui::Frame::side_top_panel(ui.style()).fill(sheets))
+                .show(ui, |ui| self.sidebar(ui));
         }
         self.load_textures(&ctx);
         if self.show_stamps {
@@ -2533,7 +2550,7 @@ impl eframe::App for App {
         }
         if self.overview && has_doc {
             self.shortcuts(&ctx);
-            egui::CentralPanel::default().show(ui, |ui| self.overview_grid(ui));
+            egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).fill(sheets)).show(ui, |ui| self.overview_grid(ui));
         } else {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.max_rect();
@@ -2554,7 +2571,7 @@ impl eframe::App for App {
             }
             self.paint(ui);
             if self.pages.is_empty() {
-                ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), Color32::from_gray(200));
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), ui.visuals().text_color());
             }
         });
         }
@@ -2637,7 +2654,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
 }
 
 /// Default name on editable-export comments when none is set in Shortcuts:
-/// $REDLINE_AUTHOR, else the account's full name (Linux /etc/passwd), else the login name.
+/// $GREENLINE_AUTHOR, else the account's full name (Linux /etc/passwd), else the login name.
 fn default_export(src: &std::path::Path, mode: ExportMode) -> PathBuf {
     let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
     let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
@@ -2645,7 +2662,7 @@ fn default_export(src: &std::path::Path, mode: ExportMode) -> PathBuf {
 }
 
 fn default_author() -> String {
-    if let Ok(a) = std::env::var("REDLINE_AUTHOR") {
+    if let Ok(a) = std::env::var("GREENLINE_AUTHOR") {
         return a;
     }
     #[cfg(windows)]
@@ -2684,8 +2701,9 @@ fn helv() -> FontFamily {
     FontFamily::Name("helv".into())
 }
 
-/// Screen fonts in the same order export uses (Liberation Sans, then the Noto
-/// fallbacks in `fonts`), so what's on screen is what gets embedded.
+/// Markup text in the same fonts and order export uses (Liberation Sans, then
+/// the Noto fallbacks in `fonts`), so what's on screen is what gets embedded.
+/// UI text is Montserrat (`theme`).
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut family = Vec::new();
@@ -2696,6 +2714,7 @@ fn install_fonts(ctx: &egui::Context) {
     }
     family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(helv(), family);
+    crate::theme::add_font(&mut fonts);
     ctx.set_fonts(fonts);
 }
 

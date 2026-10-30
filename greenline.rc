@@ -1,0 +1,23 @@
+1 ICON "assets/greenline.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,3,0,0
+PRODUCTVERSION 1,3,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Copeland Building Envelope Consulting"
+      VALUE "FileDescription", "Greenline PDF markup"
+      VALUE "FileVersion", "1.3.0"
+      VALUE "ProductName", "Greenline"
+      VALUE "ProductVersion", "1.3.0"
+      VALUE "OriginalFilename", "greenline.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

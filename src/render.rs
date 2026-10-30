@@ -502,7 +502,7 @@ mod tests {
     fn export_lands_in_view_coordinates() {
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let dir = std::env::temp_dir().join(format!("redline-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("greenline-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.pdf");
         let out = dir.join("out.pdf");
@@ -570,7 +570,7 @@ mod tests {
     fn export_images_with_alpha_and_orientation() {
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let dir = std::env::temp_dir().join(format!("redline-test3-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("greenline-test3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         let mut doc = pdfium.create_new_pdf().unwrap();
@@ -645,7 +645,7 @@ mod tests {
 
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let dir = std::env::temp_dir().join(format!("redline-test2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("greenline-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         std::fs::write(&src, &data).unwrap();
@@ -672,11 +672,11 @@ mod sample {
     use super::*;
     use crate::annot::{Annot, Kind};
 
-    /// REDLINE_SAMPLE=/path/to.pdf cargo test --release -- --ignored --nocapture
+    /// GREENLINE_SAMPLE=/path/to.pdf cargo test --release -- --ignored --nocapture
     #[test]
     #[ignore]
     fn export_real_document() {
-        let src = PathBuf::from(std::env::var("REDLINE_SAMPLE").unwrap());
+        let src = PathBuf::from(std::env::var("GREENLINE_SAMPLE").unwrap());
         let out = src.with_file_name("sample_markup.pdf");
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();

@@ -1,9 +1,10 @@
 //! Autosaved markups, kept outside the PDF's folder (often a shared drive) in
-//! ~/.local/share/redline/<hash of the PDF path>.json.
+//! ~/.local/share/greenline/<hash of the PDF path>.json.
 
 use crate::annot::Annot;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize)]
 pub struct Sidecar {
@@ -11,19 +12,29 @@ pub struct Sidecar {
     pub annots: Vec<Annot>,
 }
 
-/// ~/.local/share/redline on Linux, %APPDATA%\\Redline on Windows.
+/// ~/.local/share/greenline on Linux, %APPDATA%\\Greenline on Windows.
+/// The first call moves the folder over from the app's old name (Redline);
+/// if that fails (e.g. an old copy still has it open) the old folder is used.
 pub fn dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("Redline")
-    }
-    #[cfg(not(windows))]
-    {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-        base.join("redline")
-    }
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        #[cfg(windows)]
+        let (base, name, old) = (PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()), "Greenline", "Redline");
+        #[cfg(not(windows))]
+        let (base, name, old) = (
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")),
+            "greenline",
+            "redline",
+        );
+        let (dir, old) = (base.join(name), base.join(old));
+        if !dir.exists() && old.is_dir() && std::fs::rename(&old, &dir).is_err() {
+            return old;
+        }
+        dir
+    })
+    .clone()
 }
 
 /// FNV-1a: stable across Rust versions, unlike DefaultHasher.
@@ -61,11 +72,20 @@ pub struct Prefs {
     pub author: String,
     /// chrono format for the stamp panel's date.
     pub date_format: String,
+    /// Light, dark, or follow the system.
+    pub theme: egui::ThemePreference,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { show_sidebar: true, show_markups: false, show_stamps: false, author: String::new(), date_format: "%m/%d/%Y".into() }
+        Self {
+            show_sidebar: true,
+            show_markups: false,
+            show_stamps: false,
+            author: String::new(),
+            date_format: "%m/%d/%Y".into(),
+            theme: egui::ThemePreference::System,
+        }
     }
 }
 
@@ -81,7 +101,7 @@ pub fn save_prefs(p: &Prefs) {
 }
 
 /// Exclusive per-document lock so two windows can't overwrite each other's
-/// markups. `Ok(None)` means another Redline process holds it. Released when
+/// markups. `Ok(None)` means another Greenline process holds it. Released when
 /// the returned file is dropped or the process exits.
 pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
     std::fs::create_dir_all(dir())?;
