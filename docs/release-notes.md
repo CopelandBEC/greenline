@@ -1,7 +1,11 @@
-Greenline 1.3.1 — fast PDF markup for drawing, spec and deck review.
+Greenline 1.3.2 — fast PDF markup for drawing, spec and deck review.
 
-**Install (Windows 10/11, 64-bit):** download `Greenline-1.3.1-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
+**Install (Windows 10/11, 64-bit):** download `Greenline-1.3.2-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
+
+**New in 1.3.2: Greenline is open source**
+- The source is now public at github.com/CopelandBEC/greenline, licensed under MIT or Apache-2.0 (your choice). Pull requests are welcome; see the README for what to include.
+- The installer now includes Greenline's licences and the licences of the open-source components it's built with, in the `licenses` folder next to the program.
 
 **New in 1.3.1**
 - The markup list and stamp panel now sit on the same soft shaded background as the page thumbnails in light mode, so all the side panels match.

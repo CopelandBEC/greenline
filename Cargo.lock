@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "greenline"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "anyhow",
  "chrono",
