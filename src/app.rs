@@ -2544,9 +2544,9 @@ impl eframe::App for App {
         }
         self.load_textures(&ctx);
         if self.show_stamps {
-            egui::Panel::right("stamps").resizable(true).default_size(280.0).size_range(220.0..=600.0).show(ui, |ui| self.stamp_panel(ui));
+            egui::Panel::right("stamps").resizable(true).default_size(280.0).size_range(220.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.stamp_panel(ui));
         } else if self.show_markups {
-            egui::Panel::right("markups").resizable(true).default_size(280.0).size_range(180.0..=600.0).show(ui, |ui| self.markup_list(ui));
+            egui::Panel::right("markups").resizable(true).default_size(280.0).size_range(180.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.markup_list(ui));
         }
         if self.overview && has_doc {
             self.shortcuts(&ctx);
