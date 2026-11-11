@@ -8,7 +8,8 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "Copeland Building Envelope Consulting"
+      VALUE "CompanyName", "Copeland Building Envelope Consulting, Inc."
+      VALUE "LegalCopyright", "Copyright (c) 2026 Copeland Building Envelope Consulting, Inc. MIT OR Apache-2.0"
       VALUE "FileDescription", "Greenline PDF markup"
       VALUE "FileVersion", "1.3.1"
       VALUE "ProductName", "Greenline"

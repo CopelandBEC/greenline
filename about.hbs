@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Greenline third-party licences</title>
+<style>
+body { font: 14px/1.5 system-ui, sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; color: #222; }
+h1 { color: #446904; }
+pre { white-space: pre-wrap; background: #f4f6f1; padding: 1em; border-radius: 4px; }
+li.crates { font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>Third-party licences</h1>
+<p>Greenline is built with the open-source Rust crates listed below, grouped by licence. It also ships PDFium (BSD-3-Clause / Apache-2.0, in <code>PDFIUM-LICENSE</code>) and the Montserrat font (SIL Open Font License, in <code>Montserrat-OFL.txt</code>).</p>
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+<h2>Licence texts</h2>
+{{#each licenses}}
+<h3 id="{{id}}">{{name}}</h3>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+  <li class="crates"><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+{{/each}}
+</body>
+</html>

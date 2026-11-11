@@ -1,6 +1,6 @@
 # Greenline
 
-Fast, native PDF markup for senior review of drawing sets, specs and decks, in Copeland colours. Rust + egui + PDFium. (Called Redline before 1.3; installing over it keeps your markups.)
+Fast, native PDF markup for senior review of drawing sets, specs and decks. Built by [Copeland Building Envelope Consulting](https://copelandbec.com) for its own reviews, in Copeland colours. Rust + egui + PDFium, for Windows and Linux. (Called Redline before 1.3; installing over it keeps your markups.)
 
 ## Install
 
@@ -29,3 +29,23 @@ Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` o
 ## Build and release
 
 CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together.
+
+After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo install --locked --features cli cargo-about`) to regenerate `THIRD-PARTY-LICENSES.html`, which the installer ships alongside our licences, PDFium's and Montserrat's.
+
+## Contributing
+
+Greenline is provided as-is. Issues are turned off: if you've found a problem, send a pull request that fixes it. Pull requests are welcome, and a clear one is much easier to accept. In the description, cover:
+
+- **What and why.** The bug or missing feature, in a sentence or two, and who it affects.
+- **For a bug, how to reproduce it.** Steps, what you expected, what happened, and your OS. Attach or describe a PDF that shows it if you can (nothing confidential).
+- **How you fixed it.** The approach, and any alternatives you considered and rejected.
+- **How you checked it.** `cargo test` on which OS; for a bug, how you confirmed it happened before your change and is gone after; for UI changes, a screenshot or short clip, in light and dark mode if it affects the look.
+- **Anything it touches beyond the obvious.** Export output, saved markup files (`<data dir>/*.json`, which must keep loading in older and newer versions), Windows vs Linux behaviour, new dependencies and their licences.
+
+Keep each pull request to one change, and match the surrounding code style with no new compiler warnings. By submitting a pull request you agree to license your contribution under the same terms as the project (below).
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Copyright (c) 2026 Copeland Building Envelope Consulting, Inc.
+
+The licence covers the code. It doesn't grant rights to the Copeland or CopelandBEC names, logos or branding. If you distribute a modified version, don't present it as an official Copeland product.

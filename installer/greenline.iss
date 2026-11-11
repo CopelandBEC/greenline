@@ -13,7 +13,9 @@ AppId={{9CD48A8B-E8E2-417B-BF40-2016BFE2F448}
 AppName=Greenline
 AppVersion={#AppVersion}
 AppVerName=Greenline {#AppVersion}
-AppPublisher=Copeland Building Envelope Consulting
+AppPublisher=Copeland Building Envelope Consulting, Inc.
+AppPublisherURL=https://github.com/copelandbec/greenline
+AppCopyright=Copyright (c) 2026 Copeland Building Envelope Consulting, Inc.
 VersionInfoVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\Greenline
 UsePreviousAppDir=no
@@ -41,6 +43,9 @@ Name: "openwith"; Description: "Add Greenline to ""Open with"" for PDF files (do
 Source: "..\target\release\greenline.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vendor\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vendor\PDFIUM-LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\LICENSE-MIT"; DestDir: "{app}\licenses"; DestName: "Greenline-LICENSE-MIT.txt"; Flags: ignoreversion
+Source: "..\LICENSE-APACHE"; DestDir: "{app}\licenses"; DestName: "Greenline-LICENSE-APACHE.txt"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-LICENSES.html"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\assets\fonts\OFL.txt"; DestDir: "{app}\licenses"; DestName: "Montserrat-OFL.txt"; Flags: ignoreversion
 
 [InstallDelete]
