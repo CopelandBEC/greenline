@@ -14,8 +14,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Fetched from GitHub rather than apt: the runners' apt intermittently can't resolve the Ubuntu mirrors.
       - name: Fonts used by the export tests
-        run: sudo apt-get update -q && sudo apt-get install -yq fonts-liberation fonts-noto-core
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/share/fonts/truetype/liberation /usr/share/fonts/truetype/noto
+          curl -fsSL --retry 3 https://github.com/liberationfonts/liberation-fonts/files/7261482/liberation-fonts-ttf-2.1.5.tar.gz \
+            | sudo tar -xz --strip-components=1 -C /usr/share/fonts/truetype/liberation liberation-fonts-ttf-2.1.5/LiberationSans-Regular.ttf
+          for f in NotoSans NotoSansMath NotoSansSymbols NotoSansSymbols2; do
+            sudo curl -fsSL --retry 3 -o /usr/share/fonts/truetype/noto/$f-Regular.ttf \
+              https://github.com/notofonts/notofonts.github.io/raw/main/fonts/$f/hinted/ttf/$f-Regular.ttf
+          done
+          ls -l /usr/share/fonts/truetype/liberation /usr/share/fonts/truetype/noto
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - run: scripts/fetch-pdfium.sh
       - run: cargo test --release
