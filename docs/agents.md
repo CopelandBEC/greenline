@@ -4,6 +4,8 @@
 
 Every command prints JSON. Errors go to standard error with exit code 1. `greenline-cli help` lists the commands, and `greenline-cli ops` gives the op reference.
 
+In a chat client without a shell, the same commands are MCP tools: add a server that runs `greenline-cli mcp`. Use a script when you can, though. A takeoff of many windows is much faster in one program than in tool calls.
+
 ## Coordinates
 
 Everything uses **page points** on the page as displayed: the origin is at the top-left, y runs down, and there are 72 points per paper inch. Pages count from 1. `text`, `paths`, `snap`, `render` and `list` all report in these coordinates, and ops take them.

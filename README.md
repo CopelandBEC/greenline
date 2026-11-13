@@ -41,6 +41,8 @@ Everything an agent adds is a **proposal**. It appears in Greenline for you to a
 
 Example jobs: "review sheets A3.0–A5.1 and cloud any air or water barrier discontinuities", or "outline every window on the elevations, measure them and give me a takeoff spreadsheet".
 
+An agent with a shell (Claude Code, Codex) uses the command line directly and does best when it writes a script. A chat client without a shell can use the same commands as MCP tools: add a server whose command is `greenline-cli mcp`, for example `claude mcp add greenline -- greenline-cli mcp`.
+
 ## Build and release
 
 CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together.
