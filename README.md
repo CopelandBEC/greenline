@@ -16,13 +16,15 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `Ctrl+click` with a callout selected | Add another leader: arrowhead at the click, tail at the first leader's bend; drag a tip to adjust |
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
+| `D` `E` | Measure a length or an area: click the points, double-click or `Enter` to finish (drag for one segment or a rectangle); `Shift` squares a point to the last |
+| `U` | Scale for measuring: pick the drawing scale, use one written on the sheet, calibrate on a known dimension, or add a region for a detail at its own scale. A reduced or scanned set needs calibrating |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
 | `1`–`6`, `[` `]`, `{` `}` | Colour (CopelandBEC medium green by default, then red, blue, black, orange, yellow), line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
-| `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original |
+| `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original; **Export → Measurements (CSV)** lists every measurement's length, area, width and height for a takeoff |
 | `F1` | All shortcuts, your name for exported comments, and light/dark appearance |
 
 Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` on Linux; an old Redline folder is moved there on first launch); the source PDF is never modified. Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.

@@ -4,6 +4,7 @@
 mod annot;
 mod app;
 mod fonts;
+mod measure;
 mod render;
 mod sidecar;
 mod stamps;

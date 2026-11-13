@@ -2,6 +2,7 @@
 //! ~/.local/share/greenline/<hash of the PDF path>.json.
 
 use crate::annot::Annot;
+use crate::measure::{Scale, Units};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -10,6 +11,9 @@ use std::sync::OnceLock;
 pub struct Sidecar {
     pub pdf: PathBuf,
     pub annots: Vec<Annot>,
+    /// Drawing scales set on its pages (files from before 1.5 have none).
+    #[serde(default)]
+    pub scales: Vec<Scale>,
 }
 
 /// ~/.local/share/greenline on Linux, %APPDATA%\\Greenline on Windows.
@@ -74,6 +78,8 @@ pub struct Prefs {
     pub date_format: String,
     /// Light, dark, or follow the system.
     pub theme: egui::ThemePreference,
+    /// How measurements read: feet-inches or metric.
+    pub units: Units,
 }
 
 impl Default for Prefs {
@@ -85,6 +91,7 @@ impl Default for Prefs {
             author: String::new(),
             date_format: "%m/%d/%Y".into(),
             theme: egui::ThemePreference::System,
+            units: Units::Imperial,
         }
     }
 }
@@ -113,11 +120,11 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
     }
 }
 
-pub fn save(pdf: &Path, annots: &[Annot]) -> anyhow::Result<()> {
+pub fn save(pdf: &Path, annots: &[Annot], scales: &[Scale]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir())?;
     let f = file_for(pdf);
     let tmp = f.with_extension(format!("json.{}.tmp", std::process::id()));
-    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec() };
+    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec() };
     std::fs::write(&tmp, serde_json::to_vec(&s)?)?;
     std::fs::rename(tmp, f)?;
     Ok(())

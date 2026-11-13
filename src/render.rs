@@ -29,6 +29,8 @@ pub enum Req {
     /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
     Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
+    /// A page's text, for the scales written on it.
+    PageText { generation: u64, page: usize },
 }
 
 pub enum Resp {
@@ -38,6 +40,7 @@ pub enum Resp {
     RenderFailed { generation: u64, page: usize, layer: Layer, error: String },
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
+    PageText { generation: u64, page: usize, text: String },
 }
 
 pub struct Worker {
@@ -137,6 +140,14 @@ fn run(
                     Ok(image) => Resp::Rendered { generation, page, scale, origin, layer, image },
                     Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
                 }
+            }
+            Req::PageText { generation, page } => {
+                let Some((g, d)) = &doc else { continue };
+                if *g != generation {
+                    continue;
+                }
+                let text = d.pages().get(page as PdfPageIndex).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
+                Resp::PageText { generation, page, text }
             }
             Req::Export { src, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
@@ -613,6 +624,39 @@ mod tests {
         }
         let missing = annot(0, Kind::Image { rect, image: "ab.png".into(), name: "Seal".into() });
         assert!(export(pdfium, &src, &out, &[missing], &HashMap::new(), ExportMode::Flatten, "test").is_err(), "missing image must fail");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An L-shaped area exports filled inside the L only, with its value text,
+    /// and a length with its ticks: measurements go through prims like any markup.
+    #[test]
+    fn export_measurements() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+        let l = vec![pos2(50.0, 50.0), pos2(350.0, 50.0), pos2(350.0, 150.0), pos2(150.0, 150.0), pos2(150.0, 350.0), pos2(50.0, 350.0)];
+        let mut annots = vec![
+            annot(0, Kind::Measure { pts: l, area: true, name: "Roof A".into(), value: String::new(), size: 10.0 }),
+            annot(0, Kind::Measure { pts: vec![pos2(50.0, 500.0), pos2(350.0, 500.0)], area: false, name: String::new(), value: String::new(), size: 10.0 }),
+        ];
+        let scales = vec![crate::measure::Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
+        crate::measure::relabel(&mut annots, &scales, crate::measure::Units::Imperial);
+        export(pdfium, &src, &out, &annots, &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let text = page.text().unwrap().all();
+        assert!(text.contains("Roof A: 154.32 sf") && text.contains("16'-8\""), "{text:?}");
+        let img = render_region(&doc, 0, 1.0, [0, 0], [400, 600]).unwrap();
+        let px = |x: usize, y: usize| img.pixels[y * 400 + x];
+        assert!(px(300, 100).g() < 245, "inside the L's arm is tinted: {:?}", px(300, 100));
+        assert!(px(300, 300).r() > 250 && px(300, 300).g() > 250, "the notch stays white: {:?}", px(300, 300));
+        assert!(px(50, 492).g() < 200, "end tick: {:?}", px(50, 492));
         std::fs::remove_dir_all(&dir).ok();
     }
 

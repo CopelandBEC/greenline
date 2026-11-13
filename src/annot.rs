@@ -42,6 +42,10 @@ pub enum Kind {
     /// Stamp or signature from the image library (`stamps`), drawn into `rect`.
     /// `image` is the stored file's name; `name` is what the markup list shows.
     Image { rect: Rect, image: String, name: String },
+    /// Measurement: a length along open `pts`, or the area inside them when
+    /// `area`. `value` is the text drawn on the sheet (`name: 12'-6"`), kept up
+    /// to date from the page's scale by `measure::relabel`.
+    Measure { pts: Vec<Pos2>, area: bool, #[serde(default)] name: String, #[serde(default)] value: String, size: f32 },
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +196,7 @@ impl Annot {
     pub fn label(&self) -> &str {
         match &self.kind {
             Kind::Image { name, .. } if !name.trim().is_empty() => name,
+            Kind::Measure { value, .. } => value,
             _ if !self.text().trim().is_empty() => self.text(),
             _ => self.kind_name(),
         }
@@ -216,6 +221,8 @@ impl Annot {
             Kind::Line { .. } => "Line",
             Kind::Pen { .. } => "Pen",
             Kind::Image { .. } => "Stamp",
+            Kind::Measure { area: false, .. } => "Length",
+            Kind::Measure { area: true, .. } => "Area",
         }
     }
 
@@ -256,7 +263,30 @@ impl Annot {
                 }
                 r.expand(w)
             }
+            Kind::Measure { pts, .. } => {
+                let r = pts.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p))).expand(tick_len(w) + w);
+                self.value_box().map_or(r, |(b, _)| r.union(b))
+            }
         }
+    }
+
+    /// A measurement's value label: its box and the text's baseline origin.
+    pub fn value_box(&self) -> Option<(Rect, Pos2)> {
+        let Kind::Measure { pts, area, value, size, .. } = &self.kind else { return None };
+        if value.is_empty() || pts.len() < 2 {
+            return None;
+        }
+        let at = if *area {
+            centroid(pts)
+        } else {
+            // Middle of the longest segment.
+            let w = pts.windows(2).max_by(|a, b| (a[1] - a[0]).length().total_cmp(&(b[1] - b[0]).length()))?;
+            w[0] + (w[1] - w[0]) * 0.5
+        };
+        let p = 0.3 * size;
+        let half = vec2(text_width(value, *size) / 2.0 + p, line_h(*size) / 2.0 + p);
+        let r = Rect::from_center_size(at, half * 2.0);
+        Some((r, pos2(r.min.x + p, r.min.y + p + ascent(*size))))
     }
 
     pub fn translate(&mut self, d: Vec2) {
@@ -267,7 +297,7 @@ impl Annot {
                 *a += d;
                 *b += d;
             }
-            Kind::Pen { pts } => pts.iter_mut().for_each(|p| *p += d),
+            Kind::Pen { pts } | Kind::Measure { pts, .. } => pts.iter_mut().for_each(|p| *p += d),
         }
     }
 
@@ -282,6 +312,9 @@ impl Annot {
             if rect.contains(p) {
                 return 0.0;
             }
+        }
+        if self.value_box().is_some_and(|(r, _)| r.contains(p)) {
+            return 0.0;
         }
         let mut best = f32::INFINITY;
         for prim in self.prims() {
@@ -312,6 +345,9 @@ impl Annot {
             if rect.intersects(r) {
                 return true;
             }
+        }
+        if self.value_box().is_some_and(|(b, _)| b.intersects(r)) {
+            return true;
         }
         let r = r.expand(self.width / 2.0);
         self.prims().iter().any(|prim| match prim {
@@ -354,6 +390,25 @@ impl Annot {
             Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c }),
             Kind::Pen { pts } => out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c }),
             Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
+            Kind::Measure { pts, area, value, size, .. } => {
+                if *area && pts.len() >= 3 {
+                    out.push(Prim::Fill { pts: pts.clone(), color: c, alpha: 40, outline: Some((c, w)) });
+                } else if pts.len() >= 2 {
+                    out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c });
+                    // Ticks square to the line at both ends, like a dimension.
+                    for (end, next) in [(pts[0], pts[1]), (pts[pts.len() - 1], pts[pts.len() - 2])] {
+                        let d = next - end;
+                        if d.length() > 0.01 {
+                            let n = vec2(-d.y, d.x).normalized() * tick_len(w);
+                            out.push(Prim::Stroke { pts: vec![end - n, end + n], closed: false, width: w, color: c });
+                        }
+                    }
+                }
+                if let Some((r, origin)) = self.value_box() {
+                    out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 235, outline: None });
+                    out.push(Prim::Text { origin, text: value.clone(), size: *size, color: c });
+                }
+            }
         }
         out
     }
@@ -382,6 +437,42 @@ pub fn aspect_rect(fixed: Pos2, p: Pos2, aspect: f32) -> Rect {
     }
     let (w, h) = if w < 4.0 { (4.0, 4.0 / aspect) } else { (w, h) };
     Rect::from_two_pos(fixed, fixed + vec2(d.x.signum() * w, d.y.signum() * h))
+}
+
+/// Half-length of a length measurement's end ticks.
+pub fn tick_len(width: f32) -> f32 {
+    4.0 + 1.5 * width
+}
+
+/// Area centroid of a polygon, or the middle of its bounds when that falls
+/// outside it (an L or U shape) or the polygon has no area.
+pub fn centroid(pts: &[Pos2]) -> Pos2 {
+    let bounds = pts.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p)));
+    let (mut a, mut cx, mut cy) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..pts.len() {
+        let (p, q) = (pts[i], pts[(i + 1) % pts.len()]);
+        let cross = p.x as f64 * q.y as f64 - q.x as f64 * p.y as f64;
+        a += cross;
+        cx += (p.x + q.x) as f64 * cross;
+        cy += (p.y + q.y) as f64 * cross;
+    }
+    if a.abs() < 1e-6 {
+        return bounds.center();
+    }
+    let c = pos2((cx / (3.0 * a)) as f32, (cy / (3.0 * a)) as f32);
+    if inside(pts, c) { c } else { bounds.center() }
+}
+
+/// Even-odd point-in-polygon test.
+pub fn inside(pts: &[Pos2], p: Pos2) -> bool {
+    let mut odd = false;
+    for i in 0..pts.len() {
+        let (a, b) = (pts[i], pts[(i + pts.len() - 1) % pts.len()]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            odd = !odd;
+        }
+    }
+    odd
 }
 
 pub fn rect_pts(r: Rect) -> Vec<Pos2> {

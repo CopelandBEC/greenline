@@ -1,4 +1,5 @@
 use crate::annot::{self, Annot, Kind, Prim, Rgb};
+use crate::measure::{self, Scale, Units};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
 use crate::stamps;
@@ -47,9 +48,17 @@ pub enum Tool {
     Arrow,
     Line,
     Pen,
+    /// Length measurement: click its points, double-click or Enter to finish (or drag one segment).
+    Length,
+    /// Area measurement: click its corners, close on the first or double-click (or drag a rectangle).
+    Area,
+    /// Draw a line along a known dimension to calibrate the scale (from the scale window).
+    Calibrate,
+    /// Drag a box round a detail that has its own scale (from the scale window).
+    ScaleRegion,
 }
 
-const TOOLS: [(Tool, &str, Key); 9] = [
+const TOOLS: [(Tool, &str, Key); 11] = [
     (Tool::Select, "Select", Key::V),
     (Tool::Callout, "Callout", Key::C),
     (Tool::Text, "Text", Key::T),
@@ -59,9 +68,11 @@ const TOOLS: [(Tool, &str, Key); 9] = [
     (Tool::Arrow, "Arrow", Key::A),
     (Tool::Line, "Line", Key::L),
     (Tool::Pen, "Pen", Key::P),
+    (Tool::Length, "Length", Key::D),
+    (Tool::Area, "Area", Key::E),
 ];
 
-/// The first is the default for new markups: Copeland medium green.
+/// The first is the default for new markups: CopelandBEC medium green.
 const COLORS: [(Rgb, &str); 6] = [
     ([0x6B, 0x9A, 0x1E], "Green"),
     ([228, 0, 0], "Red"),
@@ -90,6 +101,8 @@ enum Handle {
     Anchor,
     /// Tip of a callout's extra leader, by index in its `leaders`.
     Leader(usize),
+    /// A measurement's point, by index.
+    Vertex(usize),
     A,
     B,
 }
@@ -128,6 +141,22 @@ struct Mods {
     /// Ctrl (Cmd) without Shift: with one callout selected, clicking empty
     /// space adds a leader there.
     ctrl: bool,
+    /// Shift: square a measurement's next point to the last one.
+    shift: bool,
+}
+
+/// The scale window (U) and what it is in the middle of.
+#[derive(Default)]
+struct ScaleWin {
+    open: bool,
+    /// Region the next scale is for, drawn with `Tool::ScaleRegion`; otherwise the whole page.
+    target: Option<(usize, Rect)>,
+    /// Calibration line awaiting its real length.
+    calib: Option<(usize, Pos2, Pos2)>,
+    calib_text: String,
+    /// Scales written on each page, from its text.
+    found: HashMap<usize, Vec<(String, f64)>>,
+    asked: HashSet<usize>,
 }
 
 pub struct App {
@@ -174,6 +203,13 @@ pub struct App {
     sidebar_synced: Option<usize>,
 
     annots: Vec<Annot>,
+    /// Drawing scales on this document's pages.
+    scales: Vec<Scale>,
+    /// Measurement (or calibration line) being clicked out: its page and points so far.
+    building: Option<(usize, Vec<Pos2>)>,
+    scale_win: ScaleWin,
+    /// Shift held over the canvas (squares a measurement's next point).
+    shift: bool,
     next_id: u64,
     undo: Vec<Vec<Annot>>,
     redo: Vec<Vec<Annot>>,
@@ -279,6 +315,10 @@ impl App {
             overview_scroll: false,
             sidebar_synced: None,
             annots: Vec::new(),
+            scales: Vec::new(),
+            building: None,
+            scale_win: ScaleWin::default(),
+            shift: false,
             next_id: 1,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -349,6 +389,9 @@ impl App {
         self.drag = Drag::None;
         self.placing = None;
         self.annots = Vec::new();
+        self.scales = Vec::new();
+        self.building = None;
+        self.scale_win = ScaleWin { open: self.scale_win.open, ..Default::default() };
         self.next_id = 1;
         self.lock = None;
         self.read_only = false;
@@ -362,6 +405,7 @@ impl App {
             Ok(Some(s)) => {
                 self.next_id = s.annots.iter().map(|a| a.id + 1).max().unwrap_or(1);
                 self.annots = s.annots;
+                self.scales = s.scales;
             }
             Ok(None) => {}
             // Never autosave over a markups file we couldn't read.
@@ -493,7 +537,7 @@ impl App {
             self.dirty = false;
             return;
         };
-        match sidecar::save(p, &self.annots) {
+        match sidecar::save(p, &self.annots, &self.scales) {
             Ok(()) => self.dirty = false,
             Err(e) => {
                 // Stays dirty; retried on the next change or document switch.
@@ -554,6 +598,9 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::PageText { generation, page, text } if generation == self.generation => {
+                    self.scale_win.found.insert(page, measure::find_scales(&text));
+                }
                 _ => {}
             }
         }
@@ -915,6 +962,7 @@ impl App {
             }
             Kind::Arrow { a: p, b } | Kind::Line { a: p, b } => vec![(Handle::A, *p), (Handle::B, *b)],
             Kind::Pen { .. } => vec![],
+            Kind::Measure { pts, .. } => pts.iter().enumerate().map(|(i, p)| (Handle::Vertex(i), *p)).collect(),
         }
     }
 
@@ -947,6 +995,11 @@ impl App {
             }
             (Kind::Arrow { a, .. } | Kind::Line { a, .. }, Handle::A) => *a = p,
             (Kind::Arrow { b, .. } | Kind::Line { b, .. }, Handle::B) => *b = p,
+            (Kind::Measure { pts, .. }, Handle::Vertex(i)) => {
+                if let Some(v) = pts.get_mut(i) {
+                    *v = p;
+                }
+            }
             _ => {}
         }
     }
@@ -991,6 +1044,7 @@ impl App {
 
     fn set_tool(&mut self, t: Tool) {
         self.commit_edit();
+        self.finish_measure();
         self.placing = None;
         self.tool = t;
         if t != Tool::Select {
@@ -1108,6 +1162,26 @@ impl App {
         if pressed(Key::I) {
             self.toggle_right_panel(true);
         }
+        if pressed(Key::U) {
+            self.scale_win.open = !self.scale_win.open;
+        }
+        // A measurement being clicked out: Enter finishes, Esc drops it, Backspace takes back a point.
+        if self.building.is_some() {
+            if pressed(Key::Enter) {
+                self.finish_measure();
+            } else if pressed(Key::Escape) {
+                self.building = None;
+                self.toast("Measurement cancelled".into());
+            } else if pressed(Key::Backspace) || pressed(Key::Delete) {
+                if let Some((_, pts)) = &mut self.building {
+                    pts.pop();
+                    if pts.is_empty() {
+                        self.building = None;
+                    }
+                }
+            }
+            return;
+        }
         for (t, _, k) in TOOLS {
             if pressed(k) {
                 self.set_tool(t);
@@ -1120,6 +1194,8 @@ impl App {
             }
             if self.placing.take().is_some() {
                 self.toast("Placing cancelled".into());
+            } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
+                self.set_tool(Tool::Select);
             } else if !self.selected.is_empty() {
                 self.selected.clear()
             } else {
@@ -1218,7 +1294,13 @@ impl App {
         let (hover, scroll, zoom_delta, space, press_origin, latest) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.smooth_scroll_delta, i.zoom_delta(), i.key_down(Key::Space), i.pointer.press_origin(), i.pointer.latest_pos())
         });
-        let mods = ctx.input(|i| Mods { add: i.modifiers.command || i.modifiers.shift, single: i.modifiers.alt, ctrl: i.modifiers.command && !i.modifiers.shift });
+        let mods = ctx.input(|i| Mods {
+            add: i.modifiers.command || i.modifiers.shift,
+            single: i.modifiers.alt,
+            ctrl: i.modifiers.command && !i.modifiers.shift,
+            shift: i.modifiers.shift,
+        });
+        self.shift = mods.shift;
         self.hover = hover.filter(|_| resp.hovered());
 
         if resp.hovered() {
@@ -1442,6 +1524,14 @@ impl App {
             }
             return;
         }
+        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate) && !was_editing {
+            self.measure_point(page, p, double, mods.shift);
+            return;
+        }
+        if self.tool == Tool::ScaleRegion {
+            self.toast("Drag a box round the detail that has its own scale · Esc cancels".into());
+            return;
+        }
         // Ctrl+click on empty space with one callout selected adds a leader.
         // This beats the other tool actions, so it works on the click that
         // ends typing and right after placing a callout with C.
@@ -1508,6 +1598,10 @@ impl App {
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
         let end = bounds.clamp(end);
+        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion) {
+            self.create_measure(page, start, end);
+            return;
+        }
         let rect = Rect::from_two_pos(start, end);
         let size = self.text_size;
         let tiny = rect.width() < 3.0 / self.zoom.min(1.0) && rect.height() < 3.0 / self.zoom.min(1.0);
@@ -1542,7 +1636,7 @@ impl App {
             Tool::Highlight => Kind::Highlight { rect },
             Tool::Arrow => Kind::Arrow { a: start, b: end },
             Tool::Line => Kind::Line { a: start, b: end },
-            Tool::Select | Tool::Pen => return,
+            Tool::Select | Tool::Pen | Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion => return,
         };
         self.snapshot();
         let is_text = matches!(kind, Kind::Callout { .. } | Kind::Text { .. });
@@ -1556,6 +1650,301 @@ impl App {
         }
         if is_text {
             self.start_edit(id);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Measuring
+
+    /// A click with a measuring tool: starts a measurement, adds a point, or
+    /// finishes it (double-click, the area's first point again, or a
+    /// calibration line's second point).
+    fn measure_point(&mut self, page: usize, p: Pos2, double: bool, shift: bool) {
+        let p = Rect::from_min_size(Pos2::ZERO, self.pages[page]).clamp(p);
+        let tol = HIT_PX / self.zoom;
+        let (area, calibrating) = (self.tool == Tool::Area, self.tool == Tool::Calibrate);
+        let Some((pg, pts)) = &mut self.building else {
+            self.building = Some((page, vec![p]));
+            if !calibrating {
+                let finish = if area { "click the first point or double-click to close" } else { "double-click or Enter to finish" };
+                self.toast(format!("Click the next point · {finish} · Shift squares it · Backspace takes one back · Esc drops it"));
+            }
+            return;
+        };
+        if *pg != page {
+            let other = *pg + 1;
+            self.toast(format!("Finish the measurement on page {other} first (Enter), or Esc to drop it"));
+            return;
+        }
+        let last = *pts.last().unwrap();
+        let p = if shift { square(last, p) } else { p };
+        let closes = area && pts.len() >= 3 && (pts[0] - p).length() <= tol;
+        // The second click of a double-click lands on the first.
+        if !closes && (p - last).length() > 2.0 / self.zoom {
+            pts.push(p);
+        }
+        if double || closes || (calibrating && pts.len() >= 2) {
+            self.finish_measure();
+        }
+    }
+
+    /// Ends the measurement being clicked out, adding it if it has enough
+    /// points; a calibration line goes to the scale window instead.
+    fn finish_measure(&mut self) {
+        let Some((page, pts)) = self.building.take() else { return };
+        match self.tool {
+            Tool::Calibrate if pts.len() >= 2 => self.set_calibration(page, pts[0], pts[pts.len() - 1]),
+            Tool::Length if pts.len() >= 2 => self.add_measure(page, pts, false),
+            Tool::Area if pts.len() >= 3 => self.add_measure(page, pts, true),
+            Tool::Area => self.toast("An area needs at least three points".into()),
+            _ => {}
+        }
+    }
+
+    /// A drag with a measuring tool: one segment, a rectangle, a calibration
+    /// line or a scale region. While clicking out a measurement, its end is the next point.
+    fn create_measure(&mut self, page: usize, start: Pos2, end: Pos2) {
+        if self.building.is_some() {
+            self.measure_point(page, end, false, self.shift);
+            return;
+        }
+        if (end - start).length() * self.zoom < 3.0 {
+            if self.tool != Tool::ScaleRegion {
+                self.measure_point(page, start, false, false);
+            }
+            return;
+        }
+        let squared = if self.shift { square(start, end) } else { end };
+        match self.tool {
+            Tool::Length => self.add_measure(page, vec![start, squared], false),
+            Tool::Area => {
+                let r = Rect::from_two_pos(start, end);
+                if r.width().min(r.height()) * self.zoom >= 3.0 {
+                    self.add_measure(page, annot::rect_pts(r), true);
+                }
+            }
+            Tool::Calibrate => self.set_calibration(page, start, squared),
+            Tool::ScaleRegion => {
+                self.scale_win.target = Some((page, Rect::from_two_pos(start, end)));
+                self.scale_win.open = true;
+                self.tool = Tool::Select;
+                self.toast("Region drawn: now choose or calibrate its scale in the scale window".into());
+            }
+            _ => {}
+        }
+    }
+
+    fn add_measure(&mut self, page: usize, pts: Vec<Pos2>, area: bool) {
+        self.snapshot();
+        let id = self.add(page, Kind::Measure { pts, area, name: String::new(), value: String::new(), size: self.text_size });
+        measure::relabel(&mut self.annots, &self.scales, self.prefs.units);
+        let Some(a) = self.find(id) else { return };
+        let msg = if let Kind::Measure { pts, .. } = &a.kind {
+            match measure::scale_for(&self.scales, page, pts) {
+                Some(_) => format!("{}: {}", a.kind_name(), a.label()),
+                None => format!("No scale on page {} yet: press U to set one", page + 1),
+            }
+        } else {
+            String::new()
+        };
+        self.toast(msg);
+    }
+
+    fn set_calibration(&mut self, page: usize, a: Pos2, b: Pos2) {
+        self.tool = Tool::Select;
+        if (b - a).length() * self.zoom < 10.0 {
+            self.toast("Calibration line too short: zoom in and drag along a longer dimension".into());
+            return;
+        }
+        self.scale_win.calib = Some((page, a, b));
+        self.scale_win.calib_text.clear();
+        self.scale_win.open = true;
+        self.toast("Type the line's real length in the scale window".into());
+    }
+
+    /// The page the scale window is working on.
+    fn scale_page(&self) -> usize {
+        self.scale_win.calib.map(|c| c.0).or(self.scale_win.target.map(|t| t.0)).unwrap_or_else(|| self.current_page())
+    }
+
+    /// Sets `page`'s scale (or the scale window's target region's), replacing the one it had.
+    fn apply_scale(&mut self, page: usize, per_pt: f64, label: String) {
+        let region = self.scale_win.target.filter(|(p, _)| *p == page).map(|(_, r)| r);
+        self.scales.retain(|s| !(s.page == page && s.region == region));
+        self.scales.push(Scale { page, region, per_pt, label: label.clone() });
+        self.scale_win.target = None;
+        self.scale_win.calib = None;
+        self.scale_win.calib_text.clear();
+        self.changed();
+        let what = if region.is_some() { format!("Page {} region", page + 1) } else { format!("Page {}", page + 1) };
+        self.toast(format!("{what} scale: {label} · check it against a dimension on the sheet"));
+    }
+
+    fn scale_window(&mut self, ctx: &egui::Context) {
+        if !self.scale_win.open || self.pages.is_empty() {
+            return;
+        }
+        let page = self.scale_page().min(self.pages.len() - 1);
+        if let Some(w) = &self.worker {
+            if self.scale_win.asked.insert(page) {
+                w.send(Req::PageText { generation: self.generation, page });
+            }
+        }
+        let units = self.prefs.units;
+        let target = self.scale_win.target.filter(|(p, _)| *p == page).map(|(_, r)| r);
+        let mut open = true;
+        let mut apply: Option<(f64, String)> = None;
+        let mut remove = None;
+        let mut copy_all = false;
+        egui::Window::new("Scale").open(&mut open).resizable(false).default_pos(self.canvas.right_top() + vec2(-330.0, 20.0)).show(ctx, |ui| {
+            ui.set_max_width(300.0);
+            let current = if target.is_some() { None } else { self.scales.iter().find(|s| s.page == page && s.region.is_none()).cloned() };
+            ui.label(egui::RichText::new(format!("Page {}{}", page + 1, if target.is_some() { " · new region" } else { "" })).strong());
+            ui.label(match (&current, target) {
+                (_, Some(_)) => "Set this region's scale:".to_string(),
+                (Some(s), None) => format!("Scale: {}", s.label),
+                (None, None) => "No scale yet: measurements read \"no scale\"".to_string(),
+            });
+            ui.horizontal(|ui| {
+                ui.label("Drawing scale");
+                egui::ComboBox::from_id_salt("scale-preset").selected_text("Choose…").height(420.0).show_ui(ui, |ui| {
+                    for (label, ratio) in measure::PRESETS {
+                        if ui.selectable_label(false, *label).clicked() {
+                            apply = Some((Scale::from_ratio(page, None, *ratio, label).per_pt, label.to_string()));
+                        }
+                    }
+                });
+            });
+            let found = self.scale_win.found.get(&page).cloned().unwrap_or_default();
+            if !found.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("On this sheet:");
+                    for (label, ratio) in &found {
+                        if ui.button(label).on_hover_text("Written on the sheet. Use it for this page (or the region)").clicked() {
+                            apply = Some((Scale::from_ratio(page, None, *ratio, label).per_pt, label.clone()));
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            match self.scale_win.calib {
+                Some((cp, a, b)) if cp == page => {
+                    let len = (b - a).length() as f64;
+                    ui.label(format!("Calibration line: {} on paper", measure::fmt_len(len / 72.0, Units::Imperial)));
+                    ui.horizontal(|ui| {
+                        ui.label("Its real length");
+                        let hint = if units == Units::Metric { "3.2 m" } else { "12'-6\"" };
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.scale_win.calib_text).hint_text(hint).desired_width(90.0));
+                        if !r.has_focus() && self.scale_win.calib_text.is_empty() {
+                            r.request_focus();
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Apply").clicked() || enter {
+                            match measure::parse_length(&self.scale_win.calib_text, units) {
+                                Some(real) => {
+                                    let per_pt = real / len;
+                                    let near = measure::PRESETS.iter().find(|(_, r)| (r / (per_pt * 72.0) - 1.0).abs() < 0.015).map(|(l, _)| format!(" (≈ {l})")).unwrap_or_default();
+                                    apply = Some((per_pt, format!("Calibrated: {}{near}", measure::fmt_len(real, units))));
+                                }
+                                None => self.toast("Couldn't read that length: try 12'-6\", 150\", 3.2 m or 3200 mm".into()),
+                            }
+                        }
+                    });
+                    if ui.small_button("Cancel calibration").clicked() {
+                        self.scale_win.calib = None;
+                    }
+                }
+                _ => {
+                    if ui.button("Calibrate…").on_hover_text("Drag along a dimension you know, then type its real length").clicked() {
+                        self.set_tool(Tool::Calibrate);
+                        self.toast("Drag along a dimension you know (or click its two ends) · Esc cancels".into());
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Add region…").on_hover_text("For a detail drawn at its own scale: drag a box round it, then set its scale").clicked() {
+                    self.set_tool(Tool::ScaleRegion);
+                    self.toast("Drag a box round the detail that has its own scale · Esc cancels".into());
+                }
+                if target.is_some() && ui.button("Back to whole page").clicked() {
+                    self.scale_win.target = None;
+                }
+            });
+            let regions: Vec<(usize, String)> = self.scales.iter().enumerate().filter(|(_, s)| s.page == page && s.region.is_some()).map(|(i, s)| (i, s.label.clone())).collect();
+            for (n, (i, label)) in regions.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Region {}: {label}", n + 1));
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(*i);
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Units");
+                for (u, name) in [(Units::Imperial, "Feet-inches"), (Units::Metric, "Metric")] {
+                    if ui.selectable_value(&mut self.prefs.units, u, name).changed() {
+                        self.prefs_dirty = true;
+                    }
+                }
+            });
+            if current.is_some() && self.pages.len() > 1 && ui.button(format!("Use on all {} pages", self.pages.len())).on_hover_text("This page's scale on every page; regions stay as they are").clicked() {
+                copy_all = true;
+            }
+            let size = self.pages[page] / 72.0;
+            let size_text = format!("{} × {} in", trim_num(size.x), trim_num(size.y));
+            if size.x.max(size.y) < 16.5 {
+                ui.colored_label(Color32::from_rgb(230, 120, 0), format!("This sheet is {size_text}, smaller than a drawing sheet. If it's a reduced print, the scale written on it is wrong here: calibrate instead."));
+            } else {
+                ui.weak(format!("Sheet {size_text}. A drawing scale assumes the PDF is at its printed size; a reduced or scanned set needs calibrating."));
+            }
+            ui.weak("Check a known dimension before relying on measurements.");
+        });
+        if !open {
+            self.scale_win.open = false;
+            self.scale_win.calib = None;
+            self.scale_win.target = None;
+            if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
+                self.set_tool(Tool::Select);
+            }
+        }
+        if let Some((per_pt, label)) = apply {
+            self.apply_scale(page, per_pt, label);
+        }
+        if let Some(i) = remove {
+            self.scales.remove(i);
+            self.changed();
+        }
+        if copy_all {
+            if let Some(s) = self.scales.iter().find(|s| s.page == page && s.region.is_none()).cloned() {
+                self.scales.retain(|t| t.region.is_some());
+                self.scales.extend((0..self.pages.len()).map(|p| Scale { page: p, ..s.clone() }));
+                self.changed();
+                self.toast(format!("{} on all {} pages", s.label, self.pages.len()));
+            }
+        }
+    }
+
+    /// Writes `<name>_measurements.csv` next to the PDF: one row per
+    /// measurement in page order, each value as text and as a number.
+    fn export_measurements(&mut self) {
+        self.commit_edit();
+        let Some(src) = &self.path else { return };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let out = src.with_file_name(format!("{stem}_measurements.csv"));
+        let units = self.prefs.units;
+        let mut order: Vec<&Annot> = self.annots.iter().filter(|a| matches!(a.kind, Kind::Measure { .. })).collect();
+        if order.is_empty() {
+            self.toast("No measurements yet (D for length, E for area)".into());
+            return;
+        }
+        order.sort_by_key(|a| page_order(a));
+        let csv = measure::csv(&order, &self.scales, units);
+        let unscaled = order.iter().filter(|a| measure::measured(a, &self.scales).is_none()).count();
+        match std::fs::write(&out, csv) {
+            Ok(()) if unscaled > 0 => self.toast(format!("Measurements → {} ({unscaled} with no scale)", out.display())),
+            Ok(()) => self.toast(format!("Measurements → {}", out.display())),
+            Err(e) => self.toast(format!("Could not write {}: {e}", out.display())),
         }
     }
 
@@ -1769,10 +2158,13 @@ impl App {
             }
             // Live preview.
             match &self.drag {
-                Drag::Create { page, start, cur } if *page == i => {
-                    let preview = self.preview_kind(*start, *cur);
+                Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
+                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate) { square(*start, *cur) } else { *cur };
+                    let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
-                        let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind, wrap_w: None, group: None };
+                        let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };
+                        let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None };
+                        measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
                         paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.7, &self.textures);
                     }
                 }
@@ -1785,6 +2177,42 @@ impl App {
                     pp.rect(r, 0.0, SEL.gamma_multiply(0.12), Stroke::new(1.0, SEL), egui::StrokeKind::Middle);
                 }
                 _ => {}
+            }
+            // The measurement being clicked out, running to the pointer.
+            if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i) {
+                let mut pts = pts.clone();
+                if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
+                    let h = self.screen_to_page(i, h);
+                    pts.push(if self.shift { square(*pts.last().unwrap(), h) } else { h });
+                }
+                let calibrating = self.tool == Tool::Calibrate;
+                let color = if calibrating { [0, 150, 255] } else { self.color() };
+                let kind = Kind::Measure { pts: pts.clone(), area: self.tool == Tool::Area && pts.len() >= 3, name: String::new(), value: String::new(), size: self.text_size };
+                let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None };
+                if !calibrating {
+                    measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
+                }
+                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.8, &self.textures);
+                for p in &pts {
+                    pp.circle_stroke(self.page_to_screen(i, *p), 3.0, Stroke::new(1.0, SEL));
+                }
+            }
+            // Scale regions and the calibration line while the scale window is up.
+            if self.scale_win.open || self.tool == Tool::ScaleRegion {
+                let regions = self.scales.iter().filter(|s| s.page == i).filter_map(|s| s.region.map(|r| (r, s.label.as_str())));
+                let target = self.scale_win.target.filter(|(p, _)| *p == i).map(|(_, r)| (r, "New region"));
+                for (r, label) in regions.chain(target) {
+                    let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max));
+                    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                    pp.extend(Shape::dashed_line(&pts, Stroke::new(1.5, SEL), 6.0, 4.0));
+                    pp.text(r.left_top() + vec2(4.0, 3.0), Align2::LEFT_TOP, label, FontId::proportional(12.0), SEL);
+                }
+            }
+            if let Some((_, a, b)) = self.scale_win.calib.filter(|(p, ..)| *p == i) {
+                pp.line_segment([self.page_to_screen(i, a), self.page_to_screen(i, b)], Stroke::new(2.0, SEL));
+                for p in [a, b] {
+                    pp.circle_stroke(self.page_to_screen(i, p), 4.0, Stroke::new(1.5, SEL));
+                }
             }
             // Where a stamp being placed will land: the drag so far, or centred on the pointer.
             if let Some(place) = &self.placing {
@@ -1851,6 +2279,10 @@ impl App {
             Tool::Highlight => Kind::Highlight { rect },
             Tool::Arrow => Kind::Arrow { a: start, b: cur },
             Tool::Line => Kind::Line { a: start, b: cur },
+            Tool::Length => Kind::Measure { pts: vec![start, cur], area: false, name: String::new(), value: String::new(), size },
+            Tool::Area => Kind::Measure { pts: annot::rect_pts(rect), area: true, name: String::new(), value: String::new(), size },
+            Tool::Calibrate => Kind::Line { a: start, b: cur },
+            Tool::ScaleRegion => Kind::Rect { rect },
             Tool::Select | Tool::Pen => return None,
         })
     }
@@ -1928,6 +2360,9 @@ impl App {
                     if ui.button("Comment list (CSV)").on_hover_text("<name>_comments.csv: page, type, comment").clicked() {
                         self.export_csv();
                     }
+                    if ui.button("Measurements (CSV)").on_hover_text("<name>_measurements.csv: page, name, length, area, width, height").clicked() {
+                        self.export_measurements();
+                    }
                 });
             });
             ui.separator();
@@ -1945,10 +2380,16 @@ impl App {
             }
             ui.separator();
             for (t, label, k) in TOOLS {
+                if t == Tool::Length {
+                    ui.separator();
+                }
                 let text = format!("{label} {}", k.name());
                 if ui.selectable_label(self.tool == t, text).clicked() {
                     self.set_tool(t);
                 }
+            }
+            if ui.selectable_label(self.scale_win.open, "Scale U").on_hover_text("Set the drawing scale for measuring").clicked() {
+                self.scale_win.open = !self.scale_win.open;
             }
             ui.separator();
             let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
@@ -1994,6 +2435,12 @@ impl App {
                 ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
                 ui.separator();
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
+                ui.separator();
+                let page = self.current_page();
+                let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
+                if ui.link(scale).on_hover_text("Drawing scale for measuring (U)").clicked() {
+                    self.scale_win.open = true;
+                }
                 ui.separator();
                 ui.label(format!("{} markups", self.annots.len()));
                 ui.separator();
@@ -2429,7 +2876,7 @@ impl App {
         });
         ui.separator();
         let mut order: Vec<&Annot> = self.annots.iter().collect();
-        order.sort_by(|a, b| (a.page, a.bounds().min.y as i64, a.bounds().min.x as i64).cmp(&(b.page, b.bounds().min.y as i64, b.bounds().min.x as i64)));
+        order.sort_by_key(|a| page_order(a));
         let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a).to_string())).collect();
         let mut clicked = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2491,7 +2938,7 @@ impl App {
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
         let out = src.with_file_name(format!("{stem}_comments.csv"));
         let mut order: Vec<&Annot> = self.annots.iter().collect();
-        order.sort_by(|a, b| (a.page, a.bounds().min.y as i64, a.bounds().min.x as i64).cmp(&(b.page, b.bounds().min.y as i64, b.bounds().min.x as i64)));
+        order.sort_by_key(|a| page_order(a));
         let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let mut csv = String::from("No,Page,Type,Colour,Comment\n");
         for (n, a) in order.iter().enumerate() {
@@ -2516,6 +2963,8 @@ impl App {
                     ("T", "Text box (click, or drag for width)"),
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
+                    ("D / E", "Measure length / area: click the points, double-click or Enter to finish (drag: one segment / a rectangle)"),
+                    ("U", "Scale: pick the drawing scale, use one written on the sheet, calibrate, or add a region for a detail"),
                     ("V or Esc", "Select: drag to move, handles to resize, double-click or Enter to edit text"),
                     ("Ctrl/Shift+click", "Add to or remove from selection (also in the markup list)"),
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
@@ -2579,6 +3028,8 @@ impl eframe::App for App {
             self.open(p);
         }
 
+        // Measurements read from the scales as they are now (cheap: measurements only).
+        measure::relabel(&mut self.annots, &self.scales, self.prefs.units);
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
         let has_doc = !self.pages.is_empty();
@@ -2625,6 +3076,7 @@ impl eframe::App for App {
         });
         }
         self.text_editor(&ctx);
+        self.scale_window(&ctx);
         self.goto_overlay(&ctx);
         self.help(&ctx);
         self.request_renders(&ctx, now);
@@ -2653,6 +3105,76 @@ impl eframe::App for App {
     }
 }
 
+/// `11`, `8.5`: a sheet dimension without trailing zeros.
+fn trim_num(v: f32) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
+/// Sort key for lists and CSVs: page, then top to bottom, left to right.
+fn page_order(a: &Annot) -> (usize, i64, i64) {
+    let b = a.bounds();
+    (a.page, b.min.y as i64, b.min.x as i64)
+}
+
+fn cross(a: Pos2, b: Pos2, c: Pos2) -> f32 {
+    (b - a).x * (c - b).y - (b - a).y * (c - b).x
+}
+
+/// Whether every turn of the closed outline goes the same way.
+fn convex(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    let mut sign = 0.0f32;
+    for i in 0..n {
+        let c = cross(pts[i], pts[(i + 1) % n], pts[(i + 2) % n]);
+        if c.abs() > 1e-3 {
+            if sign != 0.0 && c.signum() != sign {
+                return false;
+            }
+            sign = c.signum();
+        }
+    }
+    true
+}
+
+/// Ear-clipping triangulation of a simple polygon (vertex indices). `None`
+/// for one that crosses itself.
+fn triangulate(pts: &[Pos2]) -> Option<Vec<[usize; 3]>> {
+    let n = pts.len();
+    let area: f32 = (0..n).map(|i| pts[i].x * pts[(i + 1) % n].y - pts[(i + 1) % n].x * pts[i].y).sum();
+    let ccw = area > 0.0;
+    let in_tri = |p: Pos2, a: Pos2, b: Pos2, c: Pos2| {
+        let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+        !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+    };
+    let mut idx: Vec<usize> = (0..n).collect();
+    let mut tris = Vec::new();
+    while idx.len() > 3 {
+        let m = idx.len();
+        let ear = (0..m).find_map(|i| {
+            let (a, b, c) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+            let t = cross(pts[a], pts[b], pts[c]);
+            if t.abs() < 1e-6 {
+                return Some((i, None)); // a straight-through point: drop it
+            }
+            let ok = (t > 0.0) == ccw && !idx.iter().any(|&j| j != a && j != b && j != c && in_tri(pts[j], pts[a], pts[b], pts[c]));
+            ok.then_some((i, Some([a, b, c])))
+        })?;
+        tris.extend(ear.1);
+        idx.remove(ear.0);
+    }
+    if idx.len() == 3 {
+        tris.push([idx[0], idx[1], idx[2]]);
+    }
+    Some(tris)
+}
+
+/// `p` moved onto the horizontal or vertical through `from`, whichever is nearer.
+fn square(from: Pos2, p: Pos2) -> Pos2 {
+    let d = p - from;
+    if d.x.abs() >= d.y.abs() { pos2(p.x, from.y) } else { pos2(from.x, p.y) }
+}
+
 /// Paints prims for a page whose top-left is at `origin` on screen, drawn at
 /// `z` screen points per PDF point. `k` is the text calibration from `text_metrics`.
 fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32, f32), alpha_mul: f32, images: &HashMap<String, TextureHandle>) {
@@ -2673,7 +3195,23 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Fill { pts, color, alpha, outline } => {
                 let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
-                painter.add(Shape::convex_polygon(map(pts), col(*color, *alpha), stroke));
+                let pts = map(pts);
+                if convex(&pts) {
+                    painter.add(Shape::convex_polygon(pts, col(*color, *alpha), stroke));
+                } else {
+                    // An L- or U-shaped area: egui fills convex outlines only, so fill triangles.
+                    if let Some(tris) = triangulate(&pts) {
+                        let mut mesh = egui::Mesh::default();
+                        for p in &pts {
+                            mesh.colored_vertex(*p, col(*color, *alpha));
+                        }
+                        for [a, b, c] in tris {
+                            mesh.add_triangle(a as u32, b as u32, c as u32);
+                        }
+                        painter.add(Shape::mesh(mesh));
+                    }
+                    painter.add(Shape::closed_line(pts, stroke));
+                }
             }
             Prim::Text { origin: o, text, size, color } => {
                 let fs = size * z * k.0;
@@ -2735,6 +3273,7 @@ fn default_author() -> String {
 fn note_of(a: &Annot) -> &str {
     match &a.kind {
         Kind::Image { name, .. } => name,
+        Kind::Measure { .. } => a.label(),
         _ => a.text(),
     }
 }
@@ -2798,10 +3337,10 @@ mod tests {
         }
     }
 
-    const PLAIN: Mods = Mods { add: false, single: false, ctrl: false };
-    const ADD: Mods = Mods { add: true, single: false, ctrl: false };
-    const ALT: Mods = Mods { add: false, single: true, ctrl: false };
-    const CTRL: Mods = Mods { add: true, single: false, ctrl: true };
+    const PLAIN: Mods = Mods { add: false, single: false, ctrl: false, shift: false };
+    const ADD: Mods = Mods { add: true, single: false, ctrl: false, shift: false };
+    const ALT: Mods = Mods { add: false, single: true, ctrl: false, shift: false };
+    const CTRL: Mods = Mods { add: true, single: false, ctrl: true, shift: false };
 
     fn drag(app: &mut App, from: Pos2, to: Pos2, mods: Mods) {
         app.begin_drag(from, false, mods);
@@ -3004,4 +3543,119 @@ mod tests {
         assert_eq!(app.annots.len(), 3, "one undo step");
         assert!(app.annots.iter().all(|a| a.group.is_none()));
     }
+
+    fn measures(app: &App) -> Vec<(Vec<Pos2>, bool, String)> {
+        app.annots.iter().filter_map(|a| match &a.kind {
+            Kind::Measure { pts, area, value, .. } => Some((pts.clone(), *area, value.clone())),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn length_by_clicks_finishes_on_double_click() {
+        let mut app = app();
+        app.scales.push(Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\""));
+        app.set_tool(Tool::Length);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        app.click(pos2(154.0, 100.0), false, PLAIN);
+        // Shift squares the next point to the last one.
+        app.click(pos2(156.0, 172.0), false, Mods { shift: true, ..PLAIN });
+        app.click(pos2(156.0, 172.0), true, PLAIN);
+        assert!(app.building.is_none());
+        measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+        let m = measures(&app);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, vec![pos2(100.0, 100.0), pos2(154.0, 100.0), pos2(154.0, 172.0)]);
+        assert_eq!(m[0].2, "7'-0\"", "3 ft + 4 ft at 1/4\" = 1'-0\"");
+        assert_eq!(app.tool, Tool::Length, "stays ready for the next one");
+        app.undo();
+        assert!(measures(&app).is_empty(), "one undo step");
+    }
+
+    #[test]
+    fn area_closes_on_its_first_point_and_backspace_takes_one_back() {
+        let mut app = app();
+        app.set_tool(Tool::Area);
+        for p in [pos2(100.0, 100.0), pos2(200.0, 100.0), pos2(300.0, 300.0)] {
+            app.click(p, false, PLAIN);
+        }
+        app.building.as_mut().unwrap().1.pop();
+        app.click(pos2(200.0, 200.0), false, PLAIN);
+        app.click(pos2(100.0, 200.0), false, PLAIN);
+        app.click(pos2(102.0, 101.0), false, PLAIN);
+        assert!(app.building.is_none());
+        let m = measures(&app);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].1);
+        assert_eq!(m[0].0.len(), 4, "closing click isn't a point");
+        // Two points isn't an area.
+        app.click(pos2(400.0, 400.0), false, PLAIN);
+        app.click(pos2(450.0, 400.0), false, PLAIN);
+        app.finish_measure();
+        assert_eq!(measures(&app).len(), 1);
+    }
+
+    #[test]
+    fn drags_make_a_segment_or_a_rectangle() {
+        let mut app = app();
+        app.set_tool(Tool::Length);
+        drag(&mut app, pos2(100.0, 100.0), pos2(300.0, 100.0), PLAIN);
+        app.set_tool(Tool::Area);
+        drag(&mut app, pos2(100.0, 200.0), pos2(200.0, 300.0), PLAIN);
+        let m = measures(&app);
+        assert_eq!(m[0].0, vec![pos2(100.0, 100.0), pos2(300.0, 100.0)]);
+        assert_eq!(m[1].0, annot::rect_pts(Rect::from_min_max(pos2(100.0, 200.0), pos2(200.0, 300.0))));
+        assert!(m.iter().all(|m| m.2 == "no scale"));
+    }
+
+    #[test]
+    fn calibration_sets_the_scale_and_relabels() {
+        let mut app = app();
+        app.set_tool(Tool::Length);
+        drag(&mut app, pos2(100.0, 100.0), pos2(244.0, 100.0), PLAIN);
+        app.set_tool(Tool::Calibrate);
+        drag(&mut app, pos2(100.0, 400.0), pos2(172.0, 400.0), PLAIN);
+        assert_eq!(app.tool, Tool::Select);
+        let (page, a, b) = app.scale_win.calib.unwrap();
+        // 72 pt (1 paper inch) is 4 ft: 1/4" = 1'-0".
+        let real = measure::parse_length("4'", Units::Imperial).unwrap();
+        app.apply_scale(page, real / (b - a).length() as f64, "Calibrated: 4'-0\"".into());
+        measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+        assert_eq!(measures(&app)[0].2, "8'-0\"");
+        assert!(app.dirty, "scales are saved");
+        // A region for a detail at its own scale only covers what's inside it.
+        app.scale_win.target = Some((0, Rect::from_min_max(pos2(50.0, 50.0), pos2(400.0, 150.0))));
+        app.apply_scale(0, 8.0 / 72.0, "1 1/2\" = 1'-0\"".into());
+        measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+        assert_eq!(measures(&app)[0].2, "1'-4\"");
+        assert_eq!(app.scales.len(), 2);
+    }
+
+    #[test]
+    fn esc_drops_a_measurement_in_progress() {
+        let mut app = app();
+        app.set_tool(Tool::Length);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        assert!(app.building.is_some());
+        app.building = None; // what Esc does
+        app.set_tool(Tool::Select);
+        assert!(measures(&app).is_empty());
+        // Switching tools keeps one that's long enough.
+        app.set_tool(Tool::Length);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        app.click(pos2(200.0, 100.0), false, PLAIN);
+        app.set_tool(Tool::Rect);
+        assert_eq!(measures(&app).len(), 1);
+    }
+
+    #[test]
+    fn concave_outlines_triangulate() {
+        let l = [pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 40.0), pos2(40.0, 40.0), pos2(40.0, 100.0), pos2(0.0, 100.0)];
+        assert!(!convex(&l));
+        let tris = triangulate(&l).unwrap();
+        let area: f32 = tris.iter().map(|[a, b, c]| ((l[*b] - l[*a]).x * (l[*c] - l[*a]).y - (l[*b] - l[*a]).y * (l[*c] - l[*a]).x).abs() / 2.0).sum();
+        assert!((area - 6400.0).abs() < 0.1, "{area}");
+        assert!(convex(&annot::rect_pts(Rect::from_min_max(pos2(0.0, 0.0), pos2(5.0, 5.0)))));
+    }
+
 }
