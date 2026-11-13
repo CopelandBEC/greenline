@@ -2081,12 +2081,20 @@ impl App {
             };
             let n = annots.len() + scales.len();
             if accept && n > 0 {
-                for a in annots {
-                    let key = format!("{}/{}", b.id, a.id);
-                    if accepted_now.contains(&key) {
-                        continue; // Taken in already by an accept whose proposals write failed.
+                // Markups an accept took in before its proposals write failed: skip
+                // them, but first recover the groups they joined, so the rest join too.
+                let receipt = |a: &Annot| accepted_now.iter().find_map(|k| k.strip_prefix(&format!("{}/{}:", b.id, a.id)).and_then(|n| n.parse::<u64>().ok()));
+                let done: Vec<(Annot, u64)> = annots.iter().filter_map(|a| receipt(a).map(|n| (a.clone(), n))).collect();
+                for (a, new_id) in &done {
+                    if let (Some(g), Some(ng)) = (a.group, annots_now.iter().find(|x| x.id == *new_id).and_then(|x| x.group)) {
+                        b.accepted_groups.entry(g).or_insert(ng);
                     }
-                    accepted_now.push(key);
+                }
+                for a in annots {
+                    if done.iter().any(|(d, _)| d.id == a.id) {
+                        continue;
+                    }
+                    accepted_now.push(format!("{}/{}:{}", b.id, a.id, next_id));
                     let group = a.group.map(|g| {
                         *b.accepted_groups.entry(g).or_insert_with(|| {
                             next_group += 1;
@@ -4118,7 +4126,7 @@ mod tests {
         // As if an earlier accept saved W1 but couldn't rewrite the proposals.
         let w1 = app.props.batches[0].annots[0].clone();
         app.annots.push(Annot { id: 77, ..w1.clone() });
-        app.accepted = vec![format!("1/{}", w1.id)];
+        app.accepted = vec![format!("1/{}:77", w1.id)];
         app.settle("1", Some(w1.id), None, true);
         assert_eq!(app.annots.len(), 1, "not added again");
         assert!(app.props.batches[0].annots.is_empty(), "but taken out of the proposals");
@@ -4130,6 +4138,21 @@ mod tests {
         let s = app.props.batches[0].scales[0].clone();
         app.settle("1", None, Some(s), true);
         assert_eq!(app.scales.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_retried_accept_keeps_groups_together() {
+        let (mut app, dir) = reviewing("retrygroup");
+        app.poll_proposals(10.0);
+        // The cloud was taken in (as markup 90, group 9) but the proposals write failed.
+        let cloud = app.props.batches[1].annots[0].clone();
+        app.annots.push(Annot { id: 90, group: Some(9), ..cloud.clone() });
+        app.accepted = vec![format!("2/{}:90", cloud.id)];
+        app.next_id = 91;
+        app.settle("2", None, None, true);
+        assert_eq!(app.annots.len(), 2, "the cloud isn't added again");
+        assert_eq!(app.annots[1].group, Some(9), "the callout joins the cloud's group");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,8 +14,9 @@ pub struct Sidecar {
     /// Drawing scales set on its pages (files from before 1.5 have none).
     #[serde(default)]
     pub scales: Vec<Scale>,
-    /// Proposed markups already taken in (`<batch>/<markup id>`), so an
-    /// accept retried after a half-finished one can't add them twice.
+    /// Proposed markups already taken in (`<batch>/<proposed id>:<markup id>`),
+    /// so an accept retried after a half-finished one can't add them twice
+    /// and the rest of their groups still join them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted: Vec<String>,
 }
