@@ -211,8 +211,9 @@ pub struct App {
     /// Shift held over the canvas (squares a measurement's next point).
     shift: bool,
     next_id: u64,
-    undo: Vec<Vec<Annot>>,
-    redo: Vec<Vec<Annot>>,
+    /// Markups and scales before each change (scale changes relabel measurements, so they undo with them).
+    undo: Vec<(Vec<Annot>, Vec<Scale>)>,
+    redo: Vec<(Vec<Annot>, Vec<Scale>)>,
     dirty: bool,
 
     tool: Tool,
@@ -806,7 +807,7 @@ impl App {
     // Annotation editing
 
     fn snapshot(&mut self) {
-        self.undo.push(self.annots.clone());
+        self.undo.push((self.annots.clone(), self.scales.clone()));
         if self.undo.len() > 200 {
             self.undo.remove(0);
         }
@@ -883,7 +884,7 @@ impl App {
     }
 
     fn lead_text_size(&self) -> Option<f32> {
-        self.selected.iter().rev().filter_map(|&id| self.find(id)).find_map(|a| a.text_size())
+        self.selected.iter().rev().filter_map(|&id| self.find(id)).find_map(label_size)
     }
 
     fn toggle_selected(&mut self, id: u64) {
@@ -1027,16 +1028,16 @@ impl App {
 
     fn undo(&mut self) {
         self.commit_edit();
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.annots, prev));
+        if let Some((annots, scales)) = self.undo.pop() {
+            self.redo.push((std::mem::replace(&mut self.annots, annots), std::mem::replace(&mut self.scales, scales)));
             self.selected.clear();
             self.changed();
         }
     }
 
     fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.annots, next));
+        if let Some((annots, scales)) = self.redo.pop() {
+            self.undo.push((std::mem::replace(&mut self.annots, annots), std::mem::replace(&mut self.scales, scales)));
             self.selected.clear();
             self.changed();
         }
@@ -1074,7 +1075,7 @@ impl App {
         self.text_size = s;
         if self.lead_text_size().is_some() {
             self.edit_selected(|a| {
-                if let Kind::Callout { size, .. } | Kind::Text { size, .. } = &mut a.kind {
+                if let Kind::Callout { size, .. } | Kind::Text { size, .. } | Kind::Measure { size, .. } = &mut a.kind {
                     *size = s;
                 }
             });
@@ -1480,13 +1481,13 @@ impl App {
             }
             Drag::Move { before, moved, .. } => {
                 if moved {
-                    self.undo.push(before);
+                    self.undo.push((before, self.scales.clone()));
                     self.redo.clear();
                     self.changed();
                 }
             }
             Drag::Handle { id, before, .. } => {
-                self.undo.push(before);
+                self.undo.push((before, self.scales.clone()));
                 self.redo.clear();
                 self.changed();
                 // The next placement of this stamp uses the size just chosen.
@@ -1756,6 +1757,10 @@ impl App {
             self.toast("Calibration line too short: zoom in and drag along a longer dimension".into());
             return;
         }
+        if let Some((rp, _)) = self.scale_win.target.filter(|(rp, _)| *rp != page) {
+            self.toast(format!("The new region is on page {}: calibrate along a dimension there, or go back to the whole page", rp + 1));
+            return;
+        }
         self.scale_win.calib = Some((page, a, b));
         self.scale_win.calib_text.clear();
         self.scale_win.open = true;
@@ -1769,7 +1774,12 @@ impl App {
 
     /// Sets `page`'s scale (or the scale window's target region's), replacing the one it had.
     fn apply_scale(&mut self, page: usize, per_pt: f64, label: String) {
+        if !(per_pt.is_finite() && per_pt > 0.0) {
+            self.toast("That scale can't be used".into());
+            return;
+        }
         let region = self.scale_win.target.filter(|(p, _)| *p == page).map(|(_, r)| r);
+        self.snapshot();
         self.scales.retain(|s| !(s.page == page && s.region == region));
         self.scales.push(Scale { page, region, per_pt, label: label.clone() });
         self.scale_win.target = None;
@@ -1912,11 +1922,13 @@ impl App {
             self.apply_scale(page, per_pt, label);
         }
         if let Some(i) = remove {
+            self.snapshot();
             self.scales.remove(i);
             self.changed();
         }
         if copy_all {
             if let Some(s) = self.scales.iter().find(|s| s.page == page && s.region.is_none()).cloned() {
+                self.snapshot();
                 self.scales.retain(|t| t.region.is_some());
                 self.scales.extend((0..self.pages.len()).map(|p| Scale { page: p, ..s.clone() }));
                 self.changed();
@@ -3278,6 +3290,14 @@ fn note_of(a: &Annot) -> &str {
     }
 }
 
+/// Text size of a note, or of a measurement's value label.
+fn label_size(a: &Annot) -> Option<f32> {
+    match &a.kind {
+        Kind::Measure { size, .. } => Some(*size),
+        _ => a.text_size(),
+    }
+}
+
 fn text_of(a: &Annot) -> &str {
     match &a.kind {
         Kind::Callout { text, .. } | Kind::Text { text, .. } => text,
@@ -3629,6 +3649,26 @@ mod tests {
         measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
         assert_eq!(measures(&app)[0].2, "1'-4\"");
         assert_eq!(app.scales.len(), 2);
+        app.undo();
+        assert_eq!(app.scales.len(), 1, "a scale change is one undo step");
+        assert_eq!(measures(&app).len(), 1, "and leaves the measurements alone");
+        // A region on one page can't be calibrated from another.
+        app.pages.push(vec2(600.0, 800.0));
+        app.scale_win.target = Some((1, Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0))));
+        app.set_calibration(0, pos2(0.0, 500.0), pos2(200.0, 500.0));
+        assert!(app.scale_win.calib.is_none());
+    }
+
+    #[test]
+    fn text_size_applies_to_measurement_labels() {
+        let mut app = app();
+        app.set_tool(Tool::Length);
+        drag(&mut app, pos2(100.0, 100.0), pos2(300.0, 100.0), PLAIN);
+        let id = app.annots[0].id;
+        app.set_tool(Tool::Select);
+        app.selected = vec![id];
+        app.set_text_size(18.0);
+        assert!(matches!(app.annots[0].kind, Kind::Measure { size, .. } if size == 18.0));
     }
 
     #[test]

@@ -267,10 +267,10 @@ fn mixed_number(s: &str) -> Option<f64> {
     let frac = |f: &str| -> Option<f64> {
         let (n, d) = f.split_once('/')?;
         let (n, d): (f64, f64) = (n.trim().parse().ok()?, d.trim().parse().ok()?);
-        (d != 0.0).then(|| n / d)
+        (d != 0.0).then(|| n / d).filter(|v| v.is_finite())
     };
     if let Some(i) = s.rfind([' ', '-']).filter(|_| s.contains('/')) {
-        let whole: f64 = s[..i].trim().parse().ok()?;
+        let whole: f64 = s[..i].trim().parse().ok().filter(|v: &f64| v.is_finite())?;
         return Some(whole + frac(&s[i + 1..])?);
     }
     if s.contains('/') {
@@ -282,6 +282,10 @@ fn mixed_number(s: &str) -> Option<f64> {
 /// A typed length in inches: `12'-6"`, `12' 6 1/2"`, `12'`, `150"`, `12.5 ft`,
 /// `3.2 m`, `3200 mm`. A bare number is feet (Imperial) or metres (Metric).
 pub fn parse_length(s: &str, units: Units) -> Option<f64> {
+    parse_length_any(s, units).filter(|v| v.is_finite() && *v > 0.0)
+}
+
+fn parse_length_any(s: &str, units: Units) -> Option<f64> {
     let s = normalise(s).to_lowercase().replace("feet", "'").replace("foot", "'").replace("ft", "'").replace("inches", "\"").replace("inch", "\"").replace("in", "\"");
     let s = s.trim();
     for (suffix, per) in [("mm", 1.0 / MM_PER_IN), ("cm", 10.0 / MM_PER_IN), ("m", 1000.0 / MM_PER_IN)] {
@@ -409,6 +413,9 @@ mod tests {
         assert_eq!(p(""), None);
         assert_eq!(p("abc"), None);
         assert_eq!(p("0'"), None);
+        assert_eq!(p("inf/1"), None);
+        assert_eq!(p("1e400"), None);
+        assert_eq!(p("NaN'"), None);
     }
 
     #[test]
