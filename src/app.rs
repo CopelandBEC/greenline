@@ -1726,6 +1726,8 @@ impl App {
             }
             Tool::Calibrate => self.set_calibration(page, start, squared),
             Tool::ScaleRegion => {
+                // A calibration line drawn before belongs to the whole page it's on, not this region.
+                self.scale_win.calib = None;
                 self.scale_win.target = Some((page, Rect::from_two_pos(start, end)));
                 self.scale_win.open = true;
                 self.tool = Tool::Select;
@@ -3657,6 +3659,13 @@ mod tests {
         app.scale_win.target = Some((1, Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0))));
         app.set_calibration(0, pos2(0.0, 500.0), pos2(200.0, 500.0));
         assert!(app.scale_win.calib.is_none());
+        // Nor does a calibration left pending on page 1 take over a region drawn on page 2.
+        app.scale_win.target = None;
+        app.set_calibration(0, pos2(0.0, 500.0), pos2(200.0, 500.0));
+        app.set_tool(Tool::ScaleRegion);
+        app.create_measure(1, pos2(10.0, 10.0), pos2(200.0, 200.0));
+        assert!(app.scale_win.calib.is_none());
+        assert_eq!(app.scale_page(), 1);
     }
 
     #[test]
