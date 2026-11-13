@@ -59,37 +59,46 @@ pub fn file_for(pdf: &Path) -> PathBuf {
 
 /// Reads the proposals for `pdf` (none if there's no file).
 pub fn load(pdf: &Path) -> anyhow::Result<Proposals> {
-    let f = file_for(pdf);
+    load_file(&file_for(pdf))
+}
+
+pub fn load_file(f: &Path) -> anyhow::Result<Proposals> {
     if !f.exists() {
-        return Ok(Proposals { pdf: pdf.to_path_buf(), batches: Vec::new() });
+        return Ok(Proposals::default());
     }
-    let p: Proposals = serde_json::from_slice(&std::fs::read(&f)?).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
+    let p: Proposals = serde_json::from_slice(&std::fs::read(f)?).map_err(|e| anyhow::anyhow!("{}: {e}", f.display()))?;
     Ok(p)
 }
 
-/// When the proposals file last changed, to notice a new batch.
-pub fn modified(pdf: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(file_for(pdf)).and_then(|m| m.modified()).ok()
+/// When a proposals file last changed, to notice a new batch.
+pub fn modified(f: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(f).and_then(|m| m.modified()).ok()
 }
 
 /// Reads, changes and writes the proposals under their lock. The file is
 /// removed when the last batch goes.
 pub fn update<T>(pdf: &Path, f: impl FnOnce(&mut Proposals) -> anyhow::Result<T>) -> anyhow::Result<T> {
-    std::fs::create_dir_all(crate::sidecar::dir())?;
-    let path = file_for(pdf);
+    update_file(&file_for(pdf), pdf, f)
+}
+
+/// `update` on the proposals file `path` for `pdf`.
+pub fn update_file<T>(path: &Path, pdf: &Path, f: impl FnOnce(&mut Proposals) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock"))?;
     lock.lock()?;
-    let mut p = load(pdf)?;
+    let mut p = load_file(path)?;
     p.pdf = pdf.to_path_buf();
     let out = f(&mut p)?;
     if p.batches.is_empty() {
         if path.exists() {
-            std::fs::remove_file(&path)?;
+            std::fs::remove_file(path)?;
         }
     } else {
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(&p)?)?;
-        std::fs::rename(&tmp, &path)?;
+        std::fs::rename(&tmp, path)?;
     }
     Ok(out)
 }
