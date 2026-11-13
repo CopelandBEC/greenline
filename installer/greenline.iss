@@ -74,7 +74,9 @@ Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe"; ValueType: str
 Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe\shell\open\command"; ValueType: string; ValueData: """{app}\greenline.exe"" ""%1"""; Tasks: openwith
 
-; The user's PATH gains the install folder (for greenline-cli); the uninstaller takes it out again.
+; The user's PATH gains the install folder (for greenline-cli). The marker comes first, while
+; NeedsAddPath still sees the old PATH, so the uninstaller only takes out an entry it added.
+Root: HKCU; Subkey: "Software\Greenline"; ValueType: dword; ValueName: "AddedToPath"; ValueData: 1; Check: NeedsAddPath(ExpandConstant('{app}')); Tasks: addtopath; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}')); Tasks: addtopath
 
 [Code]
@@ -91,8 +93,12 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Path, Dir: string;
   P: Integer;
+  Added: Cardinal;
 begin
-  if CurUninstallStep <> usPostUninstall then
+  // Before the uninstaller removes its registry entries, the marker among them.
+  if CurUninstallStep <> usUninstall then
+    exit;
+  if not RegQueryDWordValue(HKCU, 'Software\Greenline', 'AddedToPath', Added) or (Added <> 1) then
     exit;
   if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
     exit;

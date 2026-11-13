@@ -497,7 +497,8 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
             let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| doc.path.with_file_name(format!("{stem}{suffix}.pdf")));
             let real_out = out.parent().filter(|p| !p.as_os_str().is_empty()).and_then(|p| dunce::canonicalize(p).ok()).or_else(|| std::env::current_dir().ok()).zip(out.file_name()).map(|(p, f)| p.join(f));
-            if real_out.as_deref() == Some(doc.path.as_path()) {
+            // An existing file is compared by its real path too: on Windows `sheet.pdf` is `Sheet.pdf`.
+            if real_out.as_deref() == Some(doc.path.as_path()) || dunce::canonicalize(&out).is_ok_and(|o| o == doc.path) {
                 anyhow::bail!("refusing to overwrite the original PDF");
             }
             let author = a.get("author").map(str::to_string).unwrap_or_else(|| "Greenline".into());

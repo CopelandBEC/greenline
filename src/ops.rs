@@ -68,7 +68,12 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
         let f = Fields { o, pages };
         let page = f.page().map_err(ctx)?;
         if name == "scale" {
-            batch.scales.push(f.scale(page).map_err(ctx)?);
+            let sc = f.scale(page).map_err(ctx)?;
+            if batch.scales.iter().any(|s| s.page == sc.page && s.region == sc.region) {
+                let what = if sc.region.is_some() { "that region" } else { "the page" };
+                return Err(ctx(format!("{what} already has a scale earlier in this batch")));
+            }
+            batch.scales.push(sc);
             continue;
         }
         let kind = f.kind(&name, page).map_err(ctx)?;
@@ -110,8 +115,11 @@ pub fn relabel(batch: &mut Batch, existing: &[Scale], units: Units) {
 
 /// `existing` with `new` replacing any scale for the same page and region.
 pub fn merged_scales(existing: &[Scale], new: &[Scale]) -> Vec<Scale> {
-    let mut out: Vec<Scale> = existing.iter().filter(|s| !new.iter().any(|n| n.page == s.page && n.region == s.region)).cloned().collect();
-    out.extend(new.iter().cloned());
+    let mut out = existing.to_vec();
+    for n in new {
+        out.retain(|s| !(s.page == n.page && s.region == n.region));
+        out.push(n.clone());
+    }
     out
 }
 
@@ -369,5 +377,11 @@ mod tests {
         assert!(bad(json!([{"op": "rect", "page": 1, "rect": [0, 0, 10, 10], "color": "teal"}])).contains("unknown colour"));
         assert!(bad(json!([{"op": "scale", "page": 1, "preset": "1/5\" = 1'"}])).contains("unknown preset"));
         assert!(bad(json!([])).contains("no ops"));
+        assert!(bad(json!([{"op": "scale", "page": 1, "ratio": 48}, {"op": "scale", "page": 1, "ratio": 96}])).contains("already has a scale"));
+        // Later scales win when merging, wherever they come from.
+        let s = |r: f64| Scale::from_ratio(0, None, r, "x");
+        let m = merged_scales(&[s(12.0)], &[s(48.0), s(96.0)]);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].ratio(), 96.0);
     }
 }
