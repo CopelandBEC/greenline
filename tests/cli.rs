@@ -150,6 +150,9 @@ fn an_agent_takes_off_a_window_for_review() {
     assert_eq!(e["markups"], 2);
     assert!(out.exists());
     assert!(env.fails(&["export", pdf, "--out", pdf]).contains("refusing to overwrite"));
+    assert!(env.fails(&["measurements", pdf, "--csv", pdf]).contains("refusing to overwrite"));
+    assert!(env.fails(&["render", pdf, "--page", "1", "--out", pdf]).contains("refusing to overwrite"));
+    assert!(env.fails(&["export", pdf, "--out", "sheet.pdf"]).contains("refusing to overwrite"), "relative to the working folder");
 
     assert_eq!(env.run(&["withdraw", pdf, "1"])["withdrawn"], 1);
     assert_eq!(env.run(&["proposals", pdf])["count"], 0);

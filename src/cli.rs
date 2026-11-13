@@ -154,6 +154,17 @@ impl Doc {
     }
 }
 
+/// Refuses an output path that is the source PDF (by its real path, so
+/// `sheet.pdf` for `Sheet.pdf` on Windows or a symlinked folder still counts).
+fn not_source(out: &Path, src: &Path) -> anyhow::Result<()> {
+    let real_parent = out.parent().filter(|p| !p.as_os_str().is_empty()).and_then(|p| dunce::canonicalize(p).ok()).or_else(|| std::env::current_dir().ok());
+    let real_out = real_parent.zip(out.file_name()).map(|(p, f)| p.join(f));
+    if real_out.as_deref() == Some(src) || dunce::canonicalize(out).is_ok_and(|o| o == src) {
+        anyhow::bail!("refusing to overwrite the original PDF");
+    }
+    Ok(())
+}
+
 fn page_arg(a: &Args, pages: usize) -> anyhow::Result<usize> {
     let n: usize = a.get("page").ok_or_else(|| anyhow::anyhow!("needs --page N"))?.parse().map_err(|_| anyhow::anyhow!("--page must be a number"))?;
     if n == 0 || n > pages {
@@ -364,6 +375,9 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             if w.max(h) > 12000 {
                 anyhow::bail!("{w} x {h} px is too big: lower --dpi or narrow --region");
             }
+            if let Some(o) = a.get("out") {
+                not_source(Path::new(o), &doc.path)?;
+            }
             let extra = overlay(a, doc, &pages, page, units)?;
             let stem = doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".into());
             let out = match a.get("out") {
@@ -415,6 +429,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                 }).collect::<Vec<_>>(),
             });
             if let Some(f) = a.get("csv") {
+                not_source(Path::new(f), &doc.path)?;
                 std::fs::write(f, measure::csv(&ms, &scales, units)).map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
                 v["csv"] = json!(f);
             }
@@ -496,11 +511,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             let stem = doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
             let suffix = if mode == ExportMode::Editable { "_markup_editable" } else { "_markup" };
             let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| doc.path.with_file_name(format!("{stem}{suffix}.pdf")));
-            let real_out = out.parent().filter(|p| !p.as_os_str().is_empty()).and_then(|p| dunce::canonicalize(p).ok()).or_else(|| std::env::current_dir().ok()).zip(out.file_name()).map(|(p, f)| p.join(f));
-            // An existing file is compared by its real path too: on Windows `sheet.pdf` is `Sheet.pdf`.
-            if real_out.as_deref() == Some(doc.path.as_path()) || dunce::canonicalize(&out).is_ok_and(|o| o == doc.path) {
-                anyhow::bail!("refusing to overwrite the original PDF");
-            }
+            not_source(&out, &doc.path)?;
             let author = a.get("author").map(str::to_string).unwrap_or_else(|| "Greenline".into());
             let images = render::load_images(&annots)?;
             let missing = render::export(pdfium, &doc.path, &out, &annots, &images, mode, &author)?;

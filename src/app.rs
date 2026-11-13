@@ -2109,6 +2109,13 @@ impl App {
                     next_id += 1;
                 }
                 for s in scales {
+                    // Receipts for scales too: a retry mustn't put back a scale the
+                    // reviewer has since changed.
+                    let key = format!("{}/scale:{}", b.id, serde_json::to_string(&s).unwrap_or_default());
+                    if accepted_now.contains(&key) {
+                        continue;
+                    }
+                    accepted_now.push(key);
                     scales_now.retain(|t| !(t.page == s.page && t.region == s.region));
                     scales_now.push(s);
                 }
@@ -4197,10 +4204,14 @@ mod tests {
         assert_eq!(app.annots.len(), 1, "saved, so shown");
         assert_eq!(sidecar::load_file(&dir.join("doc.json")).unwrap().annots.len(), 1);
         assert_eq!(app.props.batches.len(), 2, "still proposed");
-        // Accepting again once the file can be written adds nothing twice.
+        // The reviewer changes the scale meanwhile.
+        app.scales[0].per_pt *= 2.0;
+        let mine = app.scales[0].clone();
+        // Accepting again once the file can be written adds nothing twice, and keeps their scale.
         std::fs::remove_dir_all(dir.join(format!("doc.proposals.json.{}.tmp", std::process::id()))).unwrap();
         app.settle("1", None, None, true);
         assert_eq!(app.annots.len(), 1);
+        assert_eq!(app.scales, vec![mine]);
         assert_eq!(app.props.batches.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
