@@ -1,7 +1,22 @@
-Greenline 1.4.0 — fast PDF markup for drawing, spec and deck review.
+Greenline 1.5.0 — fast PDF markup for drawing, spec and deck review.
 
-**Install (Windows 10/11, 64-bit):** download `Greenline-1.4.0-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
+**Install (Windows 10/11, 64-bit):** download `Greenline-1.5.0-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
+
+**New in 1.5: measuring**
+- **Length `D`** and **Area `E`**. Click the points, then double-click or press `Enter` to finish; an area also closes when you click its first point again. Dragging gives one segment or a rectangle. `Shift` squares a point to the last one, `Backspace` takes one back, and `Esc` drops the measurement.
+- **Scale `U`** (or click the scale in the status bar). Pick the drawing scale, click a scale Greenline found written on the sheet, or **calibrate**: drag along a dimension you know and type its length (`12'-6"`, `150"`, `3.2 m`). Details drawn at their own scale get a **region** with its own scale.
+- **Check reduced prints.** A drawing scale is only right if the PDF is at its printed size. Greenline warns when a sheet is smaller than a drawing sheet; calibrate those.
+- Feet-inches to 1/8" and square feet, or metric. Measurements export with your markups.
+- **Export → Measurements (CSV)** lists each one's length or perimeter, area, width and height, as text and as numbers, ready for a takeoff spreadsheet.
+
+**New in 1.5: agents can work with your drawings, and you review what they propose**
+- `greenline-cli`, installed next to the app (the installer can add it to your PATH), lets an AI agent or a script read a drawing set. It gets the text and lines with their positions, renders with a coordinate grid, and fits outlines to the drawn lines. It can then set scales and propose markups and measurements in batches. Ask an agent to "cloud any air or water barrier discontinuities on A3.0–A5.1", or to "outline and measure every window on the elevations and give me a takeoff spreadsheet". Have it run `greenline-cli guide` first.
+- **Nothing an agent does goes straight into your markups.** Its proposals appear on the sheets with an orange dashed outline and in the **Review** panel (`Y`). Accept or reject a whole batch or each markup. Accepted markups are yours like any other, and `Ctrl+Z` takes them back out.
+- Chat apps without a shell can use the same commands as MCP tools: `greenline-cli mcp`.
+
+**Also new**
+- The README has a plain no-warranty section. Greenline is provided as is, under the MIT and Apache-2.0 licences. Check measurements against the drawings' dimensions before relying on them.
 
 **New in 1.4: a callout can point at several places**
 - With a callout selected, `Ctrl`+click on the drawing adds another leader: the arrowhead lands where you click, and its tail meets the first leader's bend. `Ctrl`+click again for a third, and so on.
