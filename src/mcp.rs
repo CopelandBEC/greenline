@@ -269,6 +269,19 @@ pub fn handle(msg: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
+/// Answers a message: one request, or a batch (an array, which 2025-03-26
+/// clients may send) answered with an array of the replies its requests get.
+pub fn handle_message(msg: &Value) -> Option<Value> {
+    match msg {
+        Value::Array(items) if items.is_empty() => Some(error(Value::Null, -32600, "invalid request: empty batch")),
+        Value::Array(items) => {
+            let replies: Vec<Value> = items.iter().filter_map(handle).collect();
+            (!replies.is_empty()).then(|| Value::Array(replies))
+        }
+        one => handle(one),
+    }
+}
+
 /// Serves newline-delimited JSON-RPC on standard input/output until it closes.
 pub fn serve() -> i32 {
     let stdin = std::io::stdin();
@@ -279,7 +292,7 @@ pub fn serve() -> i32 {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle(&msg),
+            Ok(msg) => handle_message(&msg),
             Err(e) => Some(error(Value::Null, -32700, format!("parse error: {e}"))),
         };
         if let Some(r) = reply {
@@ -349,6 +362,16 @@ mod tests {
         assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": true, "method": "ping"})).unwrap()["error"]["code"], -32600);
         assert_eq!(handle(&json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"})).unwrap()["error"]["code"], -32600);
         assert_eq!(handle(&json!([1, 2])).unwrap()["error"]["code"], -32600);
+        // A batch gets one reply per request, in an array; its notifications get none.
+        let batch = handle_message(&json!([
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"}
+        ])).unwrap();
+        let ids: Vec<&Value> = batch.as_array().unwrap().iter().map(|r| &r["id"]).collect();
+        assert_eq!(ids, vec![&json!(2), &json!(3)]);
+        assert!(handle_message(&json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}])).is_none());
+        assert_eq!(handle_message(&json!([])).unwrap()["error"]["code"], -32600);
         assert_eq!(req(json!(1), "resources/list", json!({}))["error"]["code"], -32601);
         assert_eq!(req(json!(1), "tools/call", json!({"name": "nope"}))["error"]["code"], -32602);
         assert_eq!(req(json!(1), "tools/call", json!({}))["error"]["code"], -32602);
