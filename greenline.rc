@@ -1,8 +1,8 @@
 1 ICON "assets/greenline.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,4,0,0
-PRODUCTVERSION 1,4,0,0
+FILEVERSION 1,5,0,0
+PRODUCTVERSION 1,5,0,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -11,9 +11,9 @@ BEGIN
       VALUE "CompanyName", "Copeland Building Envelope Consulting, Inc."
       VALUE "LegalCopyright", "Copyright (c) 2026 Copeland Building Envelope Consulting, Inc. MIT OR Apache-2.0"
       VALUE "FileDescription", "Greenline PDF markup"
-      VALUE "FileVersion", "1.4.0"
+      VALUE "FileVersion", "1.5.0"
       VALUE "ProductName", "Greenline"
-      VALUE "ProductVersion", "1.4.0"
+      VALUE "ProductVersion", "1.5.0"
       VALUE "OriginalFilename", "greenline.exe"
     END
   END
