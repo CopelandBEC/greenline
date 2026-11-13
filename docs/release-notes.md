@@ -1,10 +1,15 @@
-Greenline 1.3.2 — fast PDF markup for drawing, spec and deck review.
+Greenline 1.4.0 — fast PDF markup for drawing, spec and deck review.
 
-**Install (Windows 10/11, 64-bit):** download `Greenline-1.3.2-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
+**Install (Windows 10/11, 64-bit):** download `Greenline-1.4.0-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
 
+**New in 1.4: a callout can point at several places**
+- With a callout selected, `Ctrl`+click on the drawing adds another leader: the arrowhead lands where you click, and its tail meets the first leader's bend. `Ctrl`+click again for a third, and so on.
+- It works straight after placing a callout with `C` — the `Ctrl`+click that ends your typing adds the first extra leader in the same gesture. Drag any arrowhead to fine-tune it.
+- Extra leaders are part of the same markup: select, move, recolour, undo, group and export all treat them as one, in flattened and editable PDFs alike.
+
 **New in 1.3.2: Greenline is open source**
-- The source is now public at github.com/CopelandBEC/greenline, licensed under MIT or Apache-2.0 (your choice). Pull requests are welcome; see the README for what to include.
+- The source is now public at github.com/CopelandBEC/greenline, licensed under MIT or Apache-2.0 (your choice).
 - The installer now includes Greenline's licences and the licences of the open-source components it's built with, in the `licenses` folder next to the program.
 
 **New in 1.3.1**
