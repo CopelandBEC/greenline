@@ -29,6 +29,7 @@ const USAGE: &str = "greenline-cli: Greenline for agents and scripts (read `gree
   withdraw <pdf> <id | all>               take back a proposed batch
   export <pdf> [--out F.pdf] [--editable] [--proposals]
   ops                                     the op reference for apply
+  mcp                                     serve these commands as MCP tools over standard input/output
 
 Pages count from 1. R is x0,y0,x1,y1 in page points (origin top-left, y down, 72 per inch).
 --units metric shows measurements in m / m² (default feet-inches).";
@@ -124,6 +125,10 @@ pub fn run(args: Vec<String>) -> anyhow::Result<Value> {
         }
         "ops" => {
             println!("{}", ops::REFERENCE);
+            Ok(Value::Null)
+        }
+        "mcp" => {
+            crate::mcp::serve();
             Ok(Value::Null)
         }
         "info" | "text" | "paths" | "snap" | "render" | "list" | "measurements" | "apply" | "proposals" | "withdraw" | "export" => {

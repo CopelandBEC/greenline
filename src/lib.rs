@@ -5,6 +5,7 @@ pub mod annot;
 pub mod app;
 pub mod cli;
 pub mod fonts;
+pub mod mcp;
 pub mod measure;
 pub mod ops;
 pub mod pdf;
