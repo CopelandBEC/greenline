@@ -1,6 +1,6 @@
 # Greenline
 
-Fast, native PDF markup for senior review of drawing sets, specs and decks. Built by [Copeland Building Envelope Consulting](https://copelandbec.com) for its own reviews, in Copeland colours. Rust + egui + PDFium, for Windows and Linux. (Called Redline before 1.3; installing over it keeps your markups.)
+Fast, native PDF markup for senior review of drawing sets, specs and decks. Built by [Copeland Building Envelope Consulting](https://copelandbec.com) for its own reviews, in CopelandBEC colours. Rust + egui + PDFium, for Windows and Linux. (Called Redline before 1.3; installing over it keeps your markups.)
 
 ## Install
 
@@ -17,7 +17,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
-| `1`–`6`, `[` `]`, `{` `}` | Colour (Copeland medium green by default, then red, blue, black, orange, yellow), line width, text size |
+| `1`–`6`, `[` `]`, `{` `}` | Colour (CopelandBEC medium green by default, then red, blue, black, orange, yellow), line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
@@ -37,8 +37,14 @@ After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo
 
 Greenline is provided as-is. Issues are turned off, and pull requests are not being accepted: the source is published so you can read it, build it and modify it for your own use, under the licence below.
 
+## No warranty
+
+Greenline is free software, provided **"as is", without warranty of any kind**, express or implied, including the warranties of merchantability, fitness for a particular purpose and non-infringement. You use it at your own risk. In no event will Copeland Building Envelope Consulting, Inc. or the contributors be liable for any claim, damages or other liability, whether direct, indirect, incidental, special or consequential, arising from the software or its use, including lost or corrupted files or markups, missed or incorrect markups, and decisions made from its output. The full terms are in the [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licences, which govern.
+
+Greenline is a markup tool, not a professional service. Using it creates no consultant, engineering or other professional relationship with CopelandBEC, and nothing it shows or exports is professional advice. Measurements and quantities depend on the drawing's own scale and accuracy and on how the user calibrated and placed them. Check them against the dimensions on the drawings before relying on them. Keep your own copies of anything that matters.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Copyright (c) 2026 Copeland Building Envelope Consulting, Inc.
 
-The licence covers the code. It doesn't grant rights to the Copeland or CopelandBEC names, logos or branding. If you distribute a modified version, don't present it as an official Copeland product.
+The licence covers the code. It doesn't grant rights to the Copeland, CopelandBEC or Copeland Building Envelope Consulting names, logos or branding. If you distribute a modified version, don't present it as an official CopelandBEC product.
