@@ -242,11 +242,19 @@ pub fn handle(msg: &Value) -> Option<Value> {
     }
     let id = id?.clone();
     let method = method.unwrap_or("");
-    let params = obj.get("params").cloned().unwrap_or(json!({}));
+    // MCP's params are always an object.
+    let params = match obj.get("params") {
+        None => json!({}),
+        Some(p @ Value::Object(_)) => p.clone(),
+        Some(_) => return Some(error(id, -32602, "params must be an object")),
+    };
     let result = match method {
         "initialize" => {
-            let asked = params.get("protocolVersion").and_then(Value::as_str);
-            let version = asked.filter(|v| PROTOCOLS.contains(v)).unwrap_or(PROTOCOLS[0]);
+            let Some(asked) = params.get("protocolVersion").and_then(Value::as_str) else {
+                return Some(error(id, -32602, "initialize needs \"protocolVersion\" (a string)"));
+            };
+            // An unknown version gets the newest one this server speaks.
+            let version = if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[0] };
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
@@ -373,6 +381,8 @@ mod tests {
         assert!(handle_message(&json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}])).is_none());
         assert_eq!(handle_message(&json!([])).unwrap()["error"]["code"], -32600);
         assert_eq!(req(json!(1), "resources/list", json!({}))["error"]["code"], -32601);
+        assert_eq!(req(json!(1), "ping", json!(false))["error"]["code"], -32602);
+        assert_eq!(req(json!(1), "initialize", json!({"protocolVersion": 42}))["error"]["code"], -32602);
         assert_eq!(req(json!(1), "tools/call", json!({"name": "nope"}))["error"]["code"], -32602);
         assert_eq!(req(json!(1), "tools/call", json!({}))["error"]["code"], -32602);
         assert_eq!(req(json!(1), "tools/call", json!({"name": "info", "arguments": {}}))["error"]["code"], -32602, "missing pdf");
