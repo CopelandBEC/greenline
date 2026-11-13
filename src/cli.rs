@@ -37,6 +37,8 @@ Pages count from 1. R is x0,y0,x1,y1 in page points (origin top-left, y down, 72
 struct Args {
     pos: Vec<String>,
     flags: HashMap<String, String>,
+    /// Ops given as a value (MCP), in place of an ops file.
+    ops: Option<Value>,
 }
 
 const SWITCHES: &[&str] = &["markups", "proposals", "dry-run", "editable", "help"];
@@ -59,7 +61,7 @@ impl Args {
                 pos.push(a);
             }
         }
-        Ok(Self { pos, flags })
+        Ok(Self { pos, flags, ops: None })
     }
 
     fn has(&self, k: &str) -> bool {
@@ -105,6 +107,24 @@ pub fn main(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+/// The commands that work on a PDF, which `run_with` takes.
+pub const FILE_COMMANDS: &[&str] = &["info", "text", "paths", "snap", "render", "list", "measurements", "apply", "proposals", "withdraw", "export"];
+
+/// Runs a file command from arguments already parsed (the MCP server): the
+/// command, the PDF, an optional id (withdraw), flags by name (switches with
+/// an empty value), and ops as a value. Nothing here is read as a flag or
+/// prints to standard output.
+pub fn run_with(cmd: &str, file: &str, id: Option<String>, flags: HashMap<String, String>, ops: Option<Value>) -> anyhow::Result<Value> {
+    if !FILE_COMMANDS.contains(&cmd) {
+        anyhow::bail!("unknown command \"{cmd}\"");
+    }
+    let mut pos = vec![cmd.to_string(), file.to_string()];
+    pos.extend(id);
+    let a = Args { pos, flags, ops };
+    let doc = Doc::open(Path::new(file))?;
+    command(cmd, &a, &doc, pdf::pdfium()?)
 }
 
 /// Runs one command; its JSON result, or `Null` when it printed text itself.
@@ -283,9 +303,14 @@ fn overlay(a: &Args, doc: &Doc, pages: &[Vec2], page: usize, units: Units) -> an
         scales = s;
         out.extend(all.into_iter().filter(|(x, p)| x.page == page && (a.has("markups") || p.is_some())).map(|(x, _)| x));
     }
-    if let Some(f) = a.get("ops") {
+    let draft = match (&a.ops, a.get("ops")) {
+        (Some(v), _) => Some(v.clone()),
+        (None, Some(f)) => Some(read_ops(f)?),
+        (None, None) => None,
+    };
+    if let Some(draft) = draft {
         let (id, group) = (1_000_000, 1_000_000);
-        let b = ops::parse(&read_ops(f)?, pages, id, group).map_err(anyhow::Error::msg)?;
+        let b = ops::parse(&draft, pages, id, group).map_err(anyhow::Error::msg)?;
         scales = ops::merged_scales(&scales, &b.scales);
         out.extend(b.annots.into_iter().filter(|x| x.page == page));
     }
@@ -459,8 +484,10 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             Ok(v)
         }
         "apply" => {
-            let src = a.pos.get(2).ok_or_else(|| anyhow::anyhow!("apply needs an ops file (or - for standard input)"))?;
-            let ops_json = read_ops(src)?;
+            let ops_json = match &a.ops {
+                Some(v) => v.clone(),
+                None => read_ops(a.pos.get(2).ok_or_else(|| anyhow::anyhow!("apply needs an ops file (or - for standard input)"))?)?,
+            };
             let agent = a.get("agent").map(str::to_string).or_else(|| std::env::var("GREENLINE_AGENT").ok()).unwrap_or_else(|| "agent".into());
             let summary = a.get("summary").unwrap_or("").to_string();
             let dry = a.has("dry-run");
