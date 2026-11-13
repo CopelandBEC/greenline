@@ -13,6 +13,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | Key | Action |
 |---|---|
 | `C` | Callout: press on the target, drag to where the note goes (click = quick note) |
+| `Ctrl+click` with a callout selected | Add another leader: arrowhead at the click, tail at the first leader's bend; drag a tip to adjust |
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |

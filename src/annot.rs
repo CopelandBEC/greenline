@@ -28,9 +28,10 @@ pub struct Annot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Kind {
-    /// Text box with a leader arrow pointing at `anchor`. `pos` is the box's
+    /// Text box with a leader arrow pointing at `anchor`; `leaders` are extra
+    /// arrowheads whose tails meet the first leader's bend. `pos` is the box's
     /// top-left; height follows the wrapped text.
-    Callout { anchor: Pos2, pos: Pos2, box_w: f32, text: String, size: f32 },
+    Callout { anchor: Pos2, pos: Pos2, box_w: f32, text: String, size: f32, #[serde(default)] leaders: Vec<Pos2> },
     Text { pos: Pos2, box_w: f32, text: String, size: f32 },
     Cloud { rect: Rect },
     Rect { rect: Rect },
@@ -235,8 +236,14 @@ impl Annot {
     pub fn bounds(&self) -> Rect {
         let w = self.width.max(1.0);
         match &self.kind {
-            // The leader lies between box and anchor; the arrowhead spreads up to arrow_len around the anchor.
-            Kind::Callout { anchor, .. } => self.text_box().unwrap().union(Rect::from_center_size(*anchor, Vec2::splat(2.0 * arrow_len(w)))),
+            // The leaders lie between box, anchor and extra tips; each arrowhead spreads up to arrow_len around its tip.
+            Kind::Callout { anchor, leaders, .. } => {
+                let mut b = self.text_box().unwrap().union(Rect::from_center_size(*anchor, Vec2::splat(2.0 * arrow_len(w))));
+                for tip in leaders {
+                    b = b.union(Rect::from_center_size(*tip, Vec2::splat(2.0 * arrow_len(w))));
+                }
+                b
+            }
             Kind::Text { .. } => self.text_box().unwrap(),
             Kind::Cloud { rect } => rect.expand(cloud_radius(*rect) + w),
             Kind::Rect { rect } | Kind::Highlight { rect } => rect.expand(w),
@@ -319,14 +326,19 @@ impl Annot {
         let w = self.width;
         let mut out = Vec::new();
         match &self.kind {
-            Kind::Callout { anchor, text, size, .. } => {
+            Kind::Callout { anchor, text, size, leaders, .. } => {
                 let r = self.text_box().unwrap();
+                // The first leader leaves the box square to its side for a short
+                // landing, then bends to the target; extra leaders run from that
+                // bend to their own arrowheads.
+                let (start, normal) = leader_start(r, *anchor);
+                let room = (*anchor - start).dot(normal) - arrow_len(w) - 1.0;
+                let knee = start + normal * landing(*size).min(room.max(0.0));
                 if !r.contains(*anchor) {
-                    // Leader leaves the box square to its side for a short landing, then bends to the target.
-                    let (start, normal) = leader_start(r, *anchor);
-                    let room = (*anchor - start).dot(normal) - arrow_len(w) - 1.0;
-                    let knee = start + normal * landing(*size).min(room.max(0.0));
                     arrow_path_prims(&mut out, &[start, knee], *anchor, w, c);
+                }
+                for tip in leaders {
+                    arrow_path_prims(&mut out, &[knee], *tip, w, c);
                 }
                 out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 255, outline: Some((c, w)) });
                 text_prims(&mut out, r, text, *size, c);
@@ -572,7 +584,7 @@ mod tests {
 
     #[test]
     fn fit_box_shrinks_and_keeps_callout_edge() {
-        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0 } };
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0, leaders: vec![] } };
         let right = a.text_box().unwrap().max.x;
         a.fit_box_w();
         let r = a.text_box().unwrap();
@@ -581,6 +593,34 @@ mod tests {
         assert_eq!(text_lines("Short", 12.0, r.width()).len(), 1);
         a.widen_for_edit();
         assert!((a.text_box().unwrap().width() - default_box_w(12.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn extra_leaders_meet_the_first_bend() {
+        let a = Annot {
+            id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None,
+            kind: Kind::Callout {
+                anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0,
+                text: "Note".into(), size: 12.0, leaders: vec![pos2(200.0, 400.0), pos2(600.0, 300.0)],
+            },
+        };
+        let strokes: Vec<Vec<Pos2>> = a.prims().iter().filter_map(|p| match p {
+            Prim::Stroke { pts, closed: false, .. } => Some(pts.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(strokes.len(), 3, "the first leader plus two extra ones");
+        let knee = strokes[0][1];
+        for extra in &strokes[1..] {
+            assert_eq!(extra[0], knee, "extra leaders start at the first leader's bend");
+        }
+        // The tips are where the user clicked: bounds, hit-testing and export see them.
+        for tip in [pos2(200.0, 400.0), pos2(600.0, 300.0)] {
+            assert!(a.bounds().contains(tip));
+            assert_eq!(a.distance(tip), 0.0);
+        }
+        // Sidecar files written before leaders existed still load.
+        let old: Kind = serde_json::from_str(r#"{"Callout":{"anchor":[500.0,0.0],"pos":[100.0,0.0],"box_w":300.0,"text":"Note","size":12.0}}"#).unwrap();
+        assert!(matches!(old, Kind::Callout { ref leaders, .. } if leaders.is_empty()));
     }
 
     #[test]

@@ -682,7 +682,7 @@ mod sample {
         let pdfium = test_pdfium();
         let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None };
         let annots = vec![
-            mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0 }),
+            mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0, leaders: vec![pos2(300.0, 620.0)] }),
             mk(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(500.0, 420.0), pos2(700.0, 560.0)) }),
             mk(3, Kind::Highlight { rect: egui::Rect::from_min_max(pos2(100.0, 100.0), pos2(400.0, 160.0)) }),
         ];

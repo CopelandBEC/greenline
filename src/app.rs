@@ -88,6 +88,8 @@ enum Handle {
     Corner(Pos2),
     BoxWidth,
     Anchor,
+    /// Tip of a callout's extra leader, by index in its `leaders`.
+    Leader(usize),
     A,
     B,
 }
@@ -123,6 +125,9 @@ struct Mods {
     add: bool,
     /// Alt: just the markup under the pointer, not the rest of its group.
     single: bool,
+    /// Ctrl (Cmd) without Shift: with one callout selected, clicking empty
+    /// space adds a leader there.
+    ctrl: bool,
 }
 
 pub struct App {
@@ -898,9 +903,11 @@ impl App {
                 let c = annot::rect_pts(*rect);
                 (0..4).map(|i| (Handle::Corner(c[(i + 2) % 4]), c[i])).collect()
             },
-            Kind::Callout { anchor, .. } => {
+            Kind::Callout { anchor, leaders, .. } => {
                 let r = a.text_box().unwrap();
-                vec![(Handle::Anchor, *anchor), (Handle::BoxWidth, pos2(r.max.x, r.center().y))]
+                let mut hs = vec![(Handle::Anchor, *anchor), (Handle::BoxWidth, pos2(r.max.x, r.center().y))];
+                hs.extend(leaders.iter().enumerate().map(|(i, tip)| (Handle::Leader(i), *tip)));
+                hs
             }
             Kind::Text { .. } => {
                 let r = a.text_box().unwrap();
@@ -929,6 +936,11 @@ impl App {
                 *rect = annot::aspect_rect(opposite, p, rect.width() / rect.height().max(0.01));
             }
             (Kind::Callout { anchor, .. }, Handle::Anchor) => *anchor = p,
+            (Kind::Callout { leaders, .. }, Handle::Leader(i)) => {
+                if let Some(tip) = leaders.get_mut(i) {
+                    *tip = p;
+                }
+            }
             (Kind::Callout { pos, box_w, size, .. } | Kind::Text { pos, box_w, size, .. }, Handle::BoxWidth) => {
                 *box_w = (p.x - pos.x).max(4.0 * *size);
                 a.wrap_w = Some(*box_w);
@@ -1206,7 +1218,7 @@ impl App {
         let (hover, scroll, zoom_delta, space, press_origin, latest) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.smooth_scroll_delta, i.zoom_delta(), i.key_down(Key::Space), i.pointer.press_origin(), i.pointer.latest_pos())
         });
-        let mods = ctx.input(|i| Mods { add: i.modifiers.command || i.modifiers.shift, single: i.modifiers.alt });
+        let mods = ctx.input(|i| Mods { add: i.modifiers.command || i.modifiers.shift, single: i.modifiers.alt, ctrl: i.modifiers.command && !i.modifiers.shift });
         self.hover = hover.filter(|_| resp.hovered());
 
         if resp.hovered() {
@@ -1278,6 +1290,8 @@ impl App {
                     match over {
                         Some((pg, p)) if self.hit_handle(pg, p).is_some() => CursorIcon::Crosshair,
                         Some((pg, p)) if self.hit(pg, p).is_some() => CursorIcon::Move,
+                        // Ctrl+click on empty space drops a leader on the selected callout.
+                        Some((pg, _)) if mods.ctrl && self.sole_callout(pg).is_some() => CursorIcon::Crosshair,
                         _ => CursorIcon::Default,
                     }
                 }
@@ -1411,19 +1425,32 @@ impl App {
     }
 
     fn click(&mut self, screen: Pos2, double: bool, mods: Mods) {
-        if self.editing.is_some() {
+        let was_editing = self.editing.is_some();
+        if was_editing {
             self.commit_edit();
-            return;
         }
         let Some(page) = self.page_at(screen) else {
-            if !mods.add {
+            if !was_editing && !mods.add {
                 self.selected.clear();
             }
             return;
         };
         let p = self.screen_to_page(page, screen);
         if self.placing.is_some() {
-            self.place(page, p, p);
+            if !was_editing {
+                self.place(page, p, p);
+            }
+            return;
+        }
+        // Ctrl+click on empty space with one callout selected adds a leader.
+        // This beats the other tool actions, so it works on the click that
+        // ends typing and right after placing a callout with C.
+        if mods.ctrl && self.hit(page, p).is_none() && self.sole_callout(page).is_some() {
+            self.add_leader_at(page, p);
+            return;
+        }
+        // The click that ends typing is otherwise swallowed.
+        if was_editing {
             return;
         }
         match self.tool {
@@ -1457,6 +1484,27 @@ impl App {
         }
     }
 
+    /// The selected callout when it is the only thing selected on `page`.
+    fn sole_callout(&self, page: usize) -> Option<u64> {
+        self.sole().filter(|a| a.page == page && matches!(&a.kind, Kind::Callout { .. })).map(|a| a.id)
+    }
+
+    /// Ctrl+click on empty space with one callout selected: a new leader whose
+    /// arrowhead sits at `tip` and whose tail meets the first leader's bend.
+    /// Switches to Select so its tip can be dragged straight away.
+    fn add_leader_at(&mut self, page: usize, tip: Pos2) {
+        let Some(id) = self.sole_callout(page) else { return };
+        self.snapshot();
+        if let Some(a) = self.find_mut(id) {
+            if let Kind::Callout { leaders, .. } = &mut a.kind {
+                leaders.push(tip);
+            }
+        }
+        self.set_tool(Tool::Select);
+        self.changed();
+        self.toast("Leader added — Ctrl+click again for another · drag its tip to adjust".into());
+    }
+
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
         let end = bounds.clamp(end);
@@ -1481,7 +1529,7 @@ impl App {
                     x.clamp(0.0, (bounds.max.x - box_w).max(0.0)),
                     (target.y - h / 2.0).clamp(0.0, (bounds.max.y - h).max(0.0)),
                 );
-                Kind::Callout { anchor: start, pos, box_w, text: String::new(), size }
+                Kind::Callout { anchor: start, pos, box_w, text: String::new(), size, leaders: Vec::new() }
             }
             Tool::Text => {
                 let box_w = if dragged && rect.width() > 4.0 * size { rect.width() } else { annot::default_box_w(size) };
@@ -1795,7 +1843,7 @@ impl App {
                 let box_w = annot::default_box_w(size);
                 let h = annot::box_rect(Pos2::ZERO, box_w, "", size).height();
                 let x = if cur.x >= start.x { cur.x } else { cur.x - box_w };
-                Kind::Callout { anchor: start, pos: pos2(x, cur.y - h / 2.0), box_w, text: String::new(), size }
+                Kind::Callout { anchor: start, pos: pos2(x, cur.y - h / 2.0), box_w, text: String::new(), size, leaders: Vec::new() }
             }
             Tool::Text => Kind::Rect { rect },
             Tool::Cloud => Kind::Cloud { rect },
@@ -2470,6 +2518,7 @@ impl App {
                     ("A / L / P", "Arrow / line / pen"),
                     ("V or Esc", "Select: drag to move, handles to resize, double-click or Enter to edit text"),
                     ("Ctrl/Shift+click", "Add to or remove from selection (also in the markup list)"),
+                    ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
                     ("1–6", "Colour (applies to all selected)"),
@@ -2738,9 +2787,21 @@ mod tests {
         app.add(0, Kind::Rect { rect: Rect::from_min_size(pos2(x, y), vec2(100.0, 100.0)) })
     }
 
-    const PLAIN: Mods = Mods { add: false, single: false };
-    const ADD: Mods = Mods { add: true, single: false };
-    const ALT: Mods = Mods { add: false, single: true };
+    fn callout(app: &mut App, anchor: Pos2, pos: Pos2) -> u64 {
+        app.add(0, Kind::Callout { anchor, pos, box_w: 120.0, text: "Check".into(), size: 12.0, leaders: vec![] })
+    }
+
+    fn leaders(app: &App, id: u64) -> Vec<Pos2> {
+        match &app.find(id).unwrap().kind {
+            Kind::Callout { leaders, .. } => leaders.clone(),
+            _ => panic!("not a callout"),
+        }
+    }
+
+    const PLAIN: Mods = Mods { add: false, single: false, ctrl: false };
+    const ADD: Mods = Mods { add: true, single: false, ctrl: false };
+    const ALT: Mods = Mods { add: false, single: true, ctrl: false };
+    const CTRL: Mods = Mods { add: true, single: false, ctrl: true };
 
     fn drag(app: &mut App, from: Pos2, to: Pos2, mods: Mods) {
         app.begin_drag(from, false, mods);
@@ -2762,6 +2823,59 @@ mod tests {
         assert_eq!(app.selected, vec![b], "plain click replaces");
         app.click(pos2(550.0, 50.0), false, PLAIN);
         assert!(app.selected.is_empty(), "click on empty page clears");
+    }
+
+    #[test]
+    fn ctrl_click_adds_callout_leaders_and_their_tips_drag() {
+        let mut app = app();
+        let id = callout(&mut app, pos2(100.0, 100.0), pos2(300.0, 300.0));
+        let r = rect(&mut app, 500.0, 500.0);
+        app.selected = vec![id];
+        app.click(pos2(80.0, 80.0), false, CTRL);
+        assert_eq!(leaders(&app, id), vec![pos2(80.0, 80.0)]);
+        app.click(pos2(200.0, 60.0), false, CTRL);
+        assert_eq!(leaders(&app, id), vec![pos2(80.0, 80.0), pos2(200.0, 60.0)], "a third leader is fine");
+        app.click(pos2(50.0, 50.0), false, ADD);
+        assert_eq!(leaders(&app, id).len(), 2, "Shift/plain clicks on empty space add nothing");
+        app.click(pos2(500.0, 550.0), false, CTRL);
+        assert_eq!(app.selected, vec![id, r], "Ctrl+click on a markup still toggles the selection");
+        assert_eq!(leaders(&app, id).len(), 2);
+
+        app.selected = vec![id];
+        let tip = pos2(80.0, 80.0);
+        app.begin_drag(tip, false, PLAIN);
+        app.update_drag(pos2(90.0, 70.0), vec2(10.0, -10.0));
+        app.end_drag();
+        assert_eq!(leaders(&app, id)[0], pos2(90.0, 70.0), "the tip handle moves that leader");
+        app.undo();
+        assert_eq!(leaders(&app, id)[0], tip, "one undo step");
+    }
+
+    #[test]
+    fn ctrl_click_that_ends_typing_also_adds_a_leader() {
+        let mut app = app();
+        let id = callout(&mut app, pos2(100.0, 100.0), pos2(300.0, 300.0));
+        app.start_edit(id);
+        app.click(pos2(80.0, 80.0), false, PLAIN);
+        assert!(app.editing.is_none() && app.selected == vec![id], "a plain click just ends typing, keeping the callout selected");
+        assert!(leaders(&app, id).is_empty());
+        app.start_edit(id);
+        app.click(pos2(80.0, 80.0), false, CTRL);
+        assert!(app.editing.is_none(), "Ctrl+click ends typing…");
+        assert_eq!(leaders(&app, id), vec![pos2(80.0, 80.0)], "…and adds the leader");
+    }
+
+    #[test]
+    fn ctrl_click_after_placing_with_c_adds_a_leader() {
+        let mut app = app();
+        app.set_tool(Tool::Callout);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        let id = app.annots.last().unwrap().id;
+        assert_eq!(app.editing, Some(id), "a quick note opens the editor");
+        app.find_mut(id).unwrap().text_mut().unwrap().push_str("Check");
+        app.click(pos2(80.0, 80.0), false, CTRL);
+        assert_eq!(leaders(&app, id), vec![pos2(80.0, 80.0)], "Ctrl+click right after placing adds a leader");
+        assert_eq!(app.tool, Tool::Select, "ready to drag the new tip");
     }
 
     #[test]
