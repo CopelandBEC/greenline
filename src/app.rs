@@ -2064,10 +2064,23 @@ impl App {
         let (mut annots_now, mut scales_now, mut accepted_now) = (self.annots.clone(), self.scales.clone(), self.accepted.clone());
         let mut next_id = self.next_id;
         let mut next_group = self.next_group();
+        // Set once the markups file has the accepted work, whatever happens to the proposals write.
+        let mut saved = false;
         let taken = proposals::update_file(&file, &path, |p| {
             // Keys for batches that are gone can go; this batch's stay until it's written.
             accepted_now.retain(|k| k.split_once('/').is_some_and(|(bid, _)| p.batches.iter().any(|b| b.id == bid)));
             let Some(b) = p.batches.iter_mut().find(|b| b.id == id) else { return Ok(0) };
+            // Markups an accept took in before its proposals write failed are
+            // skipped below; first recover, from the whole batch, the groups they
+            // joined, so the rest of each group joins them too.
+            let receipt = |bid: &str, a: &Annot| accepted_now.iter().find_map(|k| k.strip_prefix(&format!("{bid}/{}:", a.id)).and_then(|n| n.parse::<u64>().ok()));
+            let done: Vec<(u64, u64)> = b.annots.iter().filter_map(|a| receipt(&b.id, a).map(|n| (a.id, n))).collect();
+            for (pid, new_id) in &done {
+                let g = b.annots.iter().find(|a| a.id == *pid).and_then(|a| a.group);
+                if let (Some(g), Some(ng)) = (g, annots_now.iter().find(|x| x.id == *new_id).and_then(|x| x.group)) {
+                    b.accepted_groups.insert(g, ng);
+                }
+            }
             let annots: Vec<Annot> = match annot {
                 Some(aid) => b.annots.iter().position(|a| a.id == aid).map(|i| vec![b.annots.remove(i)]).unwrap_or_default(),
                 None if whole => std::mem::take(&mut b.annots),
@@ -2081,17 +2094,8 @@ impl App {
             };
             let n = annots.len() + scales.len();
             if accept && n > 0 {
-                // Markups an accept took in before its proposals write failed: skip
-                // them, but first recover the groups they joined, so the rest join too.
-                let receipt = |a: &Annot| accepted_now.iter().find_map(|k| k.strip_prefix(&format!("{}/{}:", b.id, a.id)).and_then(|n| n.parse::<u64>().ok()));
-                let done: Vec<(Annot, u64)> = annots.iter().filter_map(|a| receipt(a).map(|n| (a.clone(), n))).collect();
-                for (a, new_id) in &done {
-                    if let (Some(g), Some(ng)) = (a.group, annots_now.iter().find(|x| x.id == *new_id).and_then(|x| x.group)) {
-                        b.accepted_groups.entry(g).or_insert(ng);
-                    }
-                }
                 for a in annots {
-                    if done.iter().any(|(d, _)| d.id == a.id) {
+                    if done.iter().any(|(pid, _)| *pid == a.id) {
                         continue;
                     }
                     accepted_now.push(format!("{}/{}:{}", b.id, a.id, next_id));
@@ -2110,6 +2114,7 @@ impl App {
                 }
                 if let Some(f) = &markups_file {
                     sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
+                    saved = true;
                 }
             }
             p.batches.retain(|b| !b.annots.is_empty() || !b.scales.is_empty());
@@ -2119,6 +2124,19 @@ impl App {
         self.reload_proposals();
         let n = match taken {
             Ok(n) => n,
+            // The markups are saved; only the proposals couldn't be rewritten.
+            // Show what's on disk: a later accept skips what's already in.
+            Err(e) if saved => {
+                self.snapshot();
+                self.annots = annots_now;
+                self.scales = scales_now;
+                self.accepted = accepted_now;
+                self.next_id = next_id;
+                self.selected.clear();
+                self.dirty = false;
+                self.toast(format!("Accepted, but couldn't update the proposals ({e}): they still show, and accepting them again adds nothing twice"));
+                return;
+            }
             Err(e) => {
                 let what = if accept { "accept" } else { "reject" };
                 self.toast(format!("Couldn't {what}: {e}"));
@@ -4153,6 +4171,37 @@ mod tests {
         app.settle("2", None, None, true);
         assert_eq!(app.annots.len(), 2, "the cloud isn't added again");
         assert_eq!(app.annots[1].group, Some(9), "the callout joins the cloud's group");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepting_one_row_recovers_its_groups_receipt_from_the_batch() {
+        let (mut app, dir) = reviewing("retryrow");
+        app.poll_proposals(10.0);
+        let (cloud, callout) = (app.props.batches[1].annots[0].clone(), app.props.batches[1].annots[1].id);
+        app.annots.push(Annot { id: 90, group: Some(9), ..cloud.clone() });
+        app.accepted = vec![format!("2/{}:90", cloud.id)];
+        app.next_id = 91;
+        app.settle("2", Some(callout), None, true);
+        assert_eq!(app.annots.last().unwrap().group, Some(9));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_proposals_write_still_shows_what_was_saved() {
+        let (mut app, dir) = reviewing("propfail");
+        app.poll_proposals(10.0);
+        // The proposals temp file's name is taken by a folder: the rewrite fails after the markups save.
+        std::fs::create_dir_all(dir.join(format!("doc.proposals.json.{}.tmp", std::process::id()))).unwrap();
+        app.settle("1", None, None, true);
+        assert_eq!(app.annots.len(), 1, "saved, so shown");
+        assert_eq!(sidecar::load_file(&dir.join("doc.json")).unwrap().annots.len(), 1);
+        assert_eq!(app.props.batches.len(), 2, "still proposed");
+        // Accepting again once the file can be written adds nothing twice.
+        std::fs::remove_dir_all(dir.join(format!("doc.proposals.json.{}.tmp", std::process::id()))).unwrap();
+        app.settle("1", None, None, true);
+        assert_eq!(app.annots.len(), 1);
+        assert_eq!(app.props.batches.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
