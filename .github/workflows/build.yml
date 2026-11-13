@@ -61,6 +61,7 @@ jobs:
           path: |
             dist/*.exe
             target/release/greenline.exe
+            target/release/greenline-cli.exe
             vendor/pdfium.dll
 
   release:

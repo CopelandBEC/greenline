@@ -1,5 +1,6 @@
-use crate::annot::{self, Annot, Kind, Prim, Rgb};
+use crate::annot::{self, Annot, Kind, Prim, Rgb, COLORS};
 use crate::measure::{self, Scale, Units};
+use crate::proposals::{self, Proposals};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
 use crate::stamps;
@@ -16,6 +17,8 @@ const MAX_BASE_PX: f32 = 4096.0;
 const HIT_PX: f32 = 7.0;
 /// Selection outlines, handles and marquee.
 const SEL: Color32 = Color32::from_rgb(0, 150, 255);
+/// Outline round agents' proposed markups until they're accepted.
+const PROPOSED: Color32 = Color32::from_rgb(235, 120, 0);
 /// Thumbnail render size (physical px on the long side) and cache cap.
 const THUMB_PX: f32 = 420.0;
 const MAX_THUMBS: usize = 400;
@@ -72,15 +75,6 @@ const TOOLS: [(Tool, &str, Key); 11] = [
     (Tool::Area, "Area", Key::E),
 ];
 
-/// The first is the default for new markups: CopelandBEC medium green.
-const COLORS: [(Rgb, &str); 6] = [
-    ([0x6B, 0x9A, 0x1E], "Green"),
-    ([228, 0, 0], "Red"),
-    ([0, 88, 220], "Blue"),
-    ([20, 20, 20], "Black"),
-    ([240, 120, 0], "Orange"),
-    ([255, 214, 0], "Yellow"),
-];
 const COLOR_KEYS: [Key; 6] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
 const TEXT_SIZES: [f32; 6] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0];
 /// Colour of placed dates.
@@ -191,6 +185,20 @@ pub struct App {
     show_sidebar: bool,
     show_markups: bool,
     show_stamps: bool,
+    /// Review panel (Y): agents' proposals. Takes the right side over from markups/stamps.
+    show_review: bool,
+    /// Proposals for this PDF as last read, and the file's time then.
+    props: Proposals,
+    /// The proposals file for this PDF (beside its markups file).
+    props_path: Option<PathBuf>,
+    /// This PDF's markups file.
+    markups_file: Option<PathBuf>,
+    /// Proposed markups already accepted, saved with the markups (`Sidecar::accepted`).
+    accepted: Vec<String>,
+    props_mtime: Option<std::time::SystemTime>,
+    props_checked: f64,
+    /// Proposal row under the pointer: batch id and markup id (outlined on the sheet).
+    props_hover: Option<(String, u64)>,
     overview: bool,
     overview_tile: f32,
     overview_cursor: usize,
@@ -306,6 +314,14 @@ impl App {
             show_sidebar: prefs.show_sidebar,
             show_markups: prefs.show_markups && !prefs.show_stamps,
             show_stamps: prefs.show_stamps,
+            show_review: false,
+            props: Proposals::default(),
+            props_path: None,
+            markups_file: None,
+            accepted: Vec::new(),
+            props_mtime: None,
+            props_checked: f64::NEG_INFINITY,
+            props_hover: None,
             overview: false,
             overview_tile: 240.0,
             overview_cursor: 0,
@@ -391,6 +407,7 @@ impl App {
         self.placing = None;
         self.annots = Vec::new();
         self.scales = Vec::new();
+        self.accepted = Vec::new();
         self.building = None;
         self.scale_win = ScaleWin { open: self.scale_win.open, ..Default::default() };
         self.next_id = 1;
@@ -404,9 +421,10 @@ impl App {
         }
         match sidecar::load(&path) {
             Ok(Some(s)) => {
-                self.next_id = s.annots.iter().map(|a| a.id + 1).max().unwrap_or(1);
+                self.next_id = first_free_id(&s.annots, &s.accepted);
                 self.annots = s.annots;
                 self.scales = s.scales;
+                self.accepted = s.accepted;
             }
             Ok(None) => {}
             // Never autosave over a markups file we couldn't read.
@@ -414,6 +432,12 @@ impl App {
         }
         self.read_only = why.is_some();
         self.read_only_why = why.unwrap_or_default();
+        self.props = Proposals::default();
+        self.props_path = Some(proposals::file_for(&path));
+        self.markups_file = Some(sidecar::file_for(&path));
+        self.props_mtime = None;
+        self.props_checked = f64::NEG_INFINITY;
+        self.props_hover = None;
         self.path = Some(path);
         self.status = "Opening…".into();
     }
@@ -534,11 +558,11 @@ impl App {
         if !self.dirty || self.read_only {
             return;
         }
-        let Some(p) = &self.path else {
+        let (Some(p), Some(f)) = (&self.path, &self.markups_file) else {
             self.dirty = false;
             return;
         };
-        match sidecar::save(p, &self.annots, &self.scales) {
+        match sidecar::save_file(f, p, &self.annots, &self.scales, &self.accepted) {
             Ok(()) => self.dirty = false,
             Err(e) => {
                 // Stays dirty; retried on the next change or document switch.
@@ -914,8 +938,11 @@ impl App {
         }
     }
 
+    /// A group id no markup has, and none a proposal batch has reserved for
+    /// the rest of a group it's partly accepted.
     fn next_group(&self) -> u64 {
-        self.annots.iter().filter_map(|a| a.group).max().unwrap_or(0) + 1
+        let reserved = self.props.batches.iter().flat_map(|b| b.accepted_groups.values().copied());
+        self.annots.iter().filter_map(|a| a.group).chain(reserved).max().unwrap_or(0) + 1
     }
 
     /// Groups the selection, one group per page it spans.
@@ -1166,6 +1193,9 @@ impl App {
         }
         if pressed(Key::I) {
             self.toggle_right_panel(true);
+        }
+        if pressed(Key::Y) {
+            self.show_review = !self.show_review;
         }
         if pressed(Key::U) {
             self.scale_win.open = !self.scale_win.open;
@@ -1972,6 +2002,264 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Proposals (agents' markups for review)
+
+    /// Rereads the proposals file when it changes (checked once a second);
+    /// opens the review panel when new ones arrive.
+    fn poll_proposals(&mut self, now: f64) {
+        if now - self.props_checked < 1.0 {
+            return;
+        }
+        self.props_checked = now;
+        let Some(file) = self.props_path.clone() else { return };
+        if proposals::modified(&file) == self.props_mtime {
+            return;
+        }
+        let before = self.props.count();
+        self.reload_proposals();
+        let n = self.props.count();
+        if n > before {
+            self.show_review = true;
+            let who: Vec<&str> = self.props.batches.iter().map(|b| b.agent.as_str()).collect();
+            self.toast(format!("{} proposed by {} to review (Y)", n - before, who.last().copied().unwrap_or("an agent")));
+        }
+    }
+
+    /// Reads the proposals file as it is now.
+    fn reload_proposals(&mut self) {
+        let Some(file) = self.props_path.clone() else { return };
+        self.props_mtime = proposals::modified(&file);
+        match proposals::load_file(&file) {
+            Ok(p) => self.props = p,
+            Err(e) => self.toast(format!("Couldn't read the proposals: {e}")),
+        }
+        self.relabel_proposals();
+    }
+
+    /// Accepted scales with every batch's scales over them, as the proposals would leave things.
+    fn proposed_scales(&self) -> Vec<Scale> {
+        self.props.batches.iter().fold(self.scales.clone(), |acc, b| crate::ops::merged_scales(&acc, &b.scales))
+    }
+
+    fn relabel_proposals(&mut self) {
+        let scales = self.proposed_scales();
+        let units = self.prefs.units;
+        for b in &mut self.props.batches {
+            measure::relabel(&mut b.annots, &scales, units);
+        }
+    }
+
+    /// Takes markups (`None`: all of them) and scales out of batch `id`.
+    /// Accepted ones are added to the markups, saved, and only then taken out
+    /// of the proposals, all under the proposals' lock: a failed save changes
+    /// nothing, and a batch arriving meanwhile isn't lost. One undo step.
+    fn settle(&mut self, id: &str, annot: Option<u64>, scale: Option<Scale>, accept: bool) {
+        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return };
+        if accept && (self.read_only || self.markups_file.is_none()) {
+            self.toast(format!("Can't accept while not autosaving ({})", self.read_only_why));
+            return;
+        }
+        let whole = annot.is_none() && scale.is_none();
+        let markups_file = self.markups_file.clone();
+        let (mut annots_now, mut scales_now, mut accepted_now) = (self.annots.clone(), self.scales.clone(), self.accepted.clone());
+        let mut next_id = self.next_id;
+        let mut next_group = self.next_group();
+        // Set once the markups file has the accepted work, whatever happens to the proposals write.
+        let mut saved = false;
+        let taken = proposals::update_file(&file, &path, |p| {
+            // Keys for batches that are gone can go; this batch's stay until it's written.
+            accepted_now.retain(|k| k.split_once('/').is_some_and(|(bid, _)| p.batches.iter().any(|b| b.id == bid)));
+            let Some(b) = p.batches.iter_mut().find(|b| b.id == id) else { return Ok(0) };
+            // Markups an accept took in before its proposals write failed are
+            // skipped below; first recover, from the whole batch, the groups they
+            // joined, so the rest of each group joins them too.
+            let receipt = |bid: &str, a: &Annot| accepted_now.iter().find_map(|k| k.strip_prefix(&format!("{bid}/{}:", a.id)).and_then(|n| n.parse::<u64>().ok()));
+            let done: Vec<(u64, u64)> = b.annots.iter().filter_map(|a| receipt(&b.id, a).map(|n| (a.id, n))).collect();
+            for (pid, new_id) in &done {
+                let g = b.annots.iter().find(|a| a.id == *pid).and_then(|a| a.group);
+                if let (Some(g), Some(ng)) = (g, annots_now.iter().find(|x| x.id == *new_id).and_then(|x| x.group)) {
+                    b.accepted_groups.insert(g, ng);
+                }
+            }
+            let annots: Vec<Annot> = match annot {
+                Some(aid) => b.annots.iter().position(|a| a.id == aid).map(|i| vec![b.annots.remove(i)]).unwrap_or_default(),
+                None if whole => std::mem::take(&mut b.annots),
+                None => Vec::new(),
+            };
+            // By value, not row: the file may have changed since the row was drawn.
+            let scales: Vec<Scale> = match scale {
+                Some(want) => b.scales.iter().position(|s| *s == want).map(|i| vec![b.scales.remove(i)]).unwrap_or_default(),
+                None if whole => std::mem::take(&mut b.scales),
+                None => Vec::new(),
+            };
+            let n = annots.len() + scales.len();
+            if accept && n > 0 {
+                for a in annots {
+                    if done.iter().any(|(pid, _)| *pid == a.id) {
+                        continue;
+                    }
+                    accepted_now.push(format!("{}/{}:{}", b.id, a.id, next_id));
+                    let group = a.group.map(|g| {
+                        *b.accepted_groups.entry(g).or_insert_with(|| {
+                            next_group += 1;
+                            next_group - 1
+                        })
+                    });
+                    annots_now.push(Annot { id: next_id, group, ..a });
+                    next_id += 1;
+                }
+                for s in scales {
+                    // Receipts for scales too: a retry mustn't put back a scale the
+                    // reviewer has since changed.
+                    let key = format!("{}/scale:{}", b.id, serde_json::to_string(&s).unwrap_or_default());
+                    if accepted_now.contains(&key) {
+                        continue;
+                    }
+                    accepted_now.push(key);
+                    scales_now.retain(|t| !(t.page == s.page && t.region == s.region));
+                    scales_now.push(s);
+                }
+                if let Some(f) = &markups_file {
+                    sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
+                    saved = true;
+                }
+            }
+            p.batches.retain(|b| !b.annots.is_empty() || !b.scales.is_empty());
+            Ok(n)
+        });
+        // Reread: the file is the truth, including anything added meanwhile.
+        self.reload_proposals();
+        let n = match taken {
+            Ok(n) => n,
+            // The markups are saved; only the proposals couldn't be rewritten.
+            // Show what's on disk: a later accept skips what's already in.
+            Err(e) if saved => {
+                self.snapshot();
+                self.annots = annots_now;
+                self.scales = scales_now;
+                self.accepted = accepted_now;
+                self.next_id = next_id;
+                self.selected.clear();
+                self.dirty = false;
+                self.toast(format!("Accepted, but couldn't update the proposals ({e}): they still show, and accepting them again adds nothing twice"));
+                return;
+            }
+            Err(e) => {
+                let what = if accept { "accept" } else { "reject" };
+                self.toast(format!("Couldn't {what}: {e}"));
+                return;
+            }
+        };
+        if !accept {
+            self.toast(format!("Rejected {n}"));
+            return;
+        }
+        if n == 0 {
+            return;
+        }
+        self.snapshot();
+        self.annots = annots_now;
+        self.scales = scales_now;
+        self.accepted = accepted_now;
+        self.next_id = next_id;
+        self.selected.clear();
+        // Saved above.
+        self.dirty = false;
+        self.toast(format!("Accepted {n} · Ctrl+Z takes {} back out of your markups", if n == 1 { "it" } else { "them" }));
+    }
+
+    /// Scrolls a proposed markup into the middle of the view.
+    fn focus_proposal(&mut self, a: &Annot) {
+        if a.page >= self.pages.len() {
+            return;
+        }
+        let c = self.page_doc_rect(a.page).min + a.bounds().center().to_vec2();
+        self.overview = false;
+        self.offset = c.to_vec2() - self.canvas.size() / (2.0 * self.zoom);
+    }
+
+    fn review_panel(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.strong(format!("Review ({})", self.props.count()));
+        });
+        ui.separator();
+        self.props_hover = None;
+        if self.props.batches.is_empty() {
+            ui.weak("Nothing to review. Markups an agent proposes with greenline-cli appear here (and on the sheets, outlined in orange) for you to accept or reject.");
+            return;
+        }
+        if self.read_only {
+            ui.colored_label(Color32::from_rgb(230, 80, 60), format!("Not autosaving ({}): you can look, but not accept.", self.read_only_why));
+        }
+        let mut action: Option<(String, Option<u64>, Option<Scale>, bool)> = None;
+        let mut focus: Option<Annot> = None;
+        let batches = self.props.batches.clone();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for b in &batches {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("{} · {}", b.agent, b.created.get(..16).unwrap_or(&b.created).replace('T', " "))).strong());
+                if !b.summary.is_empty() {
+                    ui.label(&b.summary);
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!self.read_only, egui::Button::new("Accept all")).clicked() {
+                        action = Some((b.id.clone(), None, None, true));
+                    }
+                    if ui.button("Reject all").clicked() {
+                        action = Some((b.id.clone(), None, None, false));
+                    }
+                });
+                for s in &b.scales {
+                    ui.horizontal(|ui| {
+                        let what = if s.region.is_some() { "region scale" } else { "scale" };
+                        ui.label(format!("Page {} {what}: {}", s.page + 1, s.label));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Reject").clicked() {
+                                action = Some((b.id.clone(), None, Some(s.clone()), false));
+                            }
+                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                                action = Some((b.id.clone(), None, Some(s.clone()), true));
+                            }
+                        });
+                    });
+                }
+                let mut order: Vec<&Annot> = b.annots.iter().collect();
+                order.sort_by_key(|a| page_order(a));
+                for a in order {
+                    let r = ui.horizontal(|ui| {
+                        let (sw, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
+                        ui.painter().rect_filled(sw, 2.0, Color32::from_rgb(a.color[0], a.color[1], a.color[2]));
+                        let text = format!("p{} {}", a.page + 1, if note_of(a).trim().is_empty() { a.kind_name().to_string() } else { note_of(a).replace('\n', " ") });
+                        let label = ui.add(egui::Label::new(text).truncate().sense(Sense::click())).on_hover_text("Click to show it");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Reject").clicked() {
+                                action = Some((b.id.clone(), Some(a.id), None, false));
+                            }
+                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                                action = Some((b.id.clone(), Some(a.id), None, true));
+                            }
+                        });
+                        label
+                    });
+                    if r.inner.clicked() {
+                        focus = Some(a.clone());
+                    }
+                    if r.response.hovered() || r.inner.hovered() {
+                        self.props_hover = Some((b.id.clone(), a.id));
+                    }
+                }
+                ui.separator();
+            }
+        });
+        if let Some(a) = focus {
+            self.focus_proposal(&a);
+        }
+        if let Some((id, annot, scale, accept)) = action {
+            self.settle(&id, annot, scale, accept);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Stamps
 
     fn start_placing(&mut self, place: Place) {
@@ -2095,6 +2383,7 @@ impl App {
     }
 
     fn toggle_right_panel(&mut self, stamps: bool) {
+        self.show_review = false;
         if stamps {
             self.show_stamps = !self.show_stamps;
             self.show_markups &= !self.show_stamps;
@@ -2200,6 +2489,17 @@ impl App {
                     pp.rect(r, 0.0, SEL.gamma_multiply(0.12), Stroke::new(1.0, SEL), egui::StrokeKind::Middle);
                 }
                 _ => {}
+            }
+            // Proposed markups: drawn as they'd be accepted, each in a dashed orange outline.
+            for b in &self.props.batches {
+                for a in b.annots.iter().filter(|a| a.page == i) {
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
+                    let r = a.bounds();
+                    let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
+                    let hot = self.props_hover.as_ref().is_some_and(|(bid, id)| *bid == b.id && *id == a.id);
+                    let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+                    pp.extend(Shape::dashed_line(&pts, Stroke::new(if hot { 2.5 } else { 1.2 }, PROPOSED), 5.0, 3.0));
+                }
             }
             // The measurement being clicked out, running to the pointer.
             if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i) {
@@ -2400,6 +2700,11 @@ impl App {
             }
             if ui.selectable_label(self.show_stamps, "Stamps I").on_hover_text("Seals, signatures and dates").clicked() {
                 self.toggle_right_panel(true);
+            }
+            let n = self.props.count();
+            let review = if n > 0 { format!("Review Y ({n})") } else { "Review Y".to_string() };
+            if ui.selectable_label(self.show_review, review).on_hover_text("Markups proposed by agents, to accept or reject").clicked() {
+                self.show_review = !self.show_review;
             }
             ui.separator();
             for (t, label, k) in TOOLS {
@@ -2987,6 +3292,7 @@ impl App {
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
                     ("D / E", "Measure length / area: click the points, double-click or Enter to finish (drag: one segment / a rectangle)"),
+                    ("Y", "Review: markups proposed by agents (greenline-cli); accept or reject each, or a whole batch"),
                     ("U", "Scale: pick the drawing scale, use one written on the sheet, calibrate, or add a region for a detail"),
                     ("V or Esc", "Select: drag to move, handles to resize, double-click or Enter to edit text"),
                     ("Ctrl/Shift+click", "Add to or remove from selection (also in the markup list)"),
@@ -3053,6 +3359,7 @@ impl eframe::App for App {
 
         // Measurements read from the scales as they are now (cheap: measurements only).
         measure::relabel(&mut self.annots, &self.scales, self.prefs.units);
+        self.relabel_proposals();
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
         let has_doc = !self.pages.is_empty();
@@ -3066,7 +3373,10 @@ impl eframe::App for App {
                 .show(ui, |ui| self.sidebar(ui));
         }
         self.load_textures(&ctx);
-        if self.show_stamps {
+        self.poll_proposals(now);
+        if self.show_review {
+            egui::Panel::right("review").resizable(true).default_size(300.0).size_range(220.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.review_panel(ui));
+        } else if self.show_stamps {
             egui::Panel::right("stamps").resizable(true).default_size(280.0).size_range(220.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.stamp_panel(ui));
         } else if self.show_markups {
             egui::Panel::right("markups").resizable(true).default_size(280.0).size_range(180.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.markup_list(ui));
@@ -3116,6 +3426,10 @@ impl eframe::App for App {
         self.now = now;
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
             self.save_sidecar();
+        }
+        // Wake once a second to notice proposals an agent adds.
+        if self.path.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if now < self.status_until && self.status_until.is_finite() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(self.status_until - now));
@@ -3299,6 +3613,13 @@ fn note_of(a: &Annot) -> &str {
         Kind::Measure { .. } => a.label(),
         _ => a.text(),
     }
+}
+
+/// The first markup id after every markup's and every accept receipt's (an
+/// undone accept's id must not come back for something else).
+fn first_free_id(annots: &[Annot], accepted: &[String]) -> u64 {
+    let receipts = accepted.iter().filter_map(|k| k.rsplit_once(':').and_then(|(_, n)| n.parse::<u64>().ok()));
+    annots.iter().map(|a| a.id).chain(receipts).max().map_or(1, |m| m + 1)
 }
 
 /// Text size of a note, or of a measurement's value label.
@@ -3726,6 +4047,201 @@ mod tests {
         let area: f32 = tris.iter().map(|[a, b, c]| ((l[*b] - l[*a]).x * (l[*c] - l[*a]).y - (l[*b] - l[*a]).y * (l[*c] - l[*a]).x).abs() / 2.0).sum();
         assert!((area - 6400.0).abs() < 0.1, "{area}");
         assert!(convex(&annot::rect_pts(Rect::from_min_max(pos2(0.0, 0.0), pos2(5.0, 5.0)))));
+    }
+
+
+    /// An app on a 600x800 page whose proposals file is in a temp folder, with
+    /// two batches: one markup and a scale, then a grouped cloud and callout.
+    fn reviewing(name: &str) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("greenline-review-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("doc.proposals.json");
+        let mut app = app();
+        app.path = Some(dir.join("doc.pdf"));
+        app.props_path = Some(file.clone());
+        app.markups_file = Some(dir.join("doc.json"));
+        let ops = serde_json::json!([
+            {"op": "scale", "page": 1, "ratio": 48},
+            {"op": "area", "page": 1, "rect": [100, 100, 154, 190], "name": "W1"}
+        ]);
+        let b1 = crate::ops::parse(&ops, &app.pages, 1, 1).unwrap();
+        let ops = serde_json::json!([
+            {"op": "cloud", "page": 1, "rect": [300, 300, 400, 400], "group": "g"},
+            {"op": "callout", "page": 1, "target": [400, 350], "at": [420, 300], "text": "Gap in air barrier", "group": "g"}
+        ]);
+        let b2 = crate::ops::parse(&ops, &app.pages, 3, 2).unwrap();
+        let mk = |id: &str, b: crate::ops::Batch| proposals::Proposal { id: id.into(), agent: "test".into(), summary: String::new(), created: "2026-11-13T12:00:00-05:00".into(), annots: b.annots, scales: b.scales, accepted_groups: Default::default() };
+        let p = Proposals { pdf: dir.join("doc.pdf"), batches: vec![mk("1", b1), mk("2", b2)], seq: 2 };
+        std::fs::write(&file, serde_json::to_vec(&p).unwrap()).unwrap();
+        (app, dir)
+    }
+
+    #[test]
+    fn proposals_arrive_and_are_accepted_or_rejected() {
+        let (mut app, dir) = reviewing("accept");
+        rect(&mut app, 10.0, 10.0);
+        app.poll_proposals(10.0);
+        assert!(app.show_review, "new proposals open the review panel");
+        assert_eq!(app.props.count(), 4);
+        assert_eq!(app.props.batches[0].annots[0].label(), "W1: 15.00 sf", "measured with the proposed scale");
+
+        // One markup from batch 2, then the rest of it rejected.
+        let callout = app.props.batches[1].annots[1].id;
+        app.settle("2", Some(callout), None, true);
+        assert_eq!(app.annots.len(), 2);
+        assert_eq!(app.props.batches[1].annots.len(), 1, "the file keeps the rest");
+        app.settle("2", None, None, false);
+        assert_eq!(app.annots.len(), 2, "rejecting adds nothing");
+        assert_eq!(app.props.batches.len(), 1);
+
+        // Batch 1 whole: its markup and its scale.
+        app.settle("1", None, None, true);
+        assert!(app.props.batches.is_empty());
+        assert_eq!(app.annots.len(), 3);
+        let saved = sidecar::load_file(&dir.join("doc.json")).unwrap();
+        assert_eq!((saved.annots.len(), saved.scales.len()), (3, 1), "accepted work is saved before it leaves the proposals");
+        assert!(!app.dirty);
+        // Ids aren't reused once their batch is gone.
+        assert_eq!(proposals::load_file(&dir.join("doc.proposals.json")).unwrap().take_id(), "3");
+        assert_eq!(app.scales.len(), 1);
+        assert!(app.annots.iter().map(|a| a.id).collect::<HashSet<_>>().len() == 3, "fresh ids");
+        measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+        assert_eq!(app.annots[2].label(), "W1: 15.00 sf");
+
+        // Accepting is one undo step, scale included.
+        app.undo();
+        assert_eq!((app.annots.len(), app.scales.len()), (2, 0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepted_groups_stay_together_and_read_only_cant_accept() {
+        let (mut app, dir) = reviewing("groups");
+        app.annots.push(Annot { id: 50, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: Some(2), kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)) } });
+        app.next_id = 51;
+        app.poll_proposals(10.0);
+        app.read_only = true;
+        app.settle("2", None, None, true);
+        assert_eq!(app.props.count(), 4, "nothing taken while not autosaving");
+        app.read_only = false;
+        // One at a time: the callout joins the cloud's group.
+        let (cloud, callout) = (app.props.batches[1].annots[0].id, app.props.batches[1].annots[1].id);
+        app.settle("2", Some(cloud), None, true);
+        app.settle("2", Some(callout), None, true);
+        let groups: Vec<Option<u64>> = app.annots.iter().skip(1).map(|a| a.group).collect();
+        assert_eq!(groups.len(), 2);
+        assert!(groups[0].is_some());
+        assert_eq!(groups[0], groups[1], "the cloud and its callout stay grouped");
+        assert_ne!(groups[0], Some(2), "without joining an existing group");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_save_accepts_nothing() {
+        let (mut app, dir) = reviewing("savefail");
+        app.poll_proposals(10.0);
+        // The markups file's folder is a file: saving fails.
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        app.markups_file = Some(dir.join("blocker").join("doc.json"));
+        app.settle("1", None, None, true);
+        assert!(app.annots.is_empty() && app.scales.is_empty());
+        assert_eq!(app.props.count(), 4, "still proposed");
+        assert!(app.undo.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_retried_accept_doesnt_add_twice_and_scales_match_by_value() {
+        let (mut app, dir) = reviewing("retry");
+        app.poll_proposals(10.0);
+        // As if an earlier accept saved W1 but couldn't rewrite the proposals.
+        let w1 = app.props.batches[0].annots[0].clone();
+        app.annots.push(Annot { id: 77, ..w1.clone() });
+        app.accepted = vec![format!("1/{}:77", w1.id)];
+        app.settle("1", Some(w1.id), None, true);
+        assert_eq!(app.annots.len(), 1, "not added again");
+        assert!(app.props.batches[0].annots.is_empty(), "but taken out of the proposals");
+        // A scale row that no longer matches the file does nothing.
+        let mut stale = app.props.batches[0].scales[0].clone();
+        stale.per_pt *= 2.0;
+        app.settle("1", None, Some(stale), true);
+        assert!(app.scales.is_empty());
+        let s = app.props.batches[0].scales[0].clone();
+        app.settle("1", None, Some(s), true);
+        assert_eq!(app.scales.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_retried_accept_keeps_groups_together() {
+        let (mut app, dir) = reviewing("retrygroup");
+        app.poll_proposals(10.0);
+        // The cloud was taken in (as markup 90, group 9) but the proposals write failed.
+        let cloud = app.props.batches[1].annots[0].clone();
+        app.annots.push(Annot { id: 90, group: Some(9), ..cloud.clone() });
+        app.accepted = vec![format!("2/{}:90", cloud.id)];
+        app.next_id = 91;
+        app.settle("2", None, None, true);
+        assert_eq!(app.annots.len(), 2, "the cloud isn't added again");
+        assert_eq!(app.annots[1].group, Some(9), "the callout joins the cloud's group");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accepting_one_row_recovers_its_groups_receipt_from_the_batch() {
+        let (mut app, dir) = reviewing("retryrow");
+        app.poll_proposals(10.0);
+        let (cloud, callout) = (app.props.batches[1].annots[0].clone(), app.props.batches[1].annots[1].id);
+        app.annots.push(Annot { id: 90, group: Some(9), ..cloud.clone() });
+        app.accepted = vec![format!("2/{}:90", cloud.id)];
+        app.next_id = 91;
+        app.settle("2", Some(callout), None, true);
+        assert_eq!(app.annots.last().unwrap().group, Some(9));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_proposals_write_still_shows_what_was_saved() {
+        let (mut app, dir) = reviewing("propfail");
+        app.poll_proposals(10.0);
+        // The proposals temp file's name is taken by a folder: the rewrite fails after the markups save.
+        std::fs::create_dir_all(dir.join(format!("doc.proposals.json.{}.tmp", std::process::id()))).unwrap();
+        app.settle("1", None, None, true);
+        assert_eq!(app.annots.len(), 1, "saved, so shown");
+        assert_eq!(sidecar::load_file(&dir.join("doc.json")).unwrap().annots.len(), 1);
+        assert_eq!(app.props.batches.len(), 2, "still proposed");
+        // The reviewer changes the scale meanwhile.
+        app.scales[0].per_pt *= 2.0;
+        let mine = app.scales[0].clone();
+        // Accepting again once the file can be written adds nothing twice, and keeps their scale.
+        std::fs::remove_dir_all(dir.join(format!("doc.proposals.json.{}.tmp", std::process::id()))).unwrap();
+        app.settle("1", None, None, true);
+        assert_eq!(app.annots.len(), 1);
+        assert_eq!(app.scales, vec![mine]);
+        assert_eq!(app.props.batches.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn receipt_ids_arent_handed_out_again() {
+        let a = Annot { id: 3, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: None, kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0)) } };
+        assert_eq!(first_free_id(&[a.clone()], &["1/5:12".into(), "1/scale:{\"page\":0}".into()]), 13);
+        assert_eq!(first_free_id(&[a], &[]), 4);
+        assert_eq!(first_free_id(&[], &[]), 1);
+    }
+
+    #[test]
+    fn reserved_groups_arent_handed_out_again() {
+        let (mut app, dir) = reviewing("reserved");
+        app.poll_proposals(10.0);
+        let cloud = app.props.batches[1].annots[0].id;
+        app.settle("2", Some(cloud), None, true);
+        let g = app.annots[0].group.unwrap();
+        app.undo();
+        assert!(app.annots.is_empty());
+        assert!(app.next_group() > g, "the callout still waits to join group {g}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
 }

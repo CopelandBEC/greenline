@@ -33,7 +33,6 @@ impl Scale {
     }
 
     /// Real length per paper length.
-    #[allow(dead_code)] // for the command line
     pub fn ratio(&self) -> f64 {
         self.per_pt * PT_PER_IN
     }

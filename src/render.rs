@@ -79,7 +79,7 @@ impl Worker {
     }
 }
 
-fn find_pdfium() -> anyhow::Result<PathBuf> {
+pub fn find_pdfium() -> anyhow::Result<PathBuf> {
     let name = Pdfium::pdfium_platform_library_name();
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -196,7 +196,7 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
     queue.pop_front()
 }
 
-fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
+pub fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
     let p = doc.pages().get(page as PdfPageIndex)?;
     let full_w = (p.width().value * scale).round().max(1.0) as Pixels;
     let full_h = (p.height().value * scale).round().max(1.0) as Pixels;
@@ -237,6 +237,13 @@ impl ViewToUser {
 
     pub fn map(&self, p: Pos2) -> Pos2 {
         self.o + self.u * p.x + self.v * p.y
+    }
+
+    /// PDF user space back to view points.
+    pub fn unmap(&self, q: Pos2) -> Pos2 {
+        let d = q - self.o;
+        let det = self.u.x * self.v.y - self.u.y * self.v.x;
+        pos2((d.x * self.v.y - d.y * self.v.x) / det, (self.u.x * d.y - self.u.y * d.x) / det)
     }
 }
 
@@ -323,7 +330,7 @@ const IMAGE_DPI: f32 = 600.0;
 
 /// Library images used by `annots`, decoded. A missing one fails the export
 /// rather than sending out a sheet without its seal.
-fn load_images(annots: &[Annot]) -> anyhow::Result<HashMap<String, image::RgbaImage>> {
+pub fn load_images(annots: &[Annot]) -> anyhow::Result<HashMap<String, image::RgbaImage>> {
     let mut out = HashMap::new();
     for a in annots {
         if let crate::annot::Kind::Image { image, name, .. } = &a.kind {
@@ -426,6 +433,12 @@ fn emit_prims<'a>(
     Ok(())
 }
 
+/// A flattened copy of `src` with `annots` drawn in, for the command line's renders.
+pub fn flatten(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot]) -> anyhow::Result<usize> {
+    let images = load_images(annots)?;
+    export(pdfium, src, out, annots, &images, ExportMode::Flatten, "Greenline")
+}
+
 /// Writes `annots` onto a copy of `src` and saves it to `out`. Returns how many
 /// characters had no font. Annotations already in the PDF are left as they are
 /// (PDFium's flatten can resize pages and drop comments).
@@ -489,18 +502,17 @@ pub fn export(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::annot::{Annot, Kind};
     use egui::Rect;
 
     /// PDFium can be bound only once per process and isn't thread-safe: tests
     /// share one instance and take turns using it.
-    pub(super) static PDFIUM_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static PDFIUM_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    pub(super) fn test_pdfium() -> &'static Pdfium {
-        static PDFIUM: std::sync::OnceLock<Pdfium> = std::sync::OnceLock::new();
-        PDFIUM.get_or_init(|| Pdfium::new(Pdfium::bind_to_library(find_pdfium().unwrap()).unwrap()))
+    pub(crate) fn test_pdfium() -> &'static Pdfium {
+        crate::pdf::pdfium().unwrap()
     }
 
     fn annot(page: usize, kind: Kind) -> Annot {

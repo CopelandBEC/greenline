@@ -6,7 +6,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 
 **Windows:** run `Greenline-<version>-setup.exe` from the [latest release](../../releases/latest). Per-user install, no admin rights. The installer is unsigned for now, so SmartScreen may warn: **More info → Run anyway**. It adds Start-menu (optional desktop) shortcuts and "Open with → Greenline" for PDFs without changing your default PDF app.
 
-**Linux:** `scripts/fetch-pdfium.sh && cargo build --release`, then run `target/release/greenline file.pdf`.
+**Linux:** `scripts/fetch-pdfium.sh && cargo build --release`, then run `target/release/greenline file.pdf` (and `target/release/greenline-cli` for the command line).
 
 ## Use
 
@@ -28,6 +28,18 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `F1` | All shortcuts, your name for exported comments, and light/dark appearance |
 
 Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` on Linux; an old Redline folder is moved there on first launch); the source PDF is never modified. Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.
+
+## Agents and scripts
+
+`greenline-cli` (installed next to the app; the installer can put it on your PATH) lets an AI agent or a script work on a drawing set. It can:
+
+- read sheets: text with positions, vector lines, and renders with a coordinate grid;
+- fit outlines to the drawn lines;
+- set scales, and measure and mark up in batches.
+
+Everything an agent adds is a **proposal**. It appears in Greenline for you to accept or reject, and never goes straight into your markups. Have the agent run `greenline-cli guide` first; [`docs/agents.md`](docs/agents.md) is the same guide.
+
+Example jobs: "review sheets A3.0–A5.1 and cloud any air or water barrier discontinuities", or "outline every window on the elevations, measure them and give me a takeoff spreadsheet".
 
 ## Build and release
 
