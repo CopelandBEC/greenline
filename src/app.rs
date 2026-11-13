@@ -421,7 +421,7 @@ impl App {
         }
         match sidecar::load(&path) {
             Ok(Some(s)) => {
-                self.next_id = s.annots.iter().map(|a| a.id + 1).max().unwrap_or(1);
+                self.next_id = first_free_id(&s.annots, &s.accepted);
                 self.annots = s.annots;
                 self.scales = s.scales;
                 self.accepted = s.accepted;
@@ -3615,6 +3615,13 @@ fn note_of(a: &Annot) -> &str {
     }
 }
 
+/// The first markup id after every markup's and every accept receipt's (an
+/// undone accept's id must not come back for something else).
+fn first_free_id(annots: &[Annot], accepted: &[String]) -> u64 {
+    let receipts = accepted.iter().filter_map(|k| k.rsplit_once(':').and_then(|(_, n)| n.parse::<u64>().ok()));
+    annots.iter().map(|a| a.id).chain(receipts).max().map_or(1, |m| m + 1)
+}
+
 /// Text size of a note, or of a measurement's value label.
 fn label_size(a: &Annot) -> Option<f32> {
     match &a.kind {
@@ -4214,6 +4221,14 @@ mod tests {
         assert_eq!(app.scales, vec![mine]);
         assert_eq!(app.props.batches.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn receipt_ids_arent_handed_out_again() {
+        let a = Annot { id: 3, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: None, kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0)) } };
+        assert_eq!(first_free_id(&[a.clone()], &["1/5:12".into(), "1/scale:{\"page\":0}".into()]), 13);
+        assert_eq!(first_free_id(&[a], &[]), 4);
+        assert_eq!(first_free_id(&[], &[]), 1);
     }
 
     #[test]
