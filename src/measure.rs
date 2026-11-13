@@ -119,6 +119,43 @@ pub fn area_pt2(pts: &[Pos2]) -> f64 {
     (s / 2.0).abs()
 }
 
+/// Whether a closed outline crosses itself (a bow-tie), whose area the
+/// shoelace sum would net to nothing.
+pub fn crosses_itself(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    if n < 4 {
+        return false;
+    }
+    let orient = |a: Pos2, b: Pos2, c: Pos2| ((b.x - a.x) as f64 * (c.y - a.y) as f64 - (b.y - a.y) as f64 * (c.x - a.x) as f64).signum();
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        for j in i + 2..n {
+            // Edges sharing a corner (including last with first) don't count.
+            if (j + 1) % n == i {
+                continue;
+            }
+            let (c, d) = (pts[j], pts[(j + 1) % n]);
+            let (o1, o2, o3, o4) = (orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b));
+            if o1 * o2 < 0.0 && o3 * o4 < 0.0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Why a measurement has no value: no scale where it is, or an area outline that crosses itself.
+pub fn problem(a: &Annot, scales: &[Scale]) -> Option<&'static str> {
+    let Kind::Measure { pts, area, .. } = &a.kind else { return None };
+    if *area && crosses_itself(pts) {
+        Some("outline crosses itself")
+    } else if scale_for(scales, a.page, pts).is_none() {
+        Some("no scale")
+    } else {
+        None
+    }
+}
+
 /// A measurement's real values, in inches and square inches.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measured {
@@ -135,6 +172,9 @@ pub struct Measured {
 /// Real values of a measurement markup, if it has a scale.
 pub fn measured(a: &Annot, scales: &[Scale]) -> Option<Measured> {
     let Kind::Measure { pts, area, .. } = &a.kind else { return None };
+    if problem(a, scales).is_some() {
+        return None;
+    }
     let s = scale_for(scales, a.page, pts)?;
     let k = s.per_pt;
     let r = pts.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p)));
@@ -147,10 +187,10 @@ pub fn measured(a: &Annot, scales: &[Scale]) -> Option<Measured> {
     })
 }
 
-/// The value text a measurement shows: its name, then length or area.
-pub fn value_text(name: &str, m: Option<&Measured>, units: Units) -> String {
+/// The value text a measurement shows: its name, then length or area (or why there's none).
+pub fn value_text(name: &str, m: Option<&Measured>, problem: Option<&str>, units: Units) -> String {
     let v = match m {
-        None => "no scale".to_string(),
+        None => problem.unwrap_or("no scale").to_string(),
         Some(m) => match m.area {
             Some(a) => fmt_area(a, units),
             None => fmt_len(m.length, units),
@@ -170,9 +210,9 @@ pub fn relabel(annots: &mut [Annot], scales: &[Scale], units: Units) -> bool {
         if !matches!(a.kind, Kind::Measure { .. }) {
             continue;
         }
-        let m = measured(a, scales);
+        let (m, why) = (measured(a, scales), problem(a, scales));
         if let Kind::Measure { name, value, .. } = &mut a.kind {
-            let v = value_text(name, m.as_ref(), units);
+            let v = value_text(name, m.as_ref(), why, units);
             if *value != v {
                 *value = v;
                 changed = true;
@@ -205,7 +245,7 @@ pub fn csv(annots: &[&Annot], scales: &[Scale], units: Units) -> String {
                     m.length * lk, m.width * lk, m.height * lk, q(&m.scale)
                 )
             }
-            None => format!("{head},no scale,,,,,,,,\n"),
+            None => format!("{head},{},,,,,,,,\n", problem(a, scales).unwrap_or("no scale")),
         };
     }
     out
@@ -475,6 +515,20 @@ mod tests {
         assert_eq!(lines[2], "2,1,\"W1\",Area,\"16'-0\"\"\",\"15.00 sf\",\"3'-0\"\"\",\"5'-0\"\"\",16.0000,15.0000,3.0000,5.0000,\"1/4\"\" = 1'-0\"\"\"");
         relabel(&mut annots, &[], Units::Imperial);
         assert_eq!(annots[0].label(), "no scale");
+    }
+
+    #[test]
+    fn crossing_outlines_have_no_area() {
+        let bowtie = vec![pos2(100.0, 100.0), pos2(200.0, 200.0), pos2(100.0, 200.0), pos2(200.0, 100.0)];
+        assert!(crosses_itself(&bowtie));
+        let l = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 40.0), pos2(40.0, 40.0), pos2(40.0, 100.0), pos2(0.0, 100.0)];
+        assert!(!crosses_itself(&l));
+        assert!(!crosses_itself(&[pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0), pos2(0.0, 10.0)]));
+        let scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
+        let mut a = vec![Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, kind: Kind::Measure { pts: bowtie, area: true, name: String::new(), value: String::new(), size: 10.0 } }];
+        relabel(&mut a, &scales, Units::Imperial);
+        assert_eq!(a[0].label(), "outline crosses itself");
+        assert!(measured(&a[0], &scales).is_none());
     }
 
     #[test]

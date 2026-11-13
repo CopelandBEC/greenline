@@ -1696,6 +1696,11 @@ impl App {
         match self.tool {
             Tool::Calibrate if pts.len() >= 2 => self.set_calibration(page, pts[0], pts[pts.len() - 1]),
             Tool::Length if pts.len() >= 2 => self.add_measure(page, pts, false),
+            Tool::Area if pts.len() >= 3 && measure::crosses_itself(&pts) => {
+                // Keep it going, so Backspace can take back the point that crossed.
+                self.building = Some((page, pts));
+                self.toast("The outline crosses itself: Backspace to take back a point, or Esc to drop it".into());
+            }
             Tool::Area if pts.len() >= 3 => self.add_measure(page, pts, true),
             Tool::Area => self.toast("An area needs at least three points".into()),
             _ => {}
@@ -3610,6 +3615,14 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m[0].1);
         assert_eq!(m[0].0.len(), 4, "closing click isn't a point");
+        // A bow-tie isn't finished: it stays open for Backspace.
+        for p in [pos2(300.0, 300.0), pos2(400.0, 400.0), pos2(300.0, 400.0), pos2(400.0, 300.0)] {
+            app.click(p, false, PLAIN);
+        }
+        app.click(pos2(400.0, 300.0), true, PLAIN);
+        assert_eq!(measures(&app).len(), 1);
+        assert_eq!(app.building.as_ref().map(|b| b.1.len()), Some(4));
+        app.building = None;
         // Two points isn't an area.
         app.click(pos2(400.0, 400.0), false, PLAIN);
         app.click(pos2(450.0, 400.0), false, PLAIN);
