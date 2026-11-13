@@ -165,6 +165,18 @@ fn not_source(out: &Path, src: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes `out` through a temporary file renamed into place, so a hard link
+/// to another file (the source PDF, say) is replaced, never written through.
+fn write_new(out: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = out.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| anyhow::anyhow!("{}: {e}", out.display()))?;
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("{}: {e}", out.display())
+    })
+}
+
 fn page_arg(a: &Args, pages: usize) -> anyhow::Result<usize> {
     let n: usize = a.get("page").ok_or_else(|| anyhow::anyhow!("needs --page N"))?.parse().map_err(|_| anyhow::anyhow!("--page must be a number"))?;
     if n == 0 || n > pages {
@@ -268,10 +280,12 @@ fn overlay(a: &Args, doc: &Doc, pages: &[Vec2], page: usize, units: Units) -> an
     }
     if let Some(f) = a.get("ops") {
         let (id, group) = (1_000_000, 1_000_000);
-        let mut b = ops::parse(&read_ops(f)?, pages, id, group).map_err(anyhow::Error::msg)?;
-        ops::relabel(&mut b, &scales, units);
+        let b = ops::parse(&read_ops(f)?, pages, id, group).map_err(anyhow::Error::msg)?;
+        scales = ops::merged_scales(&scales, &b.scales);
         out.extend(b.annots.into_iter().filter(|x| x.page == page));
     }
+    // Everything drawn reads from the scales as they'd be, draft scales included.
+    measure::relabel(&mut out, &scales, units);
     if let Some(step) = a.num("grid").map_err(anyhow::Error::msg)? {
         if step < 10.0 {
             anyhow::bail!("--grid step must be at least 10 points");
@@ -399,7 +413,11 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                 r?
             };
             let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
-            image::save_buffer(&out, &rgba, w as u32, h as u32, image::ColorType::Rgba8).map_err(|e| anyhow::anyhow!("{}: {e}", out.display()))?;
+            let mut png = Vec::new();
+            image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+                .ok_or_else(|| anyhow::anyhow!("render size mismatch"))?
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+            write_new(&out, &png)?;
             Ok(json!({
                 "file": out,
                 "page": page + 1,
@@ -430,7 +448,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             });
             if let Some(f) = a.get("csv") {
                 not_source(Path::new(f), &doc.path)?;
-                std::fs::write(f, measure::csv(&ms, &scales, units)).map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
+                write_new(Path::new(f), measure::csv(&ms, &scales, units).as_bytes())?;
                 v["csv"] = json!(f);
             }
             Ok(v)

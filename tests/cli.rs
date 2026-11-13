@@ -153,6 +153,16 @@ fn an_agent_takes_off_a_window_for_review() {
     assert!(env.fails(&["measurements", pdf, "--csv", pdf]).contains("refusing to overwrite"));
     assert!(env.fails(&["render", pdf, "--page", "1", "--out", pdf]).contains("refusing to overwrite"));
     assert!(env.fails(&["export", pdf, "--out", "sheet.pdf"]).contains("refusing to overwrite"), "relative to the working folder");
+    // A hard link to the source is replaced, not written through.
+    let before = std::fs::read(&env.pdf).unwrap();
+    let link = env.dir.join("linked.csv");
+    if std::fs::hard_link(&env.pdf, &link).is_ok() {
+        env.run(&["measurements", pdf, "--csv", link.to_str().unwrap()]);
+        assert_eq!(std::fs::read(&env.pdf).unwrap(), before, "the source PDF is untouched");
+    }
+    // A draft scale relabels what's already there in a preview.
+    std::fs::write(&ops, r#"[{"op": "scale", "page": 1, "ratio": 96}]"#).unwrap();
+    env.run(&["render", pdf, "--page", "1", "--dpi", "30", "--proposals", "--ops", ops.to_str().unwrap(), "--out", png.to_str().unwrap()]);
 
     assert_eq!(env.run(&["withdraw", pdf, "1"])["withdrawn"], 1);
     assert_eq!(env.run(&["proposals", pdf])["count"], 0);
