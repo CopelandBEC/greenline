@@ -1046,6 +1046,10 @@ impl App {
     fn set_tool(&mut self, t: Tool) {
         self.commit_edit();
         self.finish_measure();
+        // Still open (an area that crosses itself): it belongs to the old tool.
+        if self.building.take().is_some() {
+            self.toast("Unfinished area dropped: its outline crossed itself".into());
+        }
         self.placing = None;
         self.tool = t;
         if t != Tool::Select {
@@ -3622,7 +3626,11 @@ mod tests {
         app.click(pos2(400.0, 300.0), true, PLAIN);
         assert_eq!(measures(&app).len(), 1);
         assert_eq!(app.building.as_ref().map(|b| b.1.len()), Some(4));
-        app.building = None;
+        // Changing tools doesn't carry it over to the new one.
+        app.set_tool(Tool::Length);
+        assert!(app.building.is_none());
+        assert_eq!(measures(&app).len(), 1);
+        app.set_tool(Tool::Area);
         // Two points isn't an area.
         app.click(pos2(400.0, 400.0), false, PLAIN);
         app.click(pos2(450.0, 400.0), false, PLAIN);
