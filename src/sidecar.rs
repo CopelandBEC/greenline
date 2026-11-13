@@ -62,7 +62,11 @@ pub fn load(pdf: &Path) -> anyhow::Result<Option<Sidecar>> {
     if !f.exists() {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&std::fs::read(f)?)?))
+    load_file(&f).map(Some)
+}
+
+pub fn load_file(f: &Path) -> anyhow::Result<Sidecar> {
+    Ok(serde_json::from_slice(&std::fs::read(f)?)?)
 }
 
 /// Window preferences that persist across launches.
@@ -121,8 +125,15 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
 }
 
 pub fn save(pdf: &Path, annots: &[Annot], scales: &[Scale]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir())?;
-    let f = file_for(pdf);
+    save_file(&file_for(pdf), pdf, annots, scales)
+}
+
+/// `save` to the markups file `f` for `pdf`.
+pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale]) -> anyhow::Result<()> {
+    if let Some(d) = f.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let f = f.to_path_buf();
     let tmp = f.with_extension(format!("json.{}.tmp", std::process::id()));
     let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec() };
     std::fs::write(&tmp, serde_json::to_vec(&s)?)?;

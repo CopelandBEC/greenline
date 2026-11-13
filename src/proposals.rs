@@ -8,6 +8,7 @@
 use crate::annot::Annot;
 use crate::measure::Scale;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,6 +26,10 @@ pub struct Proposal {
     pub annots: Vec<Annot>,
     #[serde(default)]
     pub scales: Vec<Scale>,
+    /// Groups of this batch already accepted, to the group they became, so a
+    /// markup accepted later joins the rest of its group.
+    #[serde(default)]
+    pub accepted_groups: HashMap<u64, u64>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
@@ -33,11 +38,17 @@ pub struct Proposals {
     pub pdf: PathBuf,
     #[serde(default)]
     pub batches: Vec<Proposal>,
+    /// The last batch id given out. Ids are never reused, so a click on a
+    /// batch the reviewer saw can't land on a different one.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl Proposals {
-    pub fn next_id(&self) -> String {
-        (self.batches.iter().filter_map(|b| b.id.parse::<u64>().ok()).max().unwrap_or(0) + 1).to_string()
+    /// A new batch id.
+    pub fn take_id(&mut self) -> String {
+        self.seq = self.seq.max(self.batches.iter().filter_map(|b| b.id.parse::<u64>().ok()).max().unwrap_or(0)) + 1;
+        self.seq.to_string()
     }
 
     /// First free markup id and group id across all batches.
@@ -75,8 +86,8 @@ pub fn modified(f: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(f).and_then(|m| m.modified()).ok()
 }
 
-/// Reads, changes and writes the proposals under their lock. The file is
-/// removed when the last batch goes.
+/// Reads, changes and writes the proposals under their lock. The file stays
+/// when the last batch goes: it keeps the id counter.
 pub fn update<T>(pdf: &Path, f: impl FnOnce(&mut Proposals) -> anyhow::Result<T>) -> anyhow::Result<T> {
     update_file(&file_for(pdf), pdf, f)
 }
@@ -91,14 +102,8 @@ pub fn update_file<T>(path: &Path, pdf: &Path, f: impl FnOnce(&mut Proposals) ->
     let mut p = load_file(path)?;
     p.pdf = pdf.to_path_buf();
     let out = f(&mut p)?;
-    if p.batches.is_empty() {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-    } else {
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&p)?)?;
-        std::fs::rename(&tmp, path)?;
-    }
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&p)?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(out)
 }

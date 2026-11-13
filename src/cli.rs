@@ -453,10 +453,10 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             }
             proposals::update(&doc.path, |p| {
                 let (b, scales) = build(p)?;
-                let id = p.next_id();
+                let id = p.take_id();
                 let created = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
                 let out = report(&b, &scales, Some(&id));
-                p.batches.push(proposals::Proposal { id, agent: agent.clone(), summary: summary.clone(), created, annots: b.annots, scales: b.scales });
+                p.batches.push(proposals::Proposal { id, agent: agent.clone(), summary: summary.clone(), created, annots: b.annots, scales: b.scales, accepted_groups: Default::default() });
                 Ok(out)
             })
         }
