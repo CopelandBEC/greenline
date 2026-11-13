@@ -39,7 +39,7 @@ Greenline is provided as-is. Issues are turned off, and pull requests are not be
 
 ## No warranty
 
-Greenline is free software, provided **"as is", without warranty of any kind**, express or implied, including the warranties of merchantability, fitness for a particular purpose and non-infringement. You use it at your own risk. In no event will Copeland Building Envelope Consulting, Inc. or the contributors be liable for any claim, damages or other liability, whether direct, indirect, incidental, special or consequential, arising from the software or its use, including lost or corrupted files or markups, missed or incorrect markups, and decisions made from its output. The full terms are in the [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licences, which govern.
+Except as required by applicable law or agreed to in writing, Greenline is free software provided **"as is", without warranty of any kind**, express or implied, including the warranties of merchantability, fitness for a particular purpose and non-infringement. You use it at your own risk. In no event will Copeland Building Envelope Consulting, Inc. or the contributors be liable for any claim, damages or other liability, whether direct, indirect, incidental, special or consequential, arising from the software or its use, including lost or corrupted files or markups, missed or incorrect markups, and decisions made from its output. The full terms are in the [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE) licences, which govern.
 
 Greenline is a markup tool, not a professional service. Using it creates no consultant, engineering or other professional relationship with CopelandBEC, and nothing it shows or exports is professional advice. Measurements and quantities depend on the drawing's own scale and accuracy and on how the user calibrated and placed them. Check them against the dimensions on the drawings before relying on them. Keep your own copies of anything that matters.
 
@@ -47,4 +47,4 @@ Greenline is a markup tool, not a professional service. Using it creates no cons
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Copyright (c) 2026 Copeland Building Envelope Consulting, Inc.
 
-The licence covers the code. It doesn't grant rights to the Copeland, CopelandBEC or Copeland Building Envelope Consulting names, logos or branding. If you distribute a modified version, don't present it as an official CopelandBEC product.
+The licence covers the code. Apart from the reasonable attribution Apache-2.0 allows, it grants no rights to the Copeland, CopelandBEC or Copeland Building Envelope Consulting names, logos or branding. If you distribute a modified version, don't present it as an official CopelandBEC product.
