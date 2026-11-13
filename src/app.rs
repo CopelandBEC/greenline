@@ -193,6 +193,8 @@ pub struct App {
     props_path: Option<PathBuf>,
     /// This PDF's markups file.
     markups_file: Option<PathBuf>,
+    /// Proposed markups already accepted, saved with the markups (`Sidecar::accepted`).
+    accepted: Vec<String>,
     props_mtime: Option<std::time::SystemTime>,
     props_checked: f64,
     /// Proposal row under the pointer: batch id and markup id (outlined on the sheet).
@@ -316,6 +318,7 @@ impl App {
             props: Proposals::default(),
             props_path: None,
             markups_file: None,
+            accepted: Vec::new(),
             props_mtime: None,
             props_checked: f64::NEG_INFINITY,
             props_hover: None,
@@ -404,6 +407,7 @@ impl App {
         self.placing = None;
         self.annots = Vec::new();
         self.scales = Vec::new();
+        self.accepted = Vec::new();
         self.building = None;
         self.scale_win = ScaleWin { open: self.scale_win.open, ..Default::default() };
         self.next_id = 1;
@@ -420,6 +424,7 @@ impl App {
                 self.next_id = s.annots.iter().map(|a| a.id + 1).max().unwrap_or(1);
                 self.annots = s.annots;
                 self.scales = s.scales;
+                self.accepted = s.accepted;
             }
             Ok(None) => {}
             // Never autosave over a markups file we couldn't read.
@@ -557,7 +562,7 @@ impl App {
             self.dirty = false;
             return;
         };
-        match sidecar::save_file(f, p, &self.annots, &self.scales) {
+        match sidecar::save_file(f, p, &self.annots, &self.scales, &self.accepted) {
             Ok(()) => self.dirty = false,
             Err(e) => {
                 // Stays dirty; retried on the next change or document switch.
@@ -933,8 +938,11 @@ impl App {
         }
     }
 
+    /// A group id no markup has, and none a proposal batch has reserved for
+    /// the rest of a group it's partly accepted.
     fn next_group(&self) -> u64 {
-        self.annots.iter().filter_map(|a| a.group).max().unwrap_or(0) + 1
+        let reserved = self.props.batches.iter().flat_map(|b| b.accepted_groups.values().copied());
+        self.annots.iter().filter_map(|a| a.group).chain(reserved).max().unwrap_or(0) + 1
     }
 
     /// Groups the selection, one group per page it spans.
@@ -2045,7 +2053,7 @@ impl App {
     /// Accepted ones are added to the markups, saved, and only then taken out
     /// of the proposals, all under the proposals' lock: a failed save changes
     /// nothing, and a batch arriving meanwhile isn't lost. One undo step.
-    fn settle(&mut self, id: &str, annot: Option<u64>, scale: Option<usize>, accept: bool) {
+    fn settle(&mut self, id: &str, annot: Option<u64>, scale: Option<Scale>, accept: bool) {
         let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return };
         if accept && (self.read_only || self.markups_file.is_none()) {
             self.toast(format!("Can't accept while not autosaving ({})", self.read_only_why));
@@ -2053,25 +2061,32 @@ impl App {
         }
         let whole = annot.is_none() && scale.is_none();
         let markups_file = self.markups_file.clone();
-        let (mut annots_now, mut scales_now) = (self.annots.clone(), self.scales.clone());
+        let (mut annots_now, mut scales_now, mut accepted_now) = (self.annots.clone(), self.scales.clone(), self.accepted.clone());
         let mut next_id = self.next_id;
         let mut next_group = self.next_group();
         let taken = proposals::update_file(&file, &path, |p| {
+            // Keys for batches that are gone can go; this batch's stay until it's written.
+            accepted_now.retain(|k| k.split_once('/').is_some_and(|(bid, _)| p.batches.iter().any(|b| b.id == bid)));
             let Some(b) = p.batches.iter_mut().find(|b| b.id == id) else { return Ok(0) };
             let annots: Vec<Annot> = match annot {
                 Some(aid) => b.annots.iter().position(|a| a.id == aid).map(|i| vec![b.annots.remove(i)]).unwrap_or_default(),
                 None if whole => std::mem::take(&mut b.annots),
                 None => Vec::new(),
             };
+            // By value, not row: the file may have changed since the row was drawn.
             let scales: Vec<Scale> = match scale {
-                Some(i) if i < b.scales.len() => vec![b.scales.remove(i)],
-                Some(_) => Vec::new(),
+                Some(want) => b.scales.iter().position(|s| *s == want).map(|i| vec![b.scales.remove(i)]).unwrap_or_default(),
                 None if whole => std::mem::take(&mut b.scales),
                 None => Vec::new(),
             };
             let n = annots.len() + scales.len();
             if accept && n > 0 {
                 for a in annots {
+                    let key = format!("{}/{}", b.id, a.id);
+                    if accepted_now.contains(&key) {
+                        continue; // Taken in already by an accept whose proposals write failed.
+                    }
+                    accepted_now.push(key);
                     let group = a.group.map(|g| {
                         *b.accepted_groups.entry(g).or_insert_with(|| {
                             next_group += 1;
@@ -2086,7 +2101,7 @@ impl App {
                     scales_now.push(s);
                 }
                 if let Some(f) = &markups_file {
-                    sidecar::save_file(f, &path, &annots_now, &scales_now)?;
+                    sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
                 }
             }
             p.batches.retain(|b| !b.annots.is_empty() || !b.scales.is_empty());
@@ -2112,6 +2127,7 @@ impl App {
         self.snapshot();
         self.annots = annots_now;
         self.scales = scales_now;
+        self.accepted = accepted_now;
         self.next_id = next_id;
         self.selected.clear();
         // Saved above.
@@ -2142,7 +2158,7 @@ impl App {
         if self.read_only {
             ui.colored_label(Color32::from_rgb(230, 80, 60), format!("Not autosaving ({}): you can look, but not accept.", self.read_only_why));
         }
-        let mut action: Option<(String, Option<u64>, Option<usize>, bool)> = None;
+        let mut action: Option<(String, Option<u64>, Option<Scale>, bool)> = None;
         let mut focus: Option<Annot> = None;
         let batches = self.props.batches.clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -2160,16 +2176,16 @@ impl App {
                         action = Some((b.id.clone(), None, None, false));
                     }
                 });
-                for (i, s) in b.scales.iter().enumerate() {
+                for s in &b.scales {
                     ui.horizontal(|ui| {
                         let what = if s.region.is_some() { "region scale" } else { "scale" };
                         ui.label(format!("Page {} {what}: {}", s.page + 1, s.label));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Reject").clicked() {
-                                action = Some((b.id.clone(), None, Some(i), false));
+                                action = Some((b.id.clone(), None, Some(s.clone()), false));
                             }
                             if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
-                                action = Some((b.id.clone(), None, Some(i), true));
+                                action = Some((b.id.clone(), None, Some(s.clone()), true));
                             }
                         });
                     });
@@ -4092,6 +4108,41 @@ mod tests {
         assert!(app.annots.is_empty() && app.scales.is_empty());
         assert_eq!(app.props.count(), 4, "still proposed");
         assert!(app.undo.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_retried_accept_doesnt_add_twice_and_scales_match_by_value() {
+        let (mut app, dir) = reviewing("retry");
+        app.poll_proposals(10.0);
+        // As if an earlier accept saved W1 but couldn't rewrite the proposals.
+        let w1 = app.props.batches[0].annots[0].clone();
+        app.annots.push(Annot { id: 77, ..w1.clone() });
+        app.accepted = vec![format!("1/{}", w1.id)];
+        app.settle("1", Some(w1.id), None, true);
+        assert_eq!(app.annots.len(), 1, "not added again");
+        assert!(app.props.batches[0].annots.is_empty(), "but taken out of the proposals");
+        // A scale row that no longer matches the file does nothing.
+        let mut stale = app.props.batches[0].scales[0].clone();
+        stale.per_pt *= 2.0;
+        app.settle("1", None, Some(stale), true);
+        assert!(app.scales.is_empty());
+        let s = app.props.batches[0].scales[0].clone();
+        app.settle("1", None, Some(s), true);
+        assert_eq!(app.scales.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reserved_groups_arent_handed_out_again() {
+        let (mut app, dir) = reviewing("reserved");
+        app.poll_proposals(10.0);
+        let cloud = app.props.batches[1].annots[0].id;
+        app.settle("2", Some(cloud), None, true);
+        let g = app.annots[0].group.unwrap();
+        app.undo();
+        assert!(app.annots.is_empty());
+        assert!(app.next_group() > g, "the callout still waits to join group {g}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,6 +14,10 @@ pub struct Sidecar {
     /// Drawing scales set on its pages (files from before 1.5 have none).
     #[serde(default)]
     pub scales: Vec<Scale>,
+    /// Proposed markups already taken in (`<batch>/<markup id>`), so an
+    /// accept retried after a half-finished one can't add them twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted: Vec<String>,
 }
 
 /// ~/.local/share/greenline on Linux, %APPDATA%\\Greenline on Windows.
@@ -124,18 +128,14 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
     }
 }
 
-pub fn save(pdf: &Path, annots: &[Annot], scales: &[Scale]) -> anyhow::Result<()> {
-    save_file(&file_for(pdf), pdf, annots, scales)
-}
-
-/// `save` to the markups file `f` for `pdf`.
-pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale]) -> anyhow::Result<()> {
+/// Writes the markups file `f` for `pdf`.
+pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale], accepted: &[String]) -> anyhow::Result<()> {
     if let Some(d) = f.parent() {
         std::fs::create_dir_all(d)?;
     }
     let f = f.to_path_buf();
     let tmp = f.with_extension(format!("json.{}.tmp", std::process::id()));
-    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec() };
+    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec(), accepted: accepted.to_vec() };
     std::fs::write(&tmp, serde_json::to_vec(&s)?)?;
     std::fs::rename(tmp, f)?;
     Ok(())
