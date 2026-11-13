@@ -35,15 +35,7 @@ After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo
 
 ## Contributing
 
-Greenline is provided as-is. Issues are turned off: if you've found a problem, send a pull request that fixes it. Pull requests are welcome, and a clear one is much easier to accept. In the description, cover:
-
-- **What and why.** The bug or missing feature, in a sentence or two, and who it affects.
-- **For a bug, how to reproduce it.** Steps, what you expected, what happened, and your OS. Attach or describe a PDF that shows it if you can (nothing confidential).
-- **How you fixed it.** The approach, and any alternatives you considered and rejected.
-- **How you checked it.** `cargo test` on which OS; for a bug, how you confirmed it happened before your change and is gone after; for UI changes, a screenshot or short clip, in light and dark mode if it affects the look.
-- **Anything it touches beyond the obvious.** Export output, saved markup files (`<data dir>/*.json`, which must keep loading in older and newer versions), Windows vs Linux behaviour, new dependencies and their licences.
-
-Keep each pull request to one change, and match the surrounding code style with no new compiler warnings. By submitting a pull request you agree to license your contribution under the same terms as the project (below).
+Greenline is provided as-is. Issues are turned off, and pull requests are not being accepted: the source is published so you can read it, build it and modify it for your own use, under the licence below.
 
 ## License
 
