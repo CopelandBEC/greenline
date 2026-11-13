@@ -1,14 +1,7 @@
 // No console window behind the app on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod annot;
-mod app;
-mod fonts;
-mod measure;
-mod render;
-mod sidecar;
-mod stamps;
-mod theme;
+use greenline::app;
 
 fn main() -> eframe::Result {
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);

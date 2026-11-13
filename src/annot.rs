@@ -61,6 +61,16 @@ pub enum Prim {
 
 pub const WHITE: Rgb = [255, 255, 255];
 
+/// Markup colours, by name. The first is the default for new markups: CopelandBEC medium green.
+pub const COLORS: [(Rgb, &str); 6] = [
+    ([0x6B, 0x9A, 0x1E], "Green"),
+    ([228, 0, 0], "Red"),
+    ([0, 88, 220], "Blue"),
+    ([20, 20, 20], "Black"),
+    ([240, 120, 0], "Orange"),
+    ([255, 214, 0], "Yellow"),
+];
+
 // ---------------------------------------------------------------------------
 // Text layout (Helvetica metrics; Liberation Sans on screen is metric-compatible)
 

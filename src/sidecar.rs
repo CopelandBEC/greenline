@@ -51,7 +51,7 @@ pub fn fnv(bytes: &[u8]) -> u64 {
     h
 }
 
-fn file_for(pdf: &Path) -> PathBuf {
+pub fn file_for(pdf: &Path) -> PathBuf {
     let h = fnv(pdf.as_os_str().as_encoded_bytes());
     let stem = pdf.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     dir().join(format!("{stem}-{h:016x}.json"))

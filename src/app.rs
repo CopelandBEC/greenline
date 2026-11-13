@@ -1,4 +1,4 @@
-use crate::annot::{self, Annot, Kind, Prim, Rgb};
+use crate::annot::{self, Annot, Kind, Prim, Rgb, COLORS};
 use crate::measure::{self, Scale, Units};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
@@ -72,15 +72,6 @@ const TOOLS: [(Tool, &str, Key); 11] = [
     (Tool::Area, "Area", Key::E),
 ];
 
-/// The first is the default for new markups: CopelandBEC medium green.
-const COLORS: [(Rgb, &str); 6] = [
-    ([0x6B, 0x9A, 0x1E], "Green"),
-    ([228, 0, 0], "Red"),
-    ([0, 88, 220], "Blue"),
-    ([20, 20, 20], "Black"),
-    ([240, 120, 0], "Orange"),
-    ([255, 214, 0], "Yellow"),
-];
 const COLOR_KEYS: [Key; 6] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
 const TEXT_SIZES: [f32; 6] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0];
 /// Colour of placed dates.

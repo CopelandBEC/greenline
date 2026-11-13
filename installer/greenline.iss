@@ -33,14 +33,17 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ChangesAssociations=yes
+ChangesEnvironment=yes
 CloseApplications=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Name: "openwith"; Description: "Add Greenline to ""Open with"" for PDF files (does not change your default PDF app)"
+Name: "addtopath"; Description: "Add greenline-cli (the command line for agents and scripts) to your PATH"
 
 [Files]
 Source: "..\target\release\greenline.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\greenline-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vendor\pdfium.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\vendor\PDFIUM-LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\LICENSE-MIT"; DestDir: "{app}\licenses"; DestName: "Greenline-LICENSE-MIT.txt"; Flags: ignoreversion
@@ -70,6 +73,41 @@ Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; V
 Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "Greenline"; Flags: uninsdeletekey; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\greenline.exe\shell\open\command"; ValueType: string; ValueData: """{app}\greenline.exe"" ""%1"""; Tasks: openwith
+
+; The user's PATH gains the install folder (for greenline-cli); the uninstaller takes it out again.
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath(ExpandConstant('{app}')); Tasks: addtopath
+
+[Code]
+function NeedsAddPath(Dir: string): Boolean;
+var
+  Path: string;
+begin
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+    Path := '';
+  Result := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Path) + ';') = 0;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Path, Dir: string;
+  P: Integer;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    exit;
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+    exit;
+  Dir := ExpandConstant('{app}');
+  P := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Path) + ';');
+  if P = 0 then
+    exit;
+  // P indexes ';' + Path, so the folder starts at P in Path; take one ';' with it.
+  Delete(Path, P, Length(Dir));
+  if (P <= Length(Path)) and (Path[P] = ';') then
+    Delete(Path, P, 1)
+  else if (P > 1) and (Path[P - 1] = ';') then
+    Delete(Path, P - 1, 1);
+  RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Path);
+end;
 
 [Run]
 Filename: "{app}\greenline.exe"; Description: "Launch Greenline"; Flags: nowait postinstall skipifsilent
