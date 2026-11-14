@@ -2495,13 +2495,15 @@ impl App {
                 }
                 _ => {}
             }
-            // Proposed markups: drawn as they'd be accepted, each in a dashed orange outline.
+            // Proposed markups: drawn as they'd be accepted, each over a faint orange
+            // wash and in a dashed orange outline.
             for b in &self.props.batches {
                 for a in b.annots.iter().filter(|a| a.page == i) {
-                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
                     let r = a.bounds();
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
                     let hot = self.props_hover.as_ref().is_some_and(|(bid, id)| *bid == b.id && *id == a.id);
+                    pp.rect_filled(r, 0.0, PROPOSED.gamma_multiply(if hot { 0.14 } else { 0.08 }));
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
                     let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
                     pp.extend(Shape::dashed_line(&pts, Stroke::new(if hot { 2.5 } else { 1.2 }, PROPOSED), 5.0, 3.0));
                 }
