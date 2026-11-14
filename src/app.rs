@@ -672,8 +672,13 @@ impl App {
     }
 
     fn zoom_at(&mut self, factor: f32, screen: Pos2) {
+        self.set_zoom(self.zoom * factor, screen);
+    }
+
+    /// Sets the zoom, keeping the document point under `screen` where it is.
+    fn set_zoom(&mut self, zoom: f32, screen: Pos2) {
         let before = self.to_doc(screen);
-        self.zoom = (self.zoom * factor).clamp(0.02, 40.0);
+        self.zoom = zoom.clamp(0.02, 40.0);
         self.offset = before.to_vec2() - (screen - self.canvas.min) / self.zoom;
     }
 
@@ -2762,7 +2767,25 @@ impl App {
             if !self.pages.is_empty() {
                 ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
                 ui.separator();
-                ui.label(format!("{:.0}%", self.zoom * 100.0));
+                ui.menu_button(format!("{:.0}% ⏷", self.zoom * 100.0), |ui| {
+                    if ui.button("Fit width   (W)").clicked() {
+                        self.fit_width();
+                    }
+                    if ui.button("Fit page   (F)").clicked() {
+                        self.fit_page();
+                    }
+                    if ui.button("Actual size").clicked() {
+                        self.set_zoom(1.0, self.canvas.center());
+                    }
+                    ui.separator();
+                    for pct in [50, 100, 200, 400] {
+                        if ui.button(format!("{pct}%")).clicked() {
+                            self.set_zoom(pct as f32 / 100.0, self.canvas.center());
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Zoom: fit width, fit page, actual size or a preset");
                 ui.separator();
                 let page = self.current_page();
                 let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
@@ -3311,6 +3334,7 @@ impl App {
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
+                    ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
                     ("Arrows with a selection", "Nudge it 1 pixel at the current zoom (Shift: 10)"),
                 ];
@@ -3846,6 +3870,35 @@ mod tests {
         app.nudge(vec2(1.0, 0.0), 21.5);
         app.undo();
         assert_eq!(app.find(a).unwrap().bounds().min, pos2(99.0, 98.0), "a pause starts a new step");
+    }
+
+    #[test]
+    fn fit_width_and_fit_page_fit_the_canvas() {
+        let mut app = app();
+        app.zoom = 0.4;
+        app.fit_width();
+        assert!((app.zoom - (1000.0 - 24.0) / 600.0).abs() < 1e-4);
+        let r = app.page_doc_rect(0);
+        assert!((app.to_screen(r.min).x - 12.0).abs() < 0.01, "12 px margin on the left");
+        assert!((app.to_screen(r.max).x - (1000.0 - 12.0)).abs() < 0.01, "and on the right");
+
+        app.fit_page();
+        assert!((app.zoom - (1000.0 - 24.0) / 800.0).abs() < 1e-4, "the height binds");
+        assert!((app.to_screen(r.center()) - app.canvas.center()).length() < 0.5, "the page is centred");
+    }
+
+    #[test]
+    fn set_zoom_keeps_the_point_under_the_screen_position() {
+        let mut app = app();
+        let at = pos2(250.0, 300.0);
+        let before = app.to_doc(at);
+        app.set_zoom(3.0, at);
+        assert_eq!(app.zoom, 3.0);
+        assert!((app.to_doc(at) - before).length() < 1e-3);
+        app.set_zoom(1000.0, at);
+        assert_eq!(app.zoom, 40.0, "clamped like zoom_at");
+        app.set_zoom(0.0, at);
+        assert_eq!(app.zoom, 0.02);
     }
 
     #[test]
