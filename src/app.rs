@@ -672,8 +672,13 @@ impl App {
     }
 
     fn zoom_at(&mut self, factor: f32, screen: Pos2) {
+        self.set_zoom(self.zoom * factor, screen);
+    }
+
+    /// Sets the zoom, keeping the document point under `screen` where it is.
+    fn set_zoom(&mut self, zoom: f32, screen: Pos2) {
         let before = self.to_doc(screen);
-        self.zoom = (self.zoom * factor).clamp(0.02, 40.0);
+        self.zoom = zoom.clamp(0.02, 40.0);
         self.offset = before.to_vec2() - (screen - self.canvas.min) / self.zoom;
     }
 
@@ -2183,7 +2188,6 @@ impl App {
             ui.strong(format!("Review ({})", self.props.count()));
         });
         ui.separator();
-        self.props_hover = None;
         if self.props.batches.is_empty() {
             ui.weak("Nothing to review. Markups an agent proposes with greenline-cli appear here (and on the sheets, outlined in orange) for you to accept or reject.");
             return;
@@ -2490,13 +2494,15 @@ impl App {
                 }
                 _ => {}
             }
-            // Proposed markups: drawn as they'd be accepted, each in a dashed orange outline.
+            // Proposed markups: drawn as they'd be accepted, each over a faint orange
+            // wash and in a dashed orange outline.
             for b in &self.props.batches {
                 for a in b.annots.iter().filter(|a| a.page == i) {
-                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
                     let r = a.bounds();
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
                     let hot = self.props_hover.as_ref().is_some_and(|(bid, id)| *bid == b.id && *id == a.id);
+                    pp.rect_filled(r, 0.0, PROPOSED.gamma_multiply(if hot { 0.14 } else { 0.08 }));
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
                     let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
                     pp.extend(Shape::dashed_line(&pts, Stroke::new(if hot { 2.5 } else { 1.2 }, PROPOSED), 5.0, 3.0));
                 }
@@ -2670,55 +2676,79 @@ impl App {
                 self.ask = Some(Pick::Open);
             }
             ui.add_enabled_ui(self.path.is_some(), |ui| {
-                ui.menu_button("Export", |ui| {
+                ui.menu_button("Export ⏷", |ui| {
                     if ui.button("Flattened PDF   (Ctrl+E)").on_hover_text("Markups burned in → <name>_markup.pdf").clicked() {
                         self.export(ExportMode::Flatten, false);
+                        ui.close();
                     }
                     if ui.button("Flattened PDF as…   (Ctrl+Shift+E)").clicked() {
                         self.export(ExportMode::Flatten, true);
+                        ui.close();
                     }
                     if ui.button("Editable PDF   (Ctrl+Alt+E)").on_hover_text("Each markup a movable comment in Bluebeam/Acrobat → <name>_markup_editable.pdf").clicked() {
                         self.export(ExportMode::Editable, false);
+                        ui.close();
                     }
                     if ui.button("Comment list (CSV)").on_hover_text("<name>_comments.csv: page, type, comment").clicked() {
                         self.export_csv();
+                        ui.close();
                     }
                     if ui.button("Measurements (CSV)").on_hover_text("<name>_measurements.csv: page, name, length, area, width, height").clicked() {
                         self.export_measurements();
+                        ui.close();
                     }
                 });
             });
             ui.separator();
-            if ui.selectable_label(self.show_sidebar, "Pages S").on_hover_text("Thumbnail sidebar").clicked() {
-                self.show_sidebar = !self.show_sidebar;
-            }
-            if ui.selectable_label(self.overview, "Overview O").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
-                self.toggle_overview();
-            }
-            if ui.selectable_label(self.show_markups, "Markups M").on_hover_text("List of markups").clicked() {
-                self.toggle_right_panel(false);
-            }
-            if ui.selectable_label(self.show_stamps, "Stamps I").on_hover_text("Seals, signatures and dates").clicked() {
-                self.toggle_right_panel(true);
-            }
-            let n = self.props.count();
-            let review = if n > 0 { format!("Review Y ({n})") } else { "Review Y".to_string() };
-            if ui.selectable_label(self.show_review, review).on_hover_text("Markups proposed by agents, to accept or reject").clicked() {
-                self.show_review = !self.show_review;
-            }
-            ui.separator();
-            for (t, label, k) in TOOLS {
-                if t == Tool::Length {
-                    ui.separator();
+            // Panels in one menu, so the bar stays a single row on normal windows.
+            ui.menu_button("Panels ⏷", |ui| {
+                if ui.selectable_label(self.show_sidebar, "Pages   (S)").on_hover_text("Thumbnail sidebar").clicked() {
+                    self.show_sidebar = !self.show_sidebar;
+                    ui.close();
                 }
-                let text = format!("{label} {}", k.name());
-                if ui.selectable_label(self.tool == t, text).clicked() {
-                    self.set_tool(t);
+                if ui.selectable_label(self.overview, "Overview   (O)").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
+                    self.toggle_overview();
+                    ui.close();
                 }
-            }
-            if ui.selectable_label(self.scale_win.open, "Scale U").on_hover_text("Set the drawing scale for measuring").clicked() {
-                self.scale_win.open = !self.scale_win.open;
-            }
+                if ui.selectable_label(self.show_markups, "Markups   (M)").on_hover_text("List of markups").clicked() {
+                    self.toggle_right_panel(false);
+                    ui.close();
+                }
+                if ui.selectable_label(self.show_stamps, "Stamps   (I)").on_hover_text("Seals, signatures and dates").clicked() {
+                    self.toggle_right_panel(true);
+                    ui.close();
+                }
+                let n = self.props.count();
+                let review = if n > 0 { format!("Review   (Y)  ·  {n}") } else { "Review   (Y)".to_string() };
+                if ui.selectable_label(self.show_review, review).on_hover_text("Markups proposed by agents, to accept or reject").clicked() {
+                    self.show_review = !self.show_review;
+                    ui.close();
+                }
+            });
+            // The active tool labels its menu, so what clicks will draw stays in sight.
+            let label = match self.tool {
+                Tool::Calibrate => "Calibrate",
+                Tool::ScaleRegion => "Scale region",
+                t => TOOLS.iter().find(|(x, ..)| *x == t).map_or("Select", |(_, label, _)| *label),
+            };
+            ui.menu_button(format!("{label} ⏷"), |ui| {
+                for (t, label, k) in TOOLS {
+                    if t == Tool::Length {
+                        ui.separator();
+                    }
+                    if ui.selectable_label(self.tool == t, format!("{label}   ({})", k.name())).clicked() {
+                        self.set_tool(t);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.selectable_label(self.scale_win.open, "Scale   (U)").on_hover_text("Set the drawing scale for measuring").clicked() {
+                    self.scale_win.open = !self.scale_win.open;
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Markup tool: the button shows the active one");
             ui.separator();
             let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
             for (i, (c, name)) in COLORS.iter().enumerate() {
@@ -2733,24 +2763,18 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label("Line");
             let mut w = self.width;
-            if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).suffix(" pt")).on_hover_text("[ / ]").changed() {
+            if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).prefix("Line ").suffix(" pt")).on_hover_text("[ / ]").changed() {
                 self.set_width(w);
             }
-            ui.label("Text");
             let cur_size = self.lead_text_size().unwrap_or(self.text_size);
-            egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("{cur_size} pt")).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("Text {cur_size} pt")).show_ui(ui, |ui| {
                 for s in TEXT_SIZES {
                     if ui.selectable_label(s == cur_size, format!("{s} pt")).clicked() {
                         self.set_text_size(s);
                     }
                 }
             });
-            ui.separator();
-            if ui.button("?").on_hover_text("Shortcuts (F1)").clicked() {
-                self.show_help = !self.show_help;
-            }
         });
     }
 
@@ -2759,33 +2783,66 @@ impl App {
             self.status_until = now + 5.0;
         }
         ui.horizontal(|ui| {
-            if !self.pages.is_empty() {
-                ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
-                ui.separator();
-                ui.label(format!("{:.0}%", self.zoom * 100.0));
-                ui.separator();
-                let page = self.current_page();
-                let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
-                if ui.link(scale).on_hover_text("Drawing scale for measuring (U)").clicked() {
-                    self.scale_win.open = true;
+            // The help button holds the right edge; the path truncates before it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("?").on_hover_text("Shortcuts (F1)").clicked() {
+                    self.show_help = !self.show_help;
                 }
-                ui.separator();
-                ui.label(format!("{} markups", self.annots.len()));
-                ui.separator();
-                if self.selected.len() > 1 {
-                    ui.label(format!("{} selected", self.selected.len()));
-                    ui.separator();
-                }
-            }
-            if self.read_only && self.path.is_some() {
-                ui.colored_label(Color32::from_rgb(230, 80, 60), format!("NOT AUTOSAVING: {}", self.read_only_why));
-                ui.separator();
-            }
-            if now < self.status_until {
-                ui.label(&self.status);
-            } else if let Some(p) = &self.path {
-                ui.weak(p.display().to_string());
-            }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if !self.pages.is_empty() {
+                        ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
+                        ui.separator();
+                        ui.add_enabled_ui(!self.overview, |ui| {
+                            ui.menu_button(format!("{:.0}% ⏷", self.zoom * 100.0), |ui| {
+                                if ui.button("Fit width   (W)").clicked() {
+                                    self.fit_width();
+                                    ui.close();
+                                }
+                                if ui.button("Fit page   (F)").clicked() {
+                                    self.fit_page();
+                                    ui.close();
+                                }
+                                if ui.button("Actual size").clicked() {
+                                    self.set_zoom(1.0, self.canvas.center());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                for pct in [50, 100, 200, 400] {
+                                    if ui.button(format!("{pct}%")).clicked() {
+                                        self.set_zoom(pct as f32 / 100.0, self.canvas.center());
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Zoom: fit width, fit page, actual size or a preset");
+                        });
+                        ui.separator();
+                        let page = self.current_page();
+                        let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
+                        if ui.link(scale).on_hover_text("Drawing scale for measuring (U)").clicked() {
+                            self.scale_win.open = true;
+                        }
+                        ui.separator();
+                        ui.label(format!("{} markups", self.annots.len()));
+                        ui.separator();
+                        if self.selected.len() > 1 {
+                            ui.label(format!("{} selected", self.selected.len()));
+                            ui.separator();
+                        }
+                    }
+                    if self.read_only && self.path.is_some() {
+                        ui.colored_label(Color32::from_rgb(230, 80, 60), format!("NOT AUTOSAVING: {}", self.read_only_why));
+                        ui.separator();
+                    }
+                    if now < self.status_until {
+                        ui.label(&self.status);
+                    } else if let Some(p) = &self.path {
+                        let shown = p.display().to_string();
+                        ui.add(egui::Label::new(egui::RichText::new(&shown).weak()).truncate()).on_hover_text(shown);
+                    }
+                });
+            });
         });
     }
 
@@ -3311,6 +3368,7 @@ impl App {
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
+                    ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
                     ("Arrows with a selection", "Nudge it 1 pixel at the current zoom (Shift: 10)"),
                 ];
@@ -3374,6 +3432,9 @@ impl eframe::App for App {
         }
         self.load_textures(&ctx);
         self.poll_proposals(now);
+        // The review row under the pointer is set while its panel draws; start
+        // each frame clear so a closed panel leaves no hung highlight.
+        self.props_hover = None;
         if self.show_review {
             egui::Panel::right("review").resizable(true).default_size(300.0).size_range(220.0..=600.0).frame(egui::Frame::side_top_panel(ui.style()).fill(sheets)).show(ui, |ui| self.review_panel(ui));
         } else if self.show_stamps {
@@ -3846,6 +3907,35 @@ mod tests {
         app.nudge(vec2(1.0, 0.0), 21.5);
         app.undo();
         assert_eq!(app.find(a).unwrap().bounds().min, pos2(99.0, 98.0), "a pause starts a new step");
+    }
+
+    #[test]
+    fn fit_width_and_fit_page_fit_the_canvas() {
+        let mut app = app();
+        app.zoom = 0.4;
+        app.fit_width();
+        assert!((app.zoom - (1000.0 - 24.0) / 600.0).abs() < 1e-4);
+        let r = app.page_doc_rect(0);
+        assert!((app.to_screen(r.min).x - 12.0).abs() < 0.01, "12 px margin on the left");
+        assert!((app.to_screen(r.max).x - (1000.0 - 12.0)).abs() < 0.01, "and on the right");
+
+        app.fit_page();
+        assert!((app.zoom - (1000.0 - 24.0) / 800.0).abs() < 1e-4, "the height binds");
+        assert!((app.to_screen(r.center()) - app.canvas.center()).length() < 0.5, "the page is centred");
+    }
+
+    #[test]
+    fn set_zoom_keeps_the_point_under_the_screen_position() {
+        let mut app = app();
+        let at = pos2(250.0, 300.0);
+        let before = app.to_doc(at);
+        app.set_zoom(3.0, at);
+        assert_eq!(app.zoom, 3.0);
+        assert!((app.to_doc(at) - before).length() < 1e-3);
+        app.set_zoom(1000.0, at);
+        assert_eq!(app.zoom, 40.0, "clamped like zoom_at");
+        app.set_zoom(0.0, at);
+        assert_eq!(app.zoom, 0.02);
     }
 
     #[test]

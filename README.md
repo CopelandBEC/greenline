@@ -21,6 +21,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
 | `1`–`6`, `[` `]`, `{` `}` | Colour (CopelandBEC medium green by default, then red, blue, black, orange, yellow), line width, text size |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
+| `W` / `F` | Fit width / fit page — or click the zoom % in the status bar for fit, actual size and presets |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
