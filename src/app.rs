@@ -2677,7 +2677,7 @@ impl App {
                 self.ask = Some(Pick::Open);
             }
             ui.add_enabled_ui(self.path.is_some(), |ui| {
-                ui.menu_button("Export", |ui| {
+                ui.menu_button("Export ⏷", |ui| {
                     if ui.button("Flattened PDF   (Ctrl+E)").on_hover_text("Markups burned in → <name>_markup.pdf").clicked() {
                         self.export(ExportMode::Flatten, false);
                     }
@@ -2696,36 +2696,48 @@ impl App {
                 });
             });
             ui.separator();
-            if ui.selectable_label(self.show_sidebar, "Pages S").on_hover_text("Thumbnail sidebar").clicked() {
-                self.show_sidebar = !self.show_sidebar;
-            }
-            if ui.selectable_label(self.overview, "Overview O").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
-                self.toggle_overview();
-            }
-            if ui.selectable_label(self.show_markups, "Markups M").on_hover_text("List of markups").clicked() {
-                self.toggle_right_panel(false);
-            }
-            if ui.selectable_label(self.show_stamps, "Stamps I").on_hover_text("Seals, signatures and dates").clicked() {
-                self.toggle_right_panel(true);
-            }
-            let n = self.props.count();
-            let review = if n > 0 { format!("Review Y ({n})") } else { "Review Y".to_string() };
-            if ui.selectable_label(self.show_review, review).on_hover_text("Markups proposed by agents, to accept or reject").clicked() {
-                self.show_review = !self.show_review;
-            }
-            ui.separator();
-            for (t, label, k) in TOOLS {
-                if t == Tool::Length {
-                    ui.separator();
+            // Panels in one menu, so the bar stays a single row on normal windows.
+            ui.menu_button("Panels ⏷", |ui| {
+                if ui.selectable_label(self.show_sidebar, "Pages   (S)").on_hover_text("Thumbnail sidebar").clicked() {
+                    self.show_sidebar = !self.show_sidebar;
                 }
-                let text = format!("{label} {}", k.name());
-                if ui.selectable_label(self.tool == t, text).clicked() {
-                    self.set_tool(t);
+                if ui.selectable_label(self.overview, "Overview   (O)").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
+                    self.toggle_overview();
                 }
-            }
-            if ui.selectable_label(self.scale_win.open, "Scale U").on_hover_text("Set the drawing scale for measuring").clicked() {
-                self.scale_win.open = !self.scale_win.open;
-            }
+                if ui.selectable_label(self.show_markups, "Markups   (M)").on_hover_text("List of markups").clicked() {
+                    self.toggle_right_panel(false);
+                }
+                if ui.selectable_label(self.show_stamps, "Stamps   (I)").on_hover_text("Seals, signatures and dates").clicked() {
+                    self.toggle_right_panel(true);
+                }
+                let n = self.props.count();
+                let review = if n > 0 { format!("Review   (Y)  ·  {n}") } else { "Review   (Y)".to_string() };
+                if ui.selectable_label(self.show_review, review).on_hover_text("Markups proposed by agents, to accept or reject").clicked() {
+                    self.show_review = !self.show_review;
+                }
+            });
+            // The active tool labels its menu, so what clicks will draw stays in sight.
+            let label = match self.tool {
+                Tool::Calibrate => "Calibrate",
+                Tool::ScaleRegion => "Scale region",
+                t => TOOLS.iter().find(|(x, ..)| *x == t).map_or("Select", |(_, label, _)| *label),
+            };
+            ui.menu_button(format!("{label} ⏷"), |ui| {
+                for (t, label, k) in TOOLS {
+                    if t == Tool::Length {
+                        ui.separator();
+                    }
+                    if ui.selectable_label(self.tool == t, format!("{label}   ({})", k.name())).clicked() {
+                        self.set_tool(t);
+                    }
+                }
+                ui.separator();
+                if ui.selectable_label(self.scale_win.open, "Scale   (U)").on_hover_text("Set the drawing scale for measuring").clicked() {
+                    self.scale_win.open = !self.scale_win.open;
+                }
+            })
+            .response
+            .on_hover_text("Markup tool: the button shows the active one");
             ui.separator();
             let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
             for (i, (c, name)) in COLORS.iter().enumerate() {
@@ -2740,24 +2752,18 @@ impl App {
                 }
             }
             ui.separator();
-            ui.label("Line");
             let mut w = self.width;
-            if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).suffix(" pt")).on_hover_text("[ / ]").changed() {
+            if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).prefix("Line ").suffix(" pt")).on_hover_text("[ / ]").changed() {
                 self.set_width(w);
             }
-            ui.label("Text");
             let cur_size = self.lead_text_size().unwrap_or(self.text_size);
-            egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("{cur_size} pt")).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("Text {cur_size} pt")).show_ui(ui, |ui| {
                 for s in TEXT_SIZES {
                     if ui.selectable_label(s == cur_size, format!("{s} pt")).clicked() {
                         self.set_text_size(s);
                     }
                 }
             });
-            ui.separator();
-            if ui.button("?").on_hover_text("Shortcuts (F1)").clicked() {
-                self.show_help = !self.show_help;
-            }
         });
     }
 
@@ -2766,51 +2772,60 @@ impl App {
             self.status_until = now + 5.0;
         }
         ui.horizontal(|ui| {
-            if !self.pages.is_empty() {
-                ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
-                ui.separator();
-                ui.menu_button(format!("{:.0}% ⏷", self.zoom * 100.0), |ui| {
-                    if ui.button("Fit width   (W)").clicked() {
-                        self.fit_width();
-                    }
-                    if ui.button("Fit page   (F)").clicked() {
-                        self.fit_page();
-                    }
-                    if ui.button("Actual size").clicked() {
-                        self.set_zoom(1.0, self.canvas.center());
-                    }
-                    ui.separator();
-                    for pct in [50, 100, 200, 400] {
-                        if ui.button(format!("{pct}%")).clicked() {
-                            self.set_zoom(pct as f32 / 100.0, self.canvas.center());
+            // The help button holds the right edge; the path truncates before it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("?").on_hover_text("Shortcuts (F1)").clicked() {
+                    self.show_help = !self.show_help;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if !self.pages.is_empty() {
+                        ui.label(format!("Page {} / {}", self.current_page() + 1, self.pages.len()));
+                        ui.separator();
+                        ui.menu_button(format!("{:.0}% ⏷", self.zoom * 100.0), |ui| {
+                            if ui.button("Fit width   (W)").clicked() {
+                                self.fit_width();
+                            }
+                            if ui.button("Fit page   (F)").clicked() {
+                                self.fit_page();
+                            }
+                            if ui.button("Actual size").clicked() {
+                                self.set_zoom(1.0, self.canvas.center());
+                            }
+                            ui.separator();
+                            for pct in [50, 100, 200, 400] {
+                                if ui.button(format!("{pct}%")).clicked() {
+                                    self.set_zoom(pct as f32 / 100.0, self.canvas.center());
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Zoom: fit width, fit page, actual size or a preset");
+                        ui.separator();
+                        let page = self.current_page();
+                        let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
+                        if ui.link(scale).on_hover_text("Drawing scale for measuring (U)").clicked() {
+                            self.scale_win.open = true;
+                        }
+                        ui.separator();
+                        ui.label(format!("{} markups", self.annots.len()));
+                        ui.separator();
+                        if self.selected.len() > 1 {
+                            ui.label(format!("{} selected", self.selected.len()));
+                            ui.separator();
                         }
                     }
-                })
-                .response
-                .on_hover_text("Zoom: fit width, fit page, actual size or a preset");
-                ui.separator();
-                let page = self.current_page();
-                let scale = self.scales.iter().find(|s| s.page == page && s.region.is_none()).map_or("No scale".to_string(), |s| s.label.clone());
-                if ui.link(scale).on_hover_text("Drawing scale for measuring (U)").clicked() {
-                    self.scale_win.open = true;
-                }
-                ui.separator();
-                ui.label(format!("{} markups", self.annots.len()));
-                ui.separator();
-                if self.selected.len() > 1 {
-                    ui.label(format!("{} selected", self.selected.len()));
-                    ui.separator();
-                }
-            }
-            if self.read_only && self.path.is_some() {
-                ui.colored_label(Color32::from_rgb(230, 80, 60), format!("NOT AUTOSAVING: {}", self.read_only_why));
-                ui.separator();
-            }
-            if now < self.status_until {
-                ui.label(&self.status);
-            } else if let Some(p) = &self.path {
-                ui.weak(p.display().to_string());
-            }
+                    if self.read_only && self.path.is_some() {
+                        ui.colored_label(Color32::from_rgb(230, 80, 60), format!("NOT AUTOSAVING: {}", self.read_only_why));
+                        ui.separator();
+                    }
+                    if now < self.status_until {
+                        ui.label(&self.status);
+                    } else if let Some(p) = &self.path {
+                        let shown = p.display().to_string();
+                        ui.add(egui::Label::new(egui::RichText::new(&shown).weak()).truncate()).on_hover_text(shown);
+                    }
+                });
+            });
         });
     }
 
