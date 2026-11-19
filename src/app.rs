@@ -1146,7 +1146,22 @@ impl App {
     }
 
     fn set_fill_alpha(&mut self, alpha: u8) {
+        // Never fully clear: that's what None is for, and it would leave nothing to adjust.
+        let alpha = alpha.max(MIN_FILL_ALPHA);
         self.fill_alpha = alpha;
+        // A callout's or area's default fill becomes a chosen one, so new ones get this opacity.
+        if self.tool != Tool::Select && !self.tool_fill.contains_key(&self.tool) {
+            match self.shown_fill() {
+                Some(f) if f.color == WHITE => {
+                    self.tool_fill.insert(self.tool, Some(COLORS.len()));
+                }
+                Some(f) => {
+                    let i = COLORS.iter().position(|c| c.0 == f.color).unwrap_or(0);
+                    self.tool_fill.insert(self.tool, Some(i));
+                }
+                None => {}
+            }
+        }
         self.edit_fills(|a| {
             if let Some(f) = a.effective_fill() {
                 a.set_fill(Some(Fill { alpha, ..f }));
@@ -2942,7 +2957,8 @@ impl App {
                 }
             });
             let mut pct = (shown.map_or(self.fill_alpha, |f| f.alpha) as f32 / 2.55).round();
-            let slider = ui.add_enabled(shown.is_some(), egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").text("Opacity"));
+            let min = (MIN_FILL_ALPHA as f32 / 2.55).round();
+            let slider = ui.add_enabled(shown.is_some(), egui::Slider::new(&mut pct, min..=100.0).suffix("%").text("Opacity"));
             // One undo step per drag: apply on release (or a click/keyboard change).
             if slider.changed() {
                 self.fill_alpha = (pct * 2.55).round() as u8;
@@ -3836,6 +3852,9 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
     }
 }
 
+/// Lowest fill opacity the slider sets (5%); a fill is removed with None.
+const MIN_FILL_ALPHA: u8 = 13;
+
 /// Fill colours: the markup colours, then white.
 fn fill_color(i: usize) -> Rgb {
     COLORS.get(i).map_or(WHITE, |c| c.0)
@@ -4354,6 +4373,19 @@ mod tests {
             _ => None,
         });
         assert_eq!(box_fill, Some(0), "the box keeps its outline but no fill");
+        // Opacity never reaches zero, so a fill can always be turned back up.
+        let r2 = rect(&mut app, 400.0, 100.0);
+        app.selected = vec![r2];
+        app.set_fill(Some(2));
+        app.set_fill_alpha(0);
+        assert!(app.shown_fill().is_some_and(|f| f.alpha == MIN_FILL_ALPHA));
+        // With nothing selected, a callout's opacity sticks for the next ones.
+        app.selected.clear();
+        app.set_tool(Tool::Callout);
+        app.set_fill_alpha(51);
+        assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 51 }));
+        let c2 = callout(&mut app, pos2(300.0, 500.0), pos2(400.0, 600.0));
+        assert_eq!(app.find(c2).unwrap().effective_fill(), Some(Fill { color: WHITE, alpha: 51 }));
     }
 
     #[test]
