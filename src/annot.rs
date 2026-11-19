@@ -5,8 +5,10 @@
 //! Every annotation is reduced to a list of `Prim`s; the screen painter and
 //! the PDF exporter both draw from those, so export matches the screen.
 
+use crate::patterns::{HatchFill, LineType};
 use egui::{pos2, vec2, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub type Rgb = [u8; 3];
 
@@ -36,6 +38,12 @@ pub struct Style {
     /// callouts keep their white box, text has no box.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill: Option<Fill>,
+    /// Dashes or symbols along the outline; solid when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<Arc<LineType>>,
+    /// Hatch inside a closed shape, in the markup's colour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hatch: Option<HatchFill>,
 }
 
 impl Style {
@@ -84,6 +92,11 @@ pub enum Prim {
     Text { origin: Pos2, text: String, size: f32, color: Rgb },
     /// Library image stretched over `rect` (it keeps its aspect when resized).
     Image { rect: Rect, image: String },
+    /// Many separate segments of one width and colour (a hatch), placed at
+    /// `offset`; a zero-length one is a dot. `tile` is the pattern's repeat:
+    /// when that's too small to make out on screen, the screen shows a tint
+    /// of `tint` (the outline, with an opacity for the ink) instead.
+    Segments { segs: Arc<Vec<[Pos2; 2]>>, offset: Vec2, width: f32, color: Rgb, tile: f32, tint: Option<(Arc<Vec<Pos2>>, u8)> },
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
@@ -283,6 +296,14 @@ impl Annot {
     }
 
     pub fn bounds(&self) -> Rect {
+        let b = self.shape_bounds();
+        match self.style.line.as_deref().filter(|_| self.takes_line_type()) {
+            Some(lt) => b.expand(lt.reach(self.width)),
+            None => b,
+        }
+    }
+
+    fn shape_bounds(&self) -> Rect {
         let w = self.width.max(1.0);
         match &self.kind {
             // The leaders lie between box, anchor and extra tips; each arrowhead spreads up to arrow_len around its tip.
@@ -372,7 +393,7 @@ impl Annot {
                     best = best.min(polyline_dist(&rect_pts(*rect), true, p));
                     continue;
                 }
-                Prim::Text { .. } => continue,
+                Prim::Text { .. } | Prim::Segments { .. } => continue,
             };
             best = best.min(polyline_dist(pts, closed, p));
         }
@@ -405,11 +426,60 @@ impl Annot {
         self.prims().iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
             Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
-            Prim::Text { .. } | Prim::Image { .. } => false,
+            Prim::Text { .. } | Prim::Image { .. } | Prim::Segments { .. } => false,
         })
     }
 
     pub fn prims(&self) -> Vec<Prim> {
+        let mut out = self.shape_prims();
+        if let Some(lt) = self.style.line.as_deref().filter(|_| self.takes_line_type()) {
+            out = out
+                .into_iter()
+                .flat_map(|p| match p {
+                    Prim::Stroke { pts, closed, width, color } => {
+                        let mut v = Vec::new();
+                        crate::patterns::pattern_prims(&mut v, &pts, closed, lt, width, color);
+                        v
+                    }
+                    // A callout's box: its fill, then the outline in the pattern.
+                    Prim::Fill { pts, color, alpha, outline: Some((oc, ow)) } => {
+                        let mut v = vec![Prim::Fill { pts: pts.clone(), color, alpha, outline: None }];
+                        crate::patterns::pattern_prims(&mut v, &pts, true, lt, ow, oc);
+                        v
+                    }
+                    p => vec![p],
+                })
+                .collect();
+        }
+        out
+    }
+
+    /// Whether the outline can be dashed or patterned.
+    pub fn takes_line_type(&self) -> bool {
+        matches!(self.kind, Kind::Callout { .. } | Kind::Cloud { .. } | Kind::Rect { .. } | Kind::Arrow { .. } | Kind::Line { .. } | Kind::Pen { .. } | Kind::Poly { .. })
+    }
+
+    /// Whether the markup can be hatched: closed shapes.
+    pub fn hatchable(&self) -> bool {
+        match &self.kind {
+            Kind::Cloud { .. } | Kind::Rect { .. } => true,
+            Kind::Poly { closed, .. } => *closed,
+            Kind::Measure { area, .. } => *area,
+            _ => false,
+        }
+    }
+
+    /// The closed outline a fill or hatch goes inside.
+    fn outline(&self) -> Option<Vec<Pos2>> {
+        match &self.kind {
+            Kind::Cloud { rect } => Some(cloud_pts(*rect)),
+            Kind::Rect { rect } => Some(rect_pts(*rect)),
+            Kind::Poly { pts, closed: true } | Kind::Measure { pts, area: true, .. } if pts.len() >= 3 => Some(pts.clone()),
+            _ => None,
+        }
+    }
+
+    fn shape_prims(&self) -> Vec<Prim> {
         let c = self.color;
         let w = self.width;
         let mut out = Vec::new();
@@ -460,7 +530,9 @@ impl Annot {
             Kind::Measure { pts, area, value, size, .. } => {
                 if *area && pts.len() >= 3 {
                     let fill = self.style.fill.unwrap_or(Fill { color: c, alpha: AREA_TINT });
-                    out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
+                    out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: None });
+                    self.hatch_prims(&mut out, pts);
+                    out.push(Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: c });
                 } else if pts.len() >= 2 {
                     out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c });
                     // Ticks square to the line at both ends, like a dimension.
@@ -516,20 +588,34 @@ impl Annot {
     /// The closed outline whose inside is filled, when the markup has a fill.
     /// (A callout's box always counts, through `text_box`.)
     fn filled_outline(&self) -> Option<Vec<Pos2>> {
-        if !self.style.fill.is_some_and(|f| f.alpha > 0) {
+        let hatched = self.style.hatch.is_some() && self.hatchable();
+        if !self.style.fill.is_some_and(|f| f.alpha > 0) && !hatched {
             return None;
         }
-        match &self.kind {
-            Kind::Cloud { rect } => Some(cloud_pts(*rect)),
-            Kind::Rect { rect } => Some(rect_pts(*rect)),
-            Kind::Poly { pts, closed: true } | Kind::Measure { pts, area: true, .. } if pts.len() >= 3 => Some(pts.clone()),
-            _ => None,
-        }
+        self.outline()
     }
 
+    /// Fill, then hatch, inside `pts` (the outline is drawn after, on top).
     fn fill_prims(&self, out: &mut Vec<Prim>, pts: Vec<Pos2>) {
         if let Some(f) = self.style.fill.filter(|f| f.alpha > 0) {
-            out.push(Prim::Fill { pts, color: f.color, alpha: f.alpha, outline: None });
+            out.push(Prim::Fill { pts: pts.clone(), color: f.color, alpha: f.alpha, outline: None });
+        }
+        self.hatch_prims(out, &pts);
+    }
+
+    fn hatch_prims(&self, out: &mut Vec<Prim>, pts: &[Pos2]) {
+        if let Some(h) = self.style.hatch.as_ref().filter(|_| self.hatchable()) {
+            let (groups, offset) = crate::patterns::cached_hatch(pts, &h.pattern, h.scale);
+            let tile = h.pattern.tile.min_elem() * h.scale;
+            // Ink per tile, for the tint shown when zoomed out too far to see the lines.
+            let t = h.pattern.tile * h.scale;
+            let ink: f32 = h.pattern.lines.iter().map(|[a, b]| (vec2((b.x - a.x) * t.x, (b.y - a.y) * t.y)).length() * h.pattern.line_width).sum::<f32>()
+                + h.pattern.dots.iter().map(|(_, d)| d * d).sum::<f32>();
+            let alpha = (ink / (t.x * t.y).max(1.0) * 255.0).clamp(20.0, 160.0) as u8;
+            let mut tint = Some((Arc::new(pts.to_vec()), alpha));
+            for (width, segs) in groups.iter() {
+                out.push(Prim::Segments { segs: segs.clone(), offset, width: *width, color: self.color, tile, tint: tint.take() });
+            }
         }
     }
 }
@@ -869,6 +955,21 @@ mod tests {
         assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
         assert_eq!(a.bounds(), Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)));
         assert_eq!(a.label(), "NC seal");
+    }
+
+    #[test]
+    fn a_line_types_symbols_count_in_the_bounds() {
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Line { a: pos2(0.0, 100.0), b: pos2(200.0, 100.0) } };
+        let plain = a.bounds();
+        let symbol = crate::patterns::Comp::Symbol { left: 5.0, right: 5.0, stretch: 1.0, fill: false, paths: vec![vec![pos2(0.0, -20.0), pos2(0.0, 20.0)]] };
+        a.style.line = Some(Arc::new(crate::patterns::LineType { name: "tall".into(), scale_with_width: false, lines: vec![crate::patterns::LinePattern { offset: 0.0, comps: vec![symbol] }] }));
+        let b = a.bounds();
+        assert!(b.min.y <= 80.0 && b.max.y >= 120.0 && plain.height() < b.height(), "{plain:?} {b:?}");
+        for p in a.prims() {
+            if let Prim::Stroke { pts, .. } = p {
+                assert!(pts.iter().all(|q| b.contains(*q)));
+            }
+        }
     }
 
     #[test]

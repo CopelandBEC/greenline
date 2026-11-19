@@ -89,6 +89,8 @@ pub struct Prefs {
     pub theme: egui::ThemePreference,
     /// How measurements read: feet-inches or metric.
     pub units: Units,
+    /// Shared folder of Bluebeam line type (.blx) and hatch (.bhx) files, e.g. a firm's standards.
+    pub pattern_dir: Option<PathBuf>,
 }
 
 impl Default for Prefs {
@@ -101,6 +103,7 @@ impl Default for Prefs {
             date_format: "%m/%d/%Y".into(),
             theme: egui::ThemePreference::System,
             units: Units::Imperial,
+            pattern_dir: None,
         }
     }
 }

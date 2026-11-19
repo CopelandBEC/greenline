@@ -19,7 +19,13 @@ default green, highlight yellow), "width" (line width in points, default 2),
 "size" (text size in points, default 12; 10 for measurement labels),
 "group" (any string: ops on one page with the same group select and move together),
 "fill" (a colour as for "color", or "white": fills a cloud, rect, polygon, area, callout or
-text box) with "opacity" (0 to 100, default 50).
+text box) with "opacity" (0 to 100, default 50),
+"line" (a line type: dashed, dotted, dash-dot, or a name from the pattern library; for
+shapes, lines, arrows, polylines and callouts),
+"hatch" (a hatch: diagonal, crosshatch, horizontal, or a name from the pattern library; for
+clouds, rects, polygons and areas) with "hatch_scale" (default 1).
+`greenline-cli patterns` lists the library's line types and hatches; where two libraries
+share a name, write "library/name" (built-ins are "built-in/dashed").
 
   {"op": "cloud",     "page": 4, "rect": [x0, y0, x1, y1]}
   {"op": "rect",      "page": 4, "rect": [...]}
@@ -44,6 +50,35 @@ text box) with "opacity" (0 to 100, default 50).
         for a detail drawn at its own scale. "ratio" is real length per paper length
         (48 for 1/4" = 1'-0", 50 for 1:50). Lengths: 12'-6", 12' 6 1/2", 150", 3.2 m, 3200 mm.
 "##;
+
+/// The pattern library (built-ins, the user's own, the shared folder in prefs), read once.
+pub fn library() -> &'static crate::patterns::Library {
+    static LIB: std::sync::OnceLock<crate::patterns::Library> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| crate::patterns::Library::load(crate::sidecar::load_prefs().pattern_dir.as_deref()))
+}
+
+/// The pattern `want` names among (library, name, pattern) entries: by name, or
+/// "library/name" where names repeat (built-ins are in "built-in").
+fn pick<'a, T>(entries: impl Iterator<Item = (&'a str, &'a str, &'a T)>, want: &str, what: &str) -> Result<&'a T, String> {
+    let want = want.trim();
+    let all: Vec<(&str, &str, &T)> = entries.map(|(s, n, p)| (if s.is_empty() { "built-in" } else { s }, n.trim(), p)).collect();
+    let by_name: Vec<_> = all.iter().filter(|(_, n, _)| n.eq_ignore_ascii_case(want)).collect();
+    let found: Vec<_> = if by_name.is_empty() {
+        all.iter().filter(|(s, n, _)| format!("{s}/{n}").eq_ignore_ascii_case(want)).collect()
+    } else {
+        by_name
+    };
+    match found[..] {
+        [one] => Ok(one.2),
+        [] => Err(format!("no {what} \"{want}\": see `greenline-cli patterns`")),
+        _ => Err(format!(
+            "{} {} are called \"{want}\": name one as {}",
+            found.len(),
+            if what == "hatch" { "hatches" } else { "line types" },
+            found.iter().map(|(s, n, _)| format!("\"{s}/{n}\"")).collect::<Vec<_>>().join(" or ")
+        )),
+    }
+}
 
 /// What a batch of ops adds.
 #[derive(Debug, Default, Clone)]
@@ -105,6 +140,30 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
         a.style.fill = f.fill().map_err(ctx)?;
         if a.style.fill.is_some() && !a.fillable() {
             return Err(ctx("\"fill\" is for clouds, rects, polygons, areas, callouts and text boxes".into()));
+        }
+        if let Some(name) = f.o.get("line").filter(|v| !v.is_null()) {
+            let name = name.as_str().ok_or(ctx("\"line\" must be a line type's name".into()))?;
+            if !a.takes_line_type() {
+                return Err(ctx("\"line\" is for clouds, rects, lines, arrows, pens, polylines, polygons and callouts".into()));
+            }
+            let lib = library();
+            let lt = pick(lib.line_types.iter().map(|(s, l)| (s.as_str(), l.name.as_str(), l)), name, "line type").map_err(ctx)?;
+            a.style.line = Some(lt.clone());
+        }
+        if let Some(name) = f.o.get("hatch").filter(|v| !v.is_null()) {
+            let name = name.as_str().ok_or(ctx("\"hatch\" must be a hatch's name".into()))?;
+            if !a.hatchable() {
+                return Err(ctx("\"hatch\" is for clouds, rects, polygons and areas".into()));
+            }
+            let scale = f.num_or("hatch_scale", 1.0).map_err(ctx)?;
+            if !(0.1..=20.0).contains(&scale) {
+                return Err(ctx("\"hatch_scale\" must be 0.1 to 20".into()));
+            }
+            let lib = library();
+            let h = pick(lib.hatches.iter().map(|(s, h)| (s.as_str(), h.name.as_str(), h)), name, "hatch").map_err(ctx)?;
+            a.style.hatch = Some(crate::patterns::HatchFill { pattern: h.clone(), scale });
+        } else if f.o.contains_key("hatch_scale") {
+            return Err(ctx("\"hatch_scale\" goes with \"hatch\"".into()));
         }
         if let Kind::Callout { box_w, .. } | Kind::Text { box_w, .. } = a.kind {
             a.wrap_w = Some(box_w);
@@ -422,6 +481,20 @@ mod tests {
         assert!(bad(json!([{"op": "line", "page": 1, "from": [0, 0], "to": [9, 9], "fill": "red"}])).contains("\"fill\" is for"));
         assert!(bad(json!([{"op": "polygon", "page": 1, "points": [[0, 0], [100, 100], [100, 0], [0, 40]]}])).contains("crosses"));
         assert!(bad(json!([{"op": "rect", "page": 1, "rect": [0, 0, 9, 9], "opacity": 20}])).contains("goes with"));
+    }
+
+    #[test]
+    fn repeated_pattern_names_need_their_library() {
+        let a = 1;
+        let b = 2;
+        let c = 3;
+        let entries = [("", "Dashed", &a), ("Firm", "Dashed", &b), ("Firm", "Batt", &c)];
+        assert_eq!(*pick(entries.iter().copied(), "batt", "hatch").unwrap(), 3);
+        assert_eq!(*pick(entries.iter().copied(), "firm/dashed", "line type").unwrap(), 2);
+        assert_eq!(*pick(entries.iter().copied(), "built-in/Dashed", "line type").unwrap(), 1);
+        let e = pick(entries.iter().copied(), "Dashed", "line type").unwrap_err();
+        assert!(e.contains("\"built-in/Dashed\" or \"Firm/Dashed\""), "{e}");
+        assert!(pick(entries.iter().copied(), "Nope", "hatch").unwrap_err().contains("no hatch"));
     }
 
     #[test]

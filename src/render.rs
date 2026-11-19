@@ -382,11 +382,44 @@ fn emit_prims<'a>(
     // Unit vectors for upright text: baseline runs along +u, glyph "up" is -v.
     let (ux, uy) = (m.u.normalized(), (-m.v).normalized());
     let k = m.u.length();
-    for prim in prims {
+    let mut prims = prims.into_iter().peekable();
+    while let Some(prim) = prims.next() {
         match prim {
+            Prim::Segments { segs, offset, width, color: c, .. } if !segs.is_empty() => {
+                // One path object for the whole hatch: far smaller than one per segment.
+                let first = m.map(segs[0][0] + offset);
+                let mut obj = PdfPagePathObject::new(doc, PdfPoints::new(first.x), PdfPoints::new(first.y), Some(color(c, 255)), Some(PdfPoints::new(width * k)), None)?;
+                for (i, [a, b]) in segs.iter().enumerate() {
+                    let (a, b) = (m.map(*a + offset), m.map(*b + offset));
+                    if i > 0 {
+                        obj.move_to(PdfPoints::new(a.x), PdfPoints::new(a.y))?;
+                    }
+                    // A dot: a zero-length segment, which round caps draw as a dot.
+                    obj.line_to(PdfPoints::new(b.x), PdfPoints::new(b.y))?;
+                }
+                obj.set_line_cap(PdfPageObjectLineCap::Round)?;
+                objects.add_path_object(obj)?;
+            }
             Prim::Stroke { pts, closed, width, color: c } if pts.len() >= 2 => {
+                // A run of strokes alike (a dashed or patterned line) becomes one path
+                // of many subpaths: one object, not hundreds.
                 let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
-                let obj = path_object(doc, &pts, closed, Some((c, width * k)), None)?;
+                let mut obj = path_object(doc, &pts, closed, Some((c, width * k)), None)?;
+                while let Some(Prim::Stroke { pts, closed, width: w2, color: c2 }) = prims.peek() {
+                    if *w2 != width || *c2 != c || pts.len() < 2 {
+                        break;
+                    }
+                    let first = m.map(pts[0]);
+                    obj.move_to(PdfPoints::new(first.x), PdfPoints::new(first.y))?;
+                    for p in &pts[1..] {
+                        let p = m.map(*p);
+                        obj.line_to(PdfPoints::new(p.x), PdfPoints::new(p.y))?;
+                    }
+                    if *closed {
+                        obj.close_path()?;
+                    }
+                    prims.next();
+                }
                 objects.add_path_object(obj)?;
             }
             Prim::Fill { pts, color: c, alpha, outline } if pts.len() >= 3 => {
@@ -465,6 +498,8 @@ pub fn export(
             continue;
         }
         let mut page = doc.pages().get(pi as PdfPageIndex)?;
+        // Regenerating the content stream after every object is quadratic: once at the end.
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
         let m = ViewToUser::for_page(&page)?;
         for a in annots.iter().filter(|a| a.page == pi) {
             match mode {
@@ -687,13 +722,30 @@ pub(crate) mod tests {
         let mut cloud = annot(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(50.0, 50.0), pos2(350.0, 250.0)) });
         cloud.style.fill = Some(crate::annot::Fill { color: [0, 0, 255], alpha: 255 });
         let poly = annot(0, Kind::Poly { pts: vec![pos2(50.0, 400.0), pos2(350.0, 400.0), pos2(200.0, 550.0)], closed: false });
-        export(pdfium, &src, &out, &[cloud, poly], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let mut hatched = annot(0, Kind::Rect { rect: egui::Rect::from_min_max(pos2(20.0, 280.0), pos2(380.0, 380.0)) });
+        hatched.style.hatch = Some(crate::patterns::HatchFill { pattern: std::sync::Arc::new(crate::patterns::builtin_hatches()[2].clone()), scale: 1.0 });
+        export(pdfium, &src, &out, &[cloud, poly, hatched], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let img = render_region(&doc, 0, 1.0, [0, 0], [400, 600]).unwrap();
         let px = |x: usize, y: usize| img.pixels[y * 400 + x];
         assert!(px(200, 150).b() > 200 && px(200, 150).r() < 50, "inside is blue: {:?}", px(200, 150));
         assert!(px(200, 410).r() > 250 && px(200, 410).b() > 250, "an open polyline isn't filled: {:?}", px(200, 410));
         assert!(px(200, 400).g() < 200, "its first segment is drawn: {:?}", px(200, 400));
+        // Horizontal hatch lines every 8 points from the top of the rectangle: dark at 284, light at 288.
+        assert!(px(200, 284).g() < 200 && px(200, 288).g() > 230, "{:?} {:?}", px(200, 284), px(200, 288));
+        let page = doc.pages().get(0).unwrap();
+        assert!(page.objects().len() < 20, "the hatch is one path, not hundreds: {}", page.objects().len());
+        drop(page);
+        drop(doc);
+        // A long dotted line: one path object too, and quick.
+        let mut dotted = annot(0, Kind::Poly { pts: (0..400).map(|i| pos2(10.0 + (i % 20) as f32 * 19.0, 10.0 + (i / 20) as f32 * 29.0)).collect(), closed: false });
+        dotted.style.line = Some(std::sync::Arc::new(crate::patterns::builtin_line_types()[1].clone()));
+        assert!(dotted.prims().len() > 2000, "{}", dotted.prims().len());
+        let t = std::time::Instant::now();
+        export(pdfium, &src, &out, &[dotted], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        assert!(t.elapsed().as_secs_f32() < 2.0, "{:?}", t.elapsed());
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        assert!(doc.pages().get(0).unwrap().objects().len() < 5);
         std::fs::remove_dir_all(&dir).ok();
     }
 
