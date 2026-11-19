@@ -697,6 +697,9 @@ impl App {
             return;
         }
         if i == self.cur_tab {
+            if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+                self.end_drag();
+            }
             self.commit_edit();
             self.save_sidecar();
             if self.dirty && !self.read_only {
@@ -704,6 +707,12 @@ impl App {
                 return;
             }
             let p = self.park();
+            // Parking saves again: if that failed, keep it.
+            if p.dirty && !p.read_only {
+                self.unpark(p);
+                self.toast("Autosave failed; keeping this tab open so markups aren't lost".into());
+                return;
+            }
             if let Some(w) = &self.worker {
                 w.send(Req::Close { generation: p.generation });
             }
@@ -2141,10 +2150,11 @@ impl App {
             self.close_tab(self.cur_tab);
         }
         if n > 1 {
-            if take(Key::Tab, cmd) || take(Key::PageDown, cmd) {
-                self.switch_tab((self.cur_tab + 1) % n);
-            } else if take(Key::Tab, cmd_shift) || take(Key::PageUp, cmd) {
+            // Shift first: Ctrl+Tab would also match Ctrl+Shift+Tab.
+            if take(Key::Tab, cmd_shift) || take(Key::PageUp, cmd) {
                 self.switch_tab((self.cur_tab + n - 1) % n);
+            } else if take(Key::Tab, cmd) || take(Key::PageDown, cmd) {
+                self.switch_tab((self.cur_tab + 1) % n);
             }
         }
         if ctx.egui_wants_keyboard_input() {
