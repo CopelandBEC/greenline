@@ -285,6 +285,8 @@ pub struct App {
     find: Find,
     /// The New document window, while open.
     new_doc: Option<NewDoc>,
+    /// A blank PDF being written: its path, the markups lock held for it, and old markups set aside.
+    creating: Option<(PathBuf, std::fs::File, Vec<(PathBuf, PathBuf)>)>,
     /// Images being stored for placing: (stored name, file name, pixels) or an error, the drop target, the document then.
     pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
     /// Images waiting to be placed after the one being placed now.
@@ -432,6 +434,7 @@ impl App {
             scale_win: ScaleWin::default(),
             find: Find::default(),
             new_doc: None,
+            creating: None,
             pictures: mpsc::channel(),
             queued_pictures: Default::default(),
             picture_epoch: 0,
@@ -484,6 +487,11 @@ impl App {
     // Document
 
     fn open(&mut self, path: PathBuf) {
+        self.open_with(path, None);
+    }
+
+    /// Opens `path`, with its markups lock already held when `lock` is given.
+    fn open_with(&mut self, path: PathBuf, lock: Option<std::fs::File>) {
         if self.worker.is_none() {
             return;
         }
@@ -528,7 +536,7 @@ impl App {
         self.lock = None;
         self.read_only = false;
         let mut why = None;
-        match sidecar::lock(&path) {
+        match lock.map_or_else(|| sidecar::lock(&path), |l| Ok(Some(l))) {
             Ok(Some(l)) => self.lock = Some(l),
             Ok(None) => why = Some("open in another Greenline window".to_string()),
             Err(e) => why = Some(format!("could not lock markups file ({e})")),
@@ -702,8 +710,8 @@ impl App {
                         self.toast("Refusing to overwrite the open PDF: choose another name".into());
                     } else if !has_ext && path.exists() {
                         self.toast(format!("{} already exists: choose another name", path.display()));
-                    } else if let Some(w) = &self.worker {
-                        w.send(Req::Create { path, size, pages });
+                    } else {
+                        self.create_blank(path, real, size, pages);
                     }
                 }
             }
@@ -724,6 +732,28 @@ impl App {
 
     /// Stores a photo or sketch and places it: at `at` (screen) when dropped on
     /// a sheet, otherwise with the next click (or drag to size).
+    /// Writes a new blank PDF at `path` (`real`: its canonical form). The path's
+    /// markups lock is taken first and held until it opens, and markups left
+    /// from a document that used to be there are set aside, never loaded onto it.
+    fn create_blank(&mut self, path: PathBuf, real: PathBuf, size: Vec2, pages: usize) {
+        if self.creating.is_some() || self.worker.is_none() {
+            return;
+        }
+        let lock = match sidecar::lock(&real) {
+            Ok(Some(l)) => l,
+            Ok(None) => return self.toast("A document at that path is open in another Greenline window: choose another name".into()),
+            Err(e) => return self.toast(format!("Could not lock that path's markups: {e}")),
+        };
+        let retired = match sidecar::retire(&real) {
+            Ok(r) => r,
+            Err(e) => return self.toast(format!("Old markups for that path couldn't be set aside ({e}): choose another name")),
+        };
+        self.creating = Some((real, lock, retired));
+        if let Some(w) = &self.worker {
+            w.send(Req::Create { path, size, pages });
+        }
+    }
+
     /// The image is decoded and stored off the UI thread (a big photo takes a moment).
     fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
         // Where it was dropped, fixed now: the view may move before it's ready.
@@ -850,12 +880,16 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
-                Resp::Created(Ok(path)) => match sidecar::retire(&dunce::canonicalize(&path).unwrap_or(path.clone())) {
-                    Ok(true) => self.open(path),
-                    Ok(false) => self.toast("A document at that path is open in another Greenline window: close it there, then open the new one".into()),
-                    Err(e) => self.toast(format!("Created, but old markups for that path couldn't be set aside ({e}); not opening it")),
-                },
-                Resp::Created(Err(e)) => self.toast(format!("Could not create the document: {e}")),
+                Resp::Created(Ok(path)) => {
+                    let lock = self.creating.take().map(|c| c.1);
+                    self.open_with(path, lock);
+                }
+                Resp::Created(Err(e)) => {
+                    if let Some((_, _, retired)) = self.creating.take() {
+                        sidecar::unretire(&retired);
+                    }
+                    self.toast(format!("Could not create the document: {e}"));
+                }
                 Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
                     self.find.more |= more;
                     self.on_found(page, hits);
