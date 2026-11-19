@@ -194,11 +194,26 @@ struct Parked {
     read_only: bool,
     read_only_why: String,
     failed: HashSet<usize>,
+    /// Loaded while in the background: fit it when first shown.
+    fit_pending: bool,
 }
 
 /// An open document's place in the tab strip; the shown tab's state is in `App`.
 struct Tab {
     parked: Option<Box<Parked>>,
+}
+
+/// Where each page sits in the scroll of pages, the widest page, and the total height.
+fn layout(pages: &[Vec2]) -> (Vec<f32>, f32, f32) {
+    let mut y = GAP;
+    let mut ys = Vec::with_capacity(pages.len());
+    let mut w = 0.0f32;
+    for s in pages {
+        ys.push(y);
+        y += s.y + GAP;
+        w = w.max(s.x);
+    }
+    (ys, w, y)
 }
 
 /// Page sizes offered for a new document: name and portrait size in points.
@@ -340,6 +355,10 @@ pub struct App {
     title_dirty: bool,
     /// The latest document generation handed out.
     last_generation: u64,
+    /// When to next try saving background tabs whose save failed.
+    parked_retry_at: f64,
+    /// Scroll the tab strip to the shown tab on the next frame.
+    tab_scroll: bool,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -489,6 +508,8 @@ impl App {
             cur_tab: 0,
             title_dirty: false,
             last_generation: 0,
+            parked_retry_at: 0.0,
+            tab_scroll: false,
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -539,6 +560,10 @@ impl App {
 
     /// Moves the shown document's state out of `self`, leaving it empty.
     fn park(&mut self) -> Box<Parked> {
+        // A move or resize under way already changed the markups: finish it, so it's saved and undoable.
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
         self.commit_edit();
         self.save_sidecar();
         let p = Parked {
@@ -571,7 +596,11 @@ impl App {
             read_only: self.read_only,
             read_only_why: std::mem::take(&mut self.read_only_why),
             failed: std::mem::take(&mut self.failed),
+            fit_pending: self.fit_pending,
         };
+        let mut p = p;
+        // Scale suggestions asked for but not back yet are asked again when it's shown.
+        p.scale_asked.retain(|pg| p.scale_found.contains_key(pg));
         self.dirty = false;
         self.read_only = false;
         self.next_id = 1;
@@ -612,9 +641,14 @@ impl App {
         self.read_only = p.read_only;
         self.read_only_why = p.read_only_why;
         self.failed = p.failed;
-        // Find results are for this document's search; let the worker know which one is wanted.
+        self.fit_pending = p.fit_pending;
+        // Find results are for this document's search; let the worker know which one is
+        // wanted, and pick up a search that was cut short by the switch.
         if let Some(w) = &self.worker {
             w.keep.lock().unwrap().search = self.find.id;
+        }
+        if self.find.open && self.find.pending > 0 {
+            self.start_search();
         }
     }
 
@@ -714,6 +748,31 @@ impl App {
     /// The window title follows the shown tab (set on the next frame, which has the context).
     fn set_title(&mut self) {
         self.title_dirty = true;
+        self.tab_scroll = true;
+    }
+
+    /// Background tabs whose save failed when parked: tried again every few seconds,
+    /// and the failure kept in the status line until it goes through.
+    fn save_parked(&mut self, now: f64) {
+        if now < self.parked_retry_at {
+            return;
+        }
+        let mut failed = None;
+        for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).filter(|p| p.dirty && !p.read_only) {
+            let (Some(pdf), Some(f)) = (&p.path, &p.markups_file) else {
+                p.dirty = false;
+                continue;
+            };
+            match sidecar::save_file(f, pdf, &p.annots, &p.scales, &p.accepted) {
+                Ok(()) => p.dirty = false,
+                Err(e) => failed = Some(format!("AUTOSAVE FAILED for {}: {e}", pdf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
+            }
+        }
+        if let Some(msg) = failed {
+            self.status = msg;
+            self.status_until = f64::INFINITY;
+            self.parked_retry_at = now + 5.0;
+        }
     }
 
     /// A tab's label: its file name.
@@ -730,9 +789,17 @@ impl App {
             ui.horizontal(|ui| {
                 for i in 0..self.tabs.len() {
                     let name = self.tab_name(i);
-                    let short: String = if name.chars().count() > 28 { format!("{}…", name.chars().take(27).collect::<String>()) } else { name.clone() };
+                    let mut short: String = if name.chars().count() > 28 { format!("{}…", name.chars().take(27).collect::<String>()) } else { name.clone() };
+                    let unsaved = self.tabs[i].parked.as_ref().is_some_and(|p| p.dirty && !p.read_only);
+                    if unsaved {
+                        short.insert_str(0, "● ");
+                    }
                     let on = i == self.cur_tab;
-                    let r = ui.add(egui::Button::selectable(on, short)).on_hover_text(&name);
+                    let tip = if unsaved { format!("{name} — not saved yet (retrying)") } else { name.clone() };
+                    let r = ui.add(egui::Button::selectable(on, short)).on_hover_text(tip);
+                    if on && std::mem::take(&mut self.tab_scroll) {
+                        r.scroll_to_me(None);
+                    }
                     if r.clicked() {
                         switch = Some(i);
                     }
@@ -771,6 +838,7 @@ impl App {
             self.switch_tab(i);
             return;
         }
+        self.tab_scroll = true;
         // Open beside what's shown, in a new tab.
         if self.path.is_some() {
             let parked = self.park();
@@ -849,16 +917,8 @@ impl App {
     }
 
     fn on_opened(&mut self, ctx: &egui::Context, pages: Vec<Vec2>) {
+        (self.page_y, self.doc_w, self.doc_h) = layout(&pages);
         self.pages = pages;
-        self.page_y.clear();
-        let mut y = GAP;
-        self.doc_w = 0.0;
-        for s in &self.pages {
-            self.page_y.push(y);
-            y += s.y + GAP;
-            self.doc_w = self.doc_w.max(s.x);
-        }
-        self.doc_h = y;
         self.fit_pending = true;
         if self.find.open {
             self.start_search();
@@ -1121,6 +1181,21 @@ impl App {
         for m in msgs {
             match m {
                 Resp::Opened { generation, pages } if generation == self.generation => self.on_opened(ctx, pages),
+                // A document that finished loading after its tab went to the background.
+                Resp::Opened { generation, pages } => {
+                    if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
+                        (p.page_y, p.doc_w, p.doc_h) = layout(&pages);
+                        p.pages = pages;
+                        p.fit_pending = true;
+                    }
+                }
+                Resp::OpenFailed { generation, error } if generation != self.generation => {
+                    if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
+                        let name = p.path.as_ref().and_then(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                        p.path = None;
+                        self.toast(format!("Could not open {name}: {error}"));
+                    }
+                }
                 Resp::OpenFailed { generation, error } if generation == self.generation => {
                     self.status = format!("Could not open: {error}");
                     self.path = None;
@@ -2058,6 +2133,20 @@ impl App {
     // Input
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        // Tabs answer even while typing (switching commits the note being typed).
+        let n = self.tabs.len();
+        let take = |k: Key, m: egui::Modifiers| ctx.input_mut(|i| i.consume_key(m, k));
+        let (cmd, cmd_shift) = (egui::Modifiers::COMMAND, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT);
+        if take(Key::W, cmd) && (self.path.is_some() || n > 1) {
+            self.close_tab(self.cur_tab);
+        }
+        if n > 1 {
+            if take(Key::Tab, cmd) || take(Key::PageDown, cmd) {
+                self.switch_tab((self.cur_tab + 1) % n);
+            } else if take(Key::Tab, cmd_shift) || take(Key::PageUp, cmd) {
+                self.switch_tab((self.cur_tab + n - 1) % n);
+            }
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -2074,14 +2163,7 @@ impl App {
             if pressed(Key::N) {
                 self.new_doc.get_or_insert_with(NewDoc::default);
             }
-            if pressed(Key::W) && (self.path.is_some() || self.tabs.len() > 1) {
-                self.close_tab(self.cur_tab);
-            }
-            let n = self.tabs.len();
-            if n > 1 && (pressed(Key::Tab) || pressed(Key::PageDown) || pressed(Key::PageUp)) {
-                let back = (pressed(Key::Tab) && shift) || pressed(Key::PageUp);
-                self.switch_tab(if back { (self.cur_tab + n - 1) % n } else { (self.cur_tab + 1) % n });
-            }
+
             if pressed(Key::E) {
                 let alt = ctx.input(|i| i.modifiers.alt);
                 self.export(if alt { ExportMode::Editable } else { ExportMode::Flatten }, shift);
@@ -4766,6 +4848,7 @@ impl eframe::App for App {
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
             self.save_sidecar();
         }
+        self.save_parked(now);
         // Wake once a second to notice proposals an agent adds.
         if self.path.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
@@ -5774,6 +5857,48 @@ mod tests {
         // And closing the last leaves an empty window.
         app.close_tab(0);
         assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1);
+    }
+
+    #[test]
+    fn a_move_under_way_is_finished_before_its_tab_is_parked() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        let a = rect(&mut app, 100.0, 100.0);
+        app.dirty = false;
+        app.undo.clear();
+        // Read-only here so the test keeps the unsaved flag to look at.
+        app.read_only = true;
+        app.begin_drag(pos2(100.0, 150.0), false, PLAIN);
+        app.update_drag(pos2(140.0, 150.0), vec2(40.0, 0.0));
+        let p = app.park();
+        assert!(p.dirty, "the move is kept to be saved");
+        assert_eq!(p.undo.len(), 1, "and can be undone");
+        assert_eq!(p.annots[0].bounds().min.x, 138.0);
+        let _ = a;
+    }
+
+    #[test]
+    fn a_document_loaded_in_the_background_is_ready_when_shown() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 5;
+        let mut p = app.park();
+        p.pages.clear();
+        app.tabs[0].parked = Some(p);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.generation = 6;
+        // What the worker sends for the first tab's document arrives while the second is shown.
+        if let Some(p) = app.tabs[0].parked.as_mut() {
+            (p.page_y, p.doc_w, p.doc_h) = layout(&[vec2(612.0, 792.0), vec2(1224.0, 792.0)]);
+            p.pages = vec![vec2(612.0, 792.0), vec2(1224.0, 792.0)];
+            p.fit_pending = true;
+        }
+        app.switch_tab(0);
+        assert_eq!(app.pages.len(), 2);
+        assert_eq!(app.doc_w, 1224.0);
+        assert_eq!(app.page_y, vec![GAP, GAP + 792.0 + GAP]);
+        assert!(app.fit_pending);
     }
 
     #[test]
