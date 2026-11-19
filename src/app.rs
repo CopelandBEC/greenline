@@ -238,6 +238,8 @@ pub struct App {
     tool_fill: HashMap<Tool, Option<usize>>,
     /// Opacity of new fills, 0..=255.
     fill_alpha: u8,
+    /// The opacity slider's value during a drag (percent), applied on release.
+    fill_pending: Option<f32>,
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -356,6 +358,7 @@ impl App {
             tool_color: HashMap::from([(Tool::Highlight, 5)]),
             tool_fill: HashMap::new(),
             fill_alpha: 128,
+            fill_pending: None,
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -2444,8 +2447,10 @@ impl App {
         }
         self.snapshot();
         let id = self.add(page, kind);
-        if matches!(place, Place::Date) {
-            if let Some(a) = self.find_mut(id) {
+        if let Some(a) = self.find_mut(id) {
+            // Placed as previewed: no fill from whatever tool was last used.
+            a.style = Style::default();
+            if matches!(place, Place::Date) {
                 a.color = DATE_COLOR;
             }
         }
@@ -2956,15 +2961,16 @@ impl App {
                     }
                 }
             });
-            let mut pct = (shown.map_or(self.fill_alpha, |f| f.alpha) as f32 / 2.55).round();
-            let min = (MIN_FILL_ALPHA as f32 / 2.55).round();
-            let slider = ui.add_enabled(shown.is_some(), egui::Slider::new(&mut pct, min..=100.0).suffix("%").text("Opacity"));
-            // One undo step per drag: apply on release (or a click/keyboard change).
+            // While dragging, the slider shows the value it will set on release (one undo step per drag).
+            let mut pct = self.fill_pending.unwrap_or_else(|| (shown.map_or(self.fill_alpha, |f| f.alpha) as f32 / 2.55).round());
+            let slider = ui.add_enabled(shown.is_some(), egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").text("Opacity"));
             if slider.changed() {
-                self.fill_alpha = (pct * 2.55).round() as u8;
+                self.fill_pending = Some(pct);
             }
             if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                self.set_fill_alpha(self.fill_alpha);
+                if let Some(p) = self.fill_pending.take() {
+                    self.set_fill_alpha((p * 2.55).round() as u8);
+                }
             }
         });
     }
@@ -4386,6 +4392,19 @@ mod tests {
         assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 51 }));
         let c2 = callout(&mut app, pos2(300.0, 500.0), pos2(400.0, 600.0));
         assert_eq!(app.find(c2).unwrap().effective_fill(), Some(Fill { color: WHITE, alpha: 51 }));
+    }
+
+    #[test]
+    fn placed_dates_take_no_tool_fill() {
+        let mut app = app();
+        app.set_tool(Tool::Text);
+        app.set_fill(Some(COLORS.len()));
+        app.date_text = "2026-11-19".into();
+        app.start_placing(Place::Date);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        let a = app.annots.last().unwrap();
+        assert!(matches!(a.kind, Kind::Text { .. }));
+        assert!(a.style.fill.is_none());
     }
 
     #[test]
