@@ -361,7 +361,8 @@ impl Library {
             return;
         }
         let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let taken = |s: &str| self.line_types.iter().any(|(x, _)| x == s) || self.hatches.iter().any(|(x, _)| x == s);
+        // Case-insensitively, as agents name them.
+        let taken = |s: &str| self.line_types.iter().any(|(x, _)| x.eq_ignore_ascii_case(s)) || self.hatches.iter().any(|(x, _)| x.eq_ignore_ascii_case(s));
         let mut set = stem.clone();
         if !tag.is_empty() && taken(&set) {
             set = format!("{stem}{tag}");
@@ -402,7 +403,7 @@ impl Library {
                 let hs = parse_bhx(&xml)?;
                 let n = hs.len();
                 for mut h in hs {
-                    if !self.hatches.iter().any(|(_, x)| x.name.trim() == h.name.trim() && x.tile == h.tile && x.lines == h.lines && x.dots == h.dots) {
+                    if !self.hatches.iter().any(|(_, x)| x.name.trim() == h.name.trim() && x.tile == h.tile && x.line_width == h.line_width && x.lines == h.lines && x.dots == h.dots) {
                         h.name = unique(&h.name, &mut used);
                         self.hatches.push((set.clone(), Arc::new(h)));
                     }
@@ -435,8 +436,16 @@ pub fn import(paths: &[PathBuf]) -> anyhow::Result<usize> {
         if count == 0 {
             anyhow::bail!("{}: nothing in it Greenline can draw", p.display());
         }
-        let name = p.file_name().ok_or_else(|| anyhow::anyhow!("{}: no file name", p.display()))?;
-        std::fs::copy(p, dir.join(name))?;
+        // A different file of the same name gets a numbered copy rather than replacing it.
+        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("{}: no file name", p.display()))?;
+        let bytes = std::fs::read(p)?;
+        let mut dest = dir.join(format!("{stem}.{ext}"));
+        let mut k = 2;
+        while dest.exists() && std::fs::read(&dest).ok().as_deref() != Some(&bytes[..]) {
+            dest = dir.join(format!("{stem} {k}.{ext}"));
+            k += 1;
+        }
+        std::fs::write(&dest, &bytes)?;
         n += count;
     }
     Ok(n)
