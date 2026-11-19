@@ -141,8 +141,13 @@ fn prepare(bytes: &[u8], knock_out: bool) -> anyhow::Result<Prepared> {
         image::ImageFormat::Jpeg => "jpg",
         _ => anyhow::bail!("only PNG and JPEG images are supported"),
     };
-    let mut img = image::load_from_memory_with_format(bytes, format)?.to_rgba8();
-    let mut changed = false;
+    // Upright as the camera meant it (phone photos are often stored on their side).
+    let mut decoder = image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_decoder()?;
+    let orientation = image::ImageDecoder::orientation(&mut decoder).unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut dynamic = image::DynamicImage::from_decoder(decoder)?;
+    let mut changed = orientation != image::metadata::Orientation::NoTransforms;
+    dynamic.apply_orientation(orientation);
+    let mut img = dynamic.to_rgba8();
     if img.width().max(img.height()) > MAX_PX {
         let k = MAX_PX as f32 / img.width().max(img.height()) as f32;
         let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));

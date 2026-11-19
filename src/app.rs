@@ -158,6 +158,8 @@ struct Mods {
     shift: bool,
 }
 
+type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
+
 /// Page sizes offered for a new document: name and portrait size in points.
 const PAGE_SIZES: [(&str, Vec2); 9] = [
     ("Letter  8.5 × 11 in", Vec2::new(612.0, 792.0)),
@@ -282,6 +284,8 @@ pub struct App {
     find: Find,
     /// The New document window, while open.
     new_doc: Option<NewDoc>,
+    /// Images being stored for placing: (stored name, file name, pixels) or an error, the drop target, the document then.
+    pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -423,6 +427,7 @@ impl App {
             scale_win: ScaleWin::default(),
             find: Find::default(),
             new_doc: None,
+            pictures: mpsc::channel(),
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -679,10 +684,18 @@ impl App {
                 }
             }
             Pick::NewDoc(size, pages) => {
-                if let (Some(path), Some(w)) = (paths.into_iter().next(), &self.worker) {
-                    // The dialog may leave off the extension.
-                    let path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) { path } else { path.with_extension("pdf") };
-                    w.send(Req::Create { path, size, pages });
+                if let Some(chosen) = paths.into_iter().next() {
+                    // The dialog may leave off the extension; a name it didn't confirm mustn't replace a file.
+                    let has_ext = chosen.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+                    let path = if has_ext { chosen } else { chosen.with_extension("pdf") };
+                    let real = path.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(path.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| path.clone());
+                    if self.path.as_ref().is_some_and(|p| *p == real || dunce::canonicalize(&path).is_ok_and(|o| o == *p)) {
+                        self.toast("Refusing to overwrite the open PDF: choose another name".into());
+                    } else if !has_ext && path.exists() {
+                        self.toast(format!("{} already exists: choose another name", path.display()));
+                    } else if let Some(w) = &self.worker {
+                        w.send(Req::Create { path, size, pages });
+                    }
                 }
             }
             Pick::Picture => {
@@ -702,21 +715,39 @@ impl App {
 
     /// Stores a photo or sketch and places it: at `at` (screen) when dropped on
     /// a sheet, otherwise with the next click (or drag to size).
+    /// The image is decoded and stored off the UI thread (a big photo takes a moment).
     fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
-        let (image, name, px) = match stamps::store_picture(src) {
+        // Where it was dropped, fixed now: the view may move before it's ready.
+        let target = at.filter(|_| !self.overview).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
+        let (tx, src) = (self.pictures.0.clone(), src.to_path_buf());
+        let generation = self.generation;
+        std::thread::spawn(move || {
+            tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, generation)).ok();
+        });
+        self.toast("Adding the image…".into());
+    }
+
+    /// An image stored by `place_picture`: placed where it was dropped, or
+    /// ready to place with the next click.
+    fn picture_ready(&mut self, stored: Result<(String, String, Vec2), String>, target: Option<(usize, Pos2)>, generation: u64) {
+        let (image, name, px) = match stored {
             Ok(r) => r,
-            Err(e) => {
-                self.toast(format!("Could not add the image: {e}"));
-                return;
-            }
+            Err(e) => return self.toast(format!("Could not add the image: {e}")),
         };
+        if generation != self.generation || self.pages.is_empty() {
+            return;
+        }
         let aspect = px.x / px.y.max(1.0);
-        // As if at 150 dpi, but no wider than 60% of the page in view.
-        let page_w = self.pages.get(self.current_page()).map_or(612.0, |s| s.x);
-        let width = (px.x / 150.0 * 72.0).min(page_w * 0.6).max(36.0);
+        // As if at 150 dpi, but within 60% of the page either way.
+        let page = target.map_or(self.current_page(), |t| t.0).min(self.pages.len() - 1);
+        let ps = self.pages[page];
+        let width = (px.x / 150.0 * 72.0).min(ps.x * 0.6).min(ps.y * 0.6 * aspect).max(24.0);
         self.set_tool(Tool::Select);
         self.start_placing(Place::Image { image, name, aspect, width });
-        if let Some((page, p)) = at.and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s)))) {
+        if let Some((page, p)) = target {
+            // Centred on the drop, kept on the sheet.
+            let half = vec2(width, width / aspect) / 2.0;
+            let p = pos2(p.x.clamp(half.x, (ps.x - half.x).max(half.x)), p.y.clamp(half.y, (ps.y - half.y).max(half.y)));
             self.place(page, p, p);
         }
     }
@@ -4280,6 +4311,9 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.poll_worker(&ctx);
         self.poll_dialog();
+        while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
+            self.picture_ready(stored, target, generation);
+        }
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
@@ -5299,6 +5333,24 @@ mod tests {
         app.toggle_format(0);
         assert!(!app.find(t).unwrap().style.bold);
         assert_eq!(app.find(t).unwrap().text_box().unwrap(), before);
+    }
+
+    #[test]
+    fn a_dropped_picture_fits_the_sheet_and_stays_on_it() {
+        let mut app = app();
+        // A tall image dropped near the bottom-right corner.
+        app.picture_ready(Ok(("ab.png".into(), "Photo".into(), vec2(600.0, 2400.0))), Some((0, pos2(590.0, 790.0))), app.generation);
+        let a = app.annots.last().unwrap();
+        let Kind::Image { rect, name, .. } = &a.kind else { panic!() };
+        assert_eq!(name, "Photo");
+        assert!(rect.height() <= 800.0 * 0.6 + 0.01, "{rect:?}");
+        assert!(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)).contains_rect(*rect), "{rect:?}");
+        assert!((rect.width() / rect.height() - 0.25).abs() < 1e-3);
+        // A late one for a document no longer shown is let go.
+        let n = app.annots.len();
+        app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), app.generation + 1);
+        assert_eq!(app.annots.len(), n);
+        assert!(app.placing.is_none());
     }
 
     #[test]
