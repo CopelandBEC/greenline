@@ -158,6 +158,7 @@ struct Mods {
     shift: bool,
 }
 
+/// A stored image (stored name, file name, pixels) or why not, where it was dropped, and the placing epoch it began in.
 type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
 
 /// Page sizes offered for a new document: name and portrait size in points.
@@ -288,6 +289,8 @@ pub struct App {
     pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
     /// Images waiting to be placed after the one being placed now.
     queued_pictures: std::collections::VecDeque<Place>,
+    /// Bumped when placing is cancelled, so images still being stored are let go.
+    picture_epoch: u64,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -431,6 +434,7 @@ impl App {
             new_doc: None,
             pictures: mpsc::channel(),
             queued_pictures: Default::default(),
+            picture_epoch: 0,
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -511,6 +515,7 @@ impl App {
         self.drag = Drag::None;
         self.placing = None;
         self.queued_pictures.clear();
+        self.picture_epoch += 1;
         self.annots = Vec::new();
         self.scales = Vec::new();
         self.accepted = Vec::new();
@@ -723,24 +728,29 @@ impl App {
     fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
         // Where it was dropped, fixed now: the view may move before it's ready.
         let target = at.filter(|_| !self.overview).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
+        // Placing starts in Select now; changing tool or Esc before it's ready cancels it.
+        if self.tool != Tool::Select {
+            self.set_tool(Tool::Select);
+        }
         let (tx, src) = (self.pictures.0.clone(), src.to_path_buf());
-        let generation = self.generation;
+        let epoch = self.picture_epoch;
         std::thread::spawn(move || {
-            tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, generation)).ok();
+            tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, epoch)).ok();
         });
         self.toast("Adding the image…".into());
     }
 
     /// An image stored by `place_picture`: placed where it was dropped, or
     /// ready to place with the next click.
-    fn picture_ready(&mut self, stored: Result<(String, String, Vec2), String>, target: Option<(usize, Pos2)>, generation: u64) {
+    fn picture_ready(&mut self, stored: Result<(String, String, Vec2), String>, target: Option<(usize, Pos2)>, epoch: u64) {
+        // Cancelled since (Esc, another tool, another document): let it go.
+        if epoch != self.picture_epoch || self.pages.is_empty() {
+            return;
+        }
         let (image, name, px) = match stored {
             Ok(r) => r,
             Err(e) => return self.toast(format!("Could not add the image: {e}")),
         };
-        if generation != self.generation || self.pages.is_empty() {
-            return;
-        }
         let aspect = px.x / px.y.max(1.0);
         // As if at 150 dpi, but within 60% of the page either way.
         let page = target.map_or(self.current_page(), |t| t.0).min(self.pages.len() - 1);
@@ -752,7 +762,6 @@ impl App {
             self.queued_pictures.push_back(place);
             return;
         }
-        self.set_tool(Tool::Select);
         self.start_placing(place);
         if let Some((page, p)) = target {
             // Centred on the drop, kept on the sheet.
@@ -1627,6 +1636,7 @@ impl App {
         }
         self.placing = None;
         self.queued_pictures.clear();
+        self.picture_epoch += 1;
         self.tool = t;
         if t != Tool::Select {
             self.selected.clear();
@@ -1951,6 +1961,7 @@ impl App {
             // An open find bar goes first: its highlights are what's on top.
             self.close_find();
         } else if self.placing.take().is_some() {
+            self.picture_epoch += 1;
             let more = std::mem::take(&mut self.queued_pictures).len();
             self.toast(if more > 0 { format!("Placing cancelled (and {more} more)") } else { "Placing cancelled".into() });
         } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
@@ -5359,7 +5370,7 @@ mod tests {
     fn a_dropped_picture_fits_the_sheet_and_stays_on_it() {
         let mut app = app();
         // A tall image dropped near the bottom-right corner.
-        app.picture_ready(Ok(("ab.png".into(), "Photo".into(), vec2(600.0, 2400.0))), Some((0, pos2(590.0, 790.0))), app.generation);
+        app.picture_ready(Ok(("ab.png".into(), "Photo".into(), vec2(600.0, 2400.0))), Some((0, pos2(590.0, 790.0))), app.picture_epoch);
         let a = app.annots.last().unwrap();
         let Kind::Image { rect, name, .. } = &a.kind else { panic!() };
         assert_eq!(name, "Photo");
@@ -5367,20 +5378,22 @@ mod tests {
         assert!(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)).contains_rect(*rect), "{rect:?}");
         assert!((rect.width() / rect.height() - 0.25).abs() < 1e-3);
         // Two without a spot: placed one after the other.
-        app.picture_ready(Ok(("e1.png".into(), "One".into(), vec2(100.0, 100.0))), None, app.generation);
-        app.picture_ready(Ok(("e2.png".into(), "Two".into(), vec2(100.0, 100.0))), None, app.generation);
+        app.picture_ready(Ok(("e1.png".into(), "One".into(), vec2(100.0, 100.0))), None, app.picture_epoch);
+        app.picture_ready(Ok(("e2.png".into(), "Two".into(), vec2(100.0, 100.0))), None, app.picture_epoch);
         assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "One"));
         app.click(pos2(200.0, 200.0), false, PLAIN);
         assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "Two"));
         app.click(pos2(300.0, 300.0), false, PLAIN);
         assert!(app.placing.is_none());
         // A very narrow, tall one still fits.
-        app.picture_ready(Ok(("f.png".into(), "Tall".into(), vec2(60.0, 2400.0))), Some((0, pos2(300.0, 400.0))), app.generation);
+        app.picture_ready(Ok(("f.png".into(), "Tall".into(), vec2(60.0, 2400.0))), Some((0, pos2(300.0, 400.0))), app.picture_epoch);
         let Kind::Image { rect, .. } = &app.annots.last().unwrap().kind else { panic!() };
         assert!(rect.height() <= 480.01, "{rect:?}");
-        // A late one for a document no longer shown is let go.
+        // One still being stored when placing was cancelled is let go.
         let n = app.annots.len();
-        app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), app.generation + 1);
+        let started = app.picture_epoch;
+        app.set_tool(Tool::Rect);
+        app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), started);
         assert_eq!(app.annots.len(), n);
         assert!(app.placing.is_none());
     }
