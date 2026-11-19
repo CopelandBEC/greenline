@@ -92,8 +92,11 @@ pub enum Prim {
     Text { origin: Pos2, text: String, size: f32, color: Rgb },
     /// Library image stretched over `rect` (it keeps its aspect when resized).
     Image { rect: Rect, image: String },
-    /// Many separate segments of one width and colour (a hatch); a zero-length one is a dot.
-    Segments { segs: Arc<Vec<[Pos2; 2]>>, width: f32, color: Rgb },
+    /// Many separate segments of one width and colour (a hatch), placed at
+    /// `offset`; a zero-length one is a dot. `tile` is the pattern's repeat:
+    /// when that's too small to make out on screen, the screen shows a tint
+    /// of `tint` (the outline, with an opacity for the ink) instead.
+    Segments { segs: Arc<Vec<[Pos2; 2]>>, offset: Vec2, width: f32, color: Rgb, tile: f32, tint: Option<(Arc<Vec<Pos2>>, u8)> },
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
@@ -293,6 +296,14 @@ impl Annot {
     }
 
     pub fn bounds(&self) -> Rect {
+        let b = self.shape_bounds();
+        match self.style.line.as_deref().filter(|_| self.takes_line_type()) {
+            Some(lt) => b.expand(lt.reach(self.width)),
+            None => b,
+        }
+    }
+
+    fn shape_bounds(&self) -> Rect {
         let w = self.width.max(1.0);
         match &self.kind {
             // The leaders lie between box, anchor and extra tips; each arrowhead spreads up to arrow_len around its tip.
@@ -594,8 +605,16 @@ impl Annot {
 
     fn hatch_prims(&self, out: &mut Vec<Prim>, pts: &[Pos2]) {
         if let Some(h) = self.style.hatch.as_ref().filter(|_| self.hatchable()) {
-            for (width, segs) in crate::patterns::cached_hatch(pts, &h.pattern, h.scale).iter() {
-                out.push(Prim::Segments { segs: segs.clone(), width: *width, color: self.color });
+            let (groups, offset) = crate::patterns::cached_hatch(pts, &h.pattern, h.scale);
+            let tile = h.pattern.tile.min_elem() * h.scale;
+            // Ink per tile, for the tint shown when zoomed out too far to see the lines.
+            let t = h.pattern.tile * h.scale;
+            let ink: f32 = h.pattern.lines.iter().map(|[a, b]| (vec2((b.x - a.x) * t.x, (b.y - a.y) * t.y)).length() * h.pattern.line_width).sum::<f32>()
+                + h.pattern.dots.iter().map(|(_, d)| d * d).sum::<f32>();
+            let alpha = (ink / (t.x * t.y).max(1.0) * 255.0).clamp(20.0, 160.0) as u8;
+            let mut tint = Some((Arc::new(pts.to_vec()), alpha));
+            for (width, segs) in groups.iter() {
+                out.push(Prim::Segments { segs: segs.clone(), offset, width: *width, color: self.color, tile, tint: tint.take() });
             }
         }
     }
@@ -936,6 +955,21 @@ mod tests {
         assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
         assert_eq!(a.bounds(), Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)));
         assert_eq!(a.label(), "NC seal");
+    }
+
+    #[test]
+    fn a_line_types_symbols_count_in_the_bounds() {
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Line { a: pos2(0.0, 100.0), b: pos2(200.0, 100.0) } };
+        let plain = a.bounds();
+        let symbol = crate::patterns::Comp::Symbol { left: 5.0, right: 5.0, stretch: 1.0, fill: false, paths: vec![vec![pos2(0.0, -20.0), pos2(0.0, 20.0)]] };
+        a.style.line = Some(Arc::new(crate::patterns::LineType { name: "tall".into(), scale_with_width: false, lines: vec![crate::patterns::LinePattern { offset: 0.0, comps: vec![symbol] }] }));
+        let b = a.bounds();
+        assert!(b.min.y <= 80.0 && b.max.y >= 120.0 && plain.height() < b.height(), "{plain:?} {b:?}");
+        for p in a.prims() {
+            if let Prim::Stroke { pts, .. } = p {
+                assert!(pts.iter().all(|q| b.contains(*q)));
+            }
+        }
     }
 
     #[test]

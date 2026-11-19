@@ -20,6 +20,28 @@ pub struct LineType {
     pub lines: Vec<LinePattern>,
 }
 
+impl LineType {
+    /// How far the pattern can reach to either side of the path at width `w`
+    /// (offset lines and symbols), beyond half the stroke.
+    pub fn reach(&self, w: f32) -> f32 {
+        let unit = if self.scale_with_width { w } else { 1.0 };
+        let mut r = 0.0f32;
+        for l in &self.lines {
+            let mut side = 0.0f32;
+            for c in &l.comps {
+                if let Comp::Symbol { left, right, stretch, paths, .. } = c {
+                    side = side.max((left + right) * stretch);
+                    for p in paths.iter().flatten() {
+                        side = side.max(p.y.abs()).max(p.x.abs() * stretch);
+                    }
+                }
+            }
+            r = r.max(l.offset.abs() + side);
+        }
+        r * unit
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinePattern {
     /// Distance to the side of the path (positive: right of the direction drawn).
@@ -438,11 +460,9 @@ fn at(path: &[Pos2], cum: &[f32], s: f32) -> (Pos2, Vec2) {
 /// The part of `path` between arc lengths `s0` and `s1`.
 fn sub_path(path: &[Pos2], cum: &[f32], s0: f32, s1: f32) -> Vec<Pos2> {
     let mut v = vec![at(path, cum, s0).0];
-    for (i, c) in cum.iter().enumerate() {
-        if *c > s0 && *c < s1 {
-            v.push(path[i]);
-        }
-    }
+    // The corners strictly between s0 and s1 (cum is sorted).
+    let (i0, i1) = (cum.partition_point(|&c| c <= s0), cum.partition_point(|&c| c < s1));
+    v.extend_from_slice(&path[i0..i1.max(i0)]);
     v.push(at(path, cum, s1).0);
     v
 }
@@ -507,27 +527,49 @@ fn walk(out: &mut Vec<Prim>, path: &[Pos2], line: &LinePattern, unit: f32, w: f3
     }
 }
 
-/// `hatch_segments`, remembered (per thread) by outline, pattern and scale:
-/// clipping a big hatch every frame would slow painting.
-pub fn cached_hatch(outline: &[Pos2], h: &Hatch, scale: f32) -> Arc<HatchSegs> {
+/// `hatch_segments` for `outline`, remembered (per thread) by its shape relative
+/// to its top-left, the pattern and the scale: clipping a big hatch every frame
+/// would slow painting, and moving a hatched markup reuses its hatch. Returns
+/// the segments relative to the top-left, and that top-left.
+pub fn cached_hatch(outline: &[Pos2], h: &Hatch, scale: f32) -> (Arc<HatchSegs>, Vec2) {
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {
-        static CACHE: RefCell<HashMap<u64, Arc<HatchSegs>>> = RefCell::new(HashMap::new());
+        // Key → (segments, how many points they hold, last use).
+        static CACHE: RefCell<(HashMap<u64, (Arc<HatchSegs>, usize, u64)>, u64)> = RefCell::new((HashMap::new(), 0));
     }
-    let mut bytes: Vec<u8> = outline.iter().flat_map(|p| [p.x.to_bits().to_le_bytes(), p.y.to_bits().to_le_bytes()]).flatten().collect();
+    let origin = outline.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p))).min.to_vec2();
+    let rel: Vec<Pos2> = outline.iter().map(|p| *p - origin).collect();
+    let mut bytes: Vec<u8> = rel.iter().flat_map(|p| [p.x.to_bits().to_le_bytes(), p.y.to_bits().to_le_bytes()]).flatten().collect();
     bytes.extend(scale.to_bits().to_le_bytes());
     // The pattern by content, so an edited library file with the same name isn't confused with the old one.
     bytes.extend(serde_json::to_vec(h).unwrap_or_default());
     let key = crate::sidecar::fnv(&bytes);
-    CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() > 500 {
-            c.clear();
+    let segs = CACHE.with(|c| {
+        let (map, clock) = &mut *c.borrow_mut();
+        *clock += 1;
+        if let Some(e) = map.get_mut(&key) {
+            e.2 = *clock;
+            return e.0.clone();
         }
-        c.entry(key).or_insert_with(|| Arc::new(hatch_segments(outline, h, scale))).clone()
-    })
+        let segs = Arc::new(hatch_segments(&rel, h, scale));
+        let size: usize = segs.iter().map(|(_, s)| s.len()).sum();
+        // Keep about 4 million segments: drop the least recently used beyond that.
+        let mut total: usize = map.values().map(|e| e.1).sum::<usize>() + size;
+        while total > 4_000_000 || map.len() >= 2000 {
+            let Some((&old, e)) = map.iter().min_by_key(|(_, e)| e.2) else { break };
+            total -= e.1;
+            map.remove(&old);
+        }
+        map.insert(key, (segs.clone(), size, *clock));
+        segs
+    });
+    (segs, origin)
 }
+
+/// The most hatch elements one markup draws: past this the pattern is too
+/// dense for its size and is left out (the picker says so) rather than coarsened.
+pub const MAX_HATCH: f32 = 1_500_000.0;
 
 /// A clipped hatch: batches of segments by stroke width (lines, then each dot size).
 pub type HatchSegs = Vec<(f32, Arc<Vec<[Pos2; 2]>>)>;
@@ -540,10 +582,9 @@ pub fn hatch_segments(outline: &[Pos2], h: &Hatch, scale: f32) -> HatchSegs {
         return Vec::new();
     }
     let mut groups: Vec<(f32, Vec<[Pos2; 2]>)> = vec![(h.line_width, Vec::new())];
-    let mut tile = h.tile * scale.max(0.01);
-    // Keep the work bounded on a huge outline with a tiny tile.
-    while (bounds.width() / tile.x).ceil() * (bounds.height() / tile.y).ceil() * (h.lines.len() + h.dots.len()).max(1) as f32 > 60_000.0 {
-        tile *= 2.0;
+    let tile = h.tile * scale.max(0.01);
+    if too_dense(bounds, h, scale) {
+        return Vec::new();
     }
     let edges: Vec<(Pos2, Pos2)> = (0..outline.len()).map(|i| (outline[i], outline[(i + 1) % outline.len()])).collect();
     let (nx, ny) = ((bounds.width() / tile.x).ceil() as i32, (bounds.height() / tile.y).ceil() as i32);
@@ -570,6 +611,12 @@ pub fn hatch_segments(outline: &[Pos2], h: &Hatch, scale: f32) -> HatchSegs {
         }
     }
     groups.into_iter().filter(|(_, s)| !s.is_empty()).map(|(w, s)| (w, Arc::new(s))).collect()
+}
+
+/// Whether hatching `bounds` with `h` at `scale` would take more than `MAX_HATCH` elements.
+pub fn too_dense(bounds: Rect, h: &Hatch, scale: f32) -> bool {
+    let tile = h.tile * scale.max(0.01);
+    (bounds.width() / tile.x + 2.0) * (bounds.height() / tile.y + 2.0) * (h.lines.len() + h.dots.len()).max(1) as f32 > MAX_HATCH
 }
 
 /// Pushes the parts of segment `a`–`b` inside the polygon.
@@ -710,6 +757,35 @@ mod tests {
         assert_eq!(out.len(), 20);
         let Prim::Stroke { pts, .. } = &out[0] else { panic!() };
         assert!((pts[0] - pos2(5.5 - 8.8, -8.0)).length() < 1e-3, "{pts:?}");
+    }
+
+    #[test]
+    fn moved_outlines_reuse_their_hatch_and_dense_ones_are_left_out() {
+        let sq = |x: f32| [pos2(x, 0.0), pos2(x + 100.0, 0.0), pos2(x + 100.0, 100.0), pos2(x, 100.0)];
+        let h = &builtin_hatches()[0];
+        let (a, oa) = cached_hatch(&sq(0.0), h, 1.0);
+        let (b, ob) = cached_hatch(&sq(50.0), h, 1.0);
+        assert!(Arc::ptr_eq(&a, &b), "same shape elsewhere: same segments");
+        assert_eq!(ob - oa, vec2(50.0, 0.0));
+        // Exact spacing or nothing: a sheet-sized outline at a tiny scale isn't coarsened.
+        let huge = [pos2(0.0, 0.0), pos2(3000.0, 0.0), pos2(3000.0, 3000.0), pos2(0.0, 3000.0)];
+        assert!(too_dense(Rect::from_min_max(huge[0], huge[2]), h, 0.1));
+        assert!(hatch_segments(&huge, h, 0.1).is_empty());
+        assert!(!hatch_segments(&huge, h, 1.0).is_empty());
+    }
+
+    #[test]
+    fn long_dashed_paths_stay_quick_and_symbols_widen_the_reach() {
+        let lt = &builtin_line_types()[0];
+        let pts: Vec<Pos2> = (0..20_000).map(|i| pos2(i as f32 * 0.5, (i % 2) as f32)).collect();
+        let t = std::time::Instant::now();
+        let mut out = Vec::new();
+        pattern_prims(&mut out, &pts, false, lt, 1.0, [0; 3]);
+        assert!(out.len() > 1000);
+        assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
+        let lts = parse_blx(BLX).unwrap();
+        assert_eq!(lt.reach(2.0), 0.0, "plain dashes stay on the line");
+        assert!((lts[1].reach(1.0) - 11.0).abs() < 1e-3, "rigid insulation: {}", lts[1].reach(1.0));
     }
 
     #[test]

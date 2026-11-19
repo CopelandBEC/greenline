@@ -384,12 +384,12 @@ fn emit_prims<'a>(
     let k = m.u.length();
     for prim in prims {
         match prim {
-            Prim::Segments { segs, width, color: c } if !segs.is_empty() => {
+            Prim::Segments { segs, offset, width, color: c, .. } if !segs.is_empty() => {
                 // One path object for the whole hatch: far smaller than one per segment.
-                let first = m.map(segs[0][0]);
+                let first = m.map(segs[0][0] + offset);
                 let mut obj = PdfPagePathObject::new(doc, PdfPoints::new(first.x), PdfPoints::new(first.y), Some(color(c, 255)), Some(PdfPoints::new(width * k)), None)?;
                 for (i, [a, b]) in segs.iter().enumerate() {
-                    let (a, b) = (m.map(*a), m.map(*b));
+                    let (a, b) = (m.map(*a + offset), m.map(*b + offset));
                     if i > 0 {
                         obj.move_to(PdfPoints::new(a.x), PdfPoints::new(a.y))?;
                     }

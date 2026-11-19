@@ -246,6 +246,8 @@ pub struct App {
     fill_alpha: u8,
     /// The opacity slider's value during a drag (percent), applied on release.
     fill_pending: Option<f32>,
+    /// The hatch scale being dragged, applied on release.
+    hatch_scale_pending: Option<f32>,
     /// Line type per tool (absent or `None`: solid).
     tool_line: HashMap<Tool, Arc<LineType>>,
     /// Hatch per tool (absent: none).
@@ -372,6 +374,7 @@ impl App {
             tool_fill: HashMap::new(),
             fill_alpha: 128,
             fill_pending: None,
+            hatch_scale_pending: None,
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
             patterns: patterns::Library::default(),
@@ -3084,13 +3087,25 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Hatch");
             if let Some(h) = &shown {
-                let mut s = h.scale;
+                // Shows the value being dragged; applied on release, as one undo step.
+                let mut s = self.hatch_scale_pending.unwrap_or(h.scale);
                 let r = ui.add(egui::DragValue::new(&mut s).range(0.1..=20.0).speed(0.02).prefix("Scale ").suffix("×"));
+                if r.changed() {
+                    self.hatch_scale_pending = Some(s);
+                }
                 if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    self.set_hatch(Some(HatchFill { pattern: h.pattern.clone(), scale: s }));
+                    if let Some(s) = self.hatch_scale_pending.take() {
+                        self.set_hatch(Some(HatchFill { pattern: h.pattern.clone(), scale: s }));
+                    }
                 }
             }
         });
+        let dense = self.selected.iter().filter_map(|&id| self.find(id)).any(|a| {
+            a.hatchable() && a.style.hatch.as_ref().is_some_and(|h| patterns::too_dense(a.bounds(), &h.pattern, h.scale))
+        });
+        if dense {
+            ui.colored_label(ui.visuals().warn_fg_color, "Too fine for a shape this big: raise the scale");
+        }
         let mut pick: Option<Option<Arc<Hatch>>> = None;
         egui::ScrollArea::vertical().id_salt("hatches").max_height(260.0).show(ui, |ui| {
             if ui.selectable_label(shown.is_none(), "None").clicked() {
@@ -4021,14 +4036,35 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                 // A dot in a dotted line.
                 painter.circle_filled(to(pts[0]), (width * z / 2.0).max(min_w / 2.0), col(*color, 255));
             }
-            Prim::Segments { segs, width, color } => {
+            Prim::Segments { segs, offset, width, color, tile, tint } => {
+                // A hatch too fine to make out at this zoom: a tint of its ink instead
+                // (also far cheaper than thousands of sub-pixel lines).
+                if tile * z < 4.0 {
+                    if let Some((outline, alpha)) = tint {
+                        let pts = map(outline);
+                        let c = col(*color, *alpha);
+                        if convex(&pts) {
+                            painter.add(Shape::convex_polygon(pts, c, Stroke::NONE));
+                        } else if let Some(tris) = cached_triangles(outline) {
+                            let mut mesh = egui::Mesh::default();
+                            for p in &pts {
+                                mesh.colored_vertex(*p, c);
+                            }
+                            for [a, b, c] in tris.iter() {
+                                mesh.add_triangle(*a as u32, *b as u32, *c as u32);
+                            }
+                            painter.add(Shape::mesh(mesh));
+                        }
+                    }
+                    continue;
+                }
                 let w = (width * z).max(0.6);
-                // A hatch too fine to make out on screen is drawn as a light tint instead.
-                let c = col(*color, if width * z < 0.25 { 110 } else { 255 });
+                let c = col(*color, 255);
                 let s = Stroke::new(w, c);
                 let view = painter.clip_rect();
+                let o = to(Pos2::ZERO + *offset);
                 for [a, b] in segs.iter() {
-                    let (a, b) = (to(*a), to(*b));
+                    let (a, b) = (o + a.to_vec2() * z, o + b.to_vec2() * z);
                     if !view.intersects(Rect::from_two_pos(a, b).expand(w)) {
                         continue;
                     }
@@ -4119,10 +4155,8 @@ fn paint_hatch_sample(p: &Painter, r: Rect, h: &Hatch, images: &HashMap<String, 
     // Show about two tiles across.
     let z = r.width() / (2.0 * h.tile.x.max(1.0));
     let outline = annot::rect_pts(Rect::from_min_size(Pos2::ZERO, r.size() / z));
-    let prims: Vec<Prim> = patterns::cached_hatch(&outline, h, 1.0)
-        .iter()
-        .map(|(w, segs)| Prim::Segments { segs: segs.clone(), width: *w, color: [40, 40, 40] })
-        .collect();
+    let (groups, offset) = patterns::cached_hatch(&outline, h, 1.0);
+    let prims: Vec<Prim> = groups.iter().map(|(w, segs)| Prim::Segments { segs: segs.clone(), offset, width: *w, color: [40, 40, 40], tile: f32::INFINITY, tint: None }).collect();
     paint_prims(&p.with_clip_rect(r), r.min, z, &prims, (1.0, 0.0), 1.0, images);
     p.rect_stroke(r, 2.0, Stroke::new(1.0, Color32::from_gray(160)), egui::StrokeKind::Inside);
 }
