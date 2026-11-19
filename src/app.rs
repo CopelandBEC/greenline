@@ -2074,7 +2074,7 @@ impl App {
             if pressed(Key::N) {
                 self.new_doc.get_or_insert_with(NewDoc::default);
             }
-            if pressed(Key::W) && self.path.is_some() {
+            if pressed(Key::W) && (self.path.is_some() || self.tabs.len() > 1) {
                 self.close_tab(self.cur_tab);
             }
             let n = self.tabs.len();
@@ -4675,12 +4675,11 @@ impl eframe::App for App {
         if !dropped.is_empty() {
             let at = ctx.input(|i| i.pointer.hover_pos());
             for p in dropped {
-                // An image dropped on a sheet is placed there; a PDF opens.
+                // An image dropped on a sheet is placed there; each PDF opens in a tab.
                 if stamps::is_picture(&p) && !self.pages.is_empty() {
                     self.place_picture(&p, at);
                 } else {
                     self.open(p);
-                    break;
                 }
             }
         }
