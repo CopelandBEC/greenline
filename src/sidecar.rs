@@ -132,31 +132,6 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
     }
 }
 
-/// A new blank PDF is about to be written at `pdf` (whose lock the caller
-/// holds): markups saved for a document that used to be there no longer apply,
-/// so they're renamed aside (`<file>.replaced-<unix time>`, recoverable) rather
-/// than loaded onto it. Returns the renames, to undo if writing fails.
-pub fn retire(pdf: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let mut done = Vec::new();
-    let f = file_for(pdf);
-    if f.exists() {
-        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let to = f.with_file_name(format!("{name}.replaced-{stamp}"));
-        std::fs::rename(&f, &to)?;
-        done.push((f, to));
-    }
-    done.extend(crate::proposals::retire(pdf, &format!("replaced-{stamp}"))?);
-    Ok(done)
-}
-
-/// Puts back what `retire` set aside.
-pub fn unretire(done: &[(PathBuf, PathBuf)]) {
-    for (from, to) in done {
-        let _ = std::fs::rename(to, from);
-    }
-}
-
 /// Writes the markups file `f` for `pdf`.
 pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale], accepted: &[String]) -> anyhow::Result<()> {
     if let Some(d) = f.parent() {

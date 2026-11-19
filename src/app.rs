@@ -285,8 +285,8 @@ pub struct App {
     find: Find,
     /// The New document window, while open.
     new_doc: Option<NewDoc>,
-    /// A blank PDF being written: its path, the markups lock held for it, and old markups set aside.
-    creating: Option<(PathBuf, std::fs::File, Vec<(PathBuf, PathBuf)>)>,
+    /// A blank PDF being written: its path and the markups lock held for it.
+    creating: Option<(PathBuf, std::fs::File)>,
     /// Images being stored for placing: (stored name, file name, pixels) or an error, the drop target, the document then.
     pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
     /// Images waiting to be placed after the one being placed now.
@@ -708,8 +708,9 @@ impl App {
                     let real = path.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(path.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| path.clone());
                     if self.path.as_ref().is_some_and(|p| *p == real || dunce::canonicalize(&path).is_ok_and(|o| o == *p)) {
                         self.toast("Refusing to overwrite the open PDF: choose another name".into());
-                    } else if !has_ext && path.exists() {
-                        self.toast(format!("{} already exists: choose another name", path.display()));
+                    } else if path.exists() || sidecar::file_for(&real).exists() || proposals::file_for(&real).exists() {
+                        // New makes a new file: never one over a document (or its saved markups).
+                        self.toast(format!("{} already exists or has saved markups: New needs a new name", path.display()));
                     } else {
                         self.create_blank(path, real, size, pages);
                     }
@@ -732,23 +733,18 @@ impl App {
 
     /// Stores a photo or sketch and places it: at `at` (screen) when dropped on
     /// a sheet, otherwise with the next click (or drag to size).
-    /// Writes a new blank PDF at `path` (`real`: its canonical form). The path's
-    /// markups lock is taken first and held until it opens, and markups left
-    /// from a document that used to be there are set aside, never loaded onto it.
+    /// Writes a new blank PDF at `path` (`real`: its canonical form; nothing is
+    /// there yet). The path's markups lock is taken first and held until it opens.
     fn create_blank(&mut self, path: PathBuf, real: PathBuf, size: Vec2, pages: usize) {
         if self.creating.is_some() || self.worker.is_none() {
             return;
         }
         let lock = match sidecar::lock(&real) {
             Ok(Some(l)) => l,
-            Ok(None) => return self.toast("A document at that path is open in another Greenline window: choose another name".into()),
+            Ok(None) => return self.toast("That path is open in another Greenline window: choose another name".into()),
             Err(e) => return self.toast(format!("Could not lock that path's markups: {e}")),
         };
-        let retired = match sidecar::retire(&real) {
-            Ok(r) => r,
-            Err(e) => return self.toast(format!("Old markups for that path couldn't be set aside ({e}): choose another name")),
-        };
-        self.creating = Some((real, lock, retired));
+        self.creating = Some((real, lock));
         if let Some(w) = &self.worker {
             w.send(Req::Create { path, size, pages });
         }
@@ -885,9 +881,7 @@ impl App {
                     self.open_with(path, lock);
                 }
                 Resp::Created(Err(e)) => {
-                    if let Some((_, _, retired)) = self.creating.take() {
-                        sidecar::unretire(&retired);
-                    }
+                    self.creating = None;
                     self.toast(format!("Could not create the document: {e}"));
                 }
                 Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {

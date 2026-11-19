@@ -233,18 +233,19 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut 
     }
 }
 
-/// Writes a PDF of `pages` blank pages of `size` points (via a temporary file,
-/// so a failed write leaves nothing half-done behind).
+/// Writes a new PDF of `pages` blank pages of `size` points. It never replaces
+/// a file: written to a temporary file, then linked into place, which fails if
+/// anything is already at `path`.
 pub fn create_blank(pdfium: &Pdfium, path: &Path, size: Vec2, pages: usize) -> anyhow::Result<()> {
     let mut doc = pdfium.create_new_pdf()?;
     for _ in 0..pages.max(1) {
         doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(size.x), PdfPoints::new(size.y)))?;
     }
     let tmp = path.with_extension(format!("pdf.{}.part", std::process::id()));
-    let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| Ok(std::fs::rename(&tmp, path)?));
-    if saved.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| {
+        std::fs::hard_link(&tmp, path).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { anyhow::anyhow!("{} already exists", path.display()) } else { e.into() })
+    });
+    let _ = std::fs::remove_file(&tmp);
     saved
 }
 
@@ -869,6 +870,8 @@ pub(crate) mod tests {
         let p = doc.pages().get(2).unwrap();
         assert_eq!((p.width().value, p.height().value), (1224.0, 792.0));
         assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "no temporary file left");
+        assert!(create_blank(pdfium, &path, vec2(612.0, 792.0), 1).unwrap_err().to_string().contains("already exists"), "never replaces a file");
+        assert_eq!(pdfium.load_pdf_from_file(&path, None).unwrap().pages().len(), 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 
