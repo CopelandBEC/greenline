@@ -21,6 +21,8 @@ const HIT_PX: f32 = 7.0;
 const SEL: Color32 = Color32::from_rgb(0, 150, 255);
 /// Outline round agents' proposed markups until they're accepted.
 const PROPOSED: Color32 = Color32::from_rgb(235, 120, 0);
+/// Search matches.
+const FOUND: Color32 = Color32::from_rgb(255, 190, 0);
 /// Thumbnail render size (physical px on the long side) and cache cap.
 const THUMB_PX: f32 = 420.0;
 const MAX_THUMBS: usize = 400;
@@ -152,6 +154,24 @@ struct Mods {
     shift: bool,
 }
 
+/// The find bar (Ctrl+F) and its results.
+#[derive(Default)]
+struct Find {
+    open: bool,
+    query: String,
+    /// Search the results belong to; bumped on every new query.
+    id: u64,
+    /// Matches in page order: page and a box per line of the match.
+    hits: Vec<(usize, Vec<Rect>)>,
+    /// Pages still to report for the current search.
+    pending: usize,
+    /// A page had more matches than were reported.
+    more: bool,
+    /// Index into `hits` of the match shown.
+    cur: Option<usize>,
+    focus: bool,
+}
+
 /// The scale window (U) and what it is in the middle of.
 #[derive(Default)]
 struct ScaleWin {
@@ -229,6 +249,9 @@ pub struct App {
     /// Measurement (or calibration line) being clicked out: its page and points so far.
     building: Option<(usize, Vec<Pos2>)>,
     scale_win: ScaleWin,
+    find: Find,
+    /// Page in view when the search started: the first match shown is at or after it.
+    find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
     shift: bool,
     next_id: u64,
@@ -364,6 +387,8 @@ impl App {
             scales: Vec::new(),
             building: None,
             scale_win: ScaleWin::default(),
+            find: Find::default(),
+            find_from: 0,
             shift: false,
             next_id: 1,
             undo: Vec::new(),
@@ -445,6 +470,9 @@ impl App {
         self.scales = Vec::new();
         self.accepted = Vec::new();
         self.building = None;
+        self.find.hits.clear();
+        self.find.cur = None;
+        self.find.pending = 0;
         self.scale_win = ScaleWin { open: self.scale_win.open, ..Default::default() };
         self.next_id = 1;
         self.lock = None;
@@ -490,6 +518,9 @@ impl App {
         }
         self.doc_h = y;
         self.fit_pending = true;
+        if self.find.open {
+            self.start_search();
+        }
         let name = self.file_name();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Greenline")));
         let n = self.annots.len();
@@ -690,6 +721,10 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
+                    self.find.more |= more;
+                    self.on_found(page, hits);
+                }
                 Resp::PageText { generation, page, text } if generation == self.generation => {
                     self.scale_win.found.insert(page, measure::find_scales(&text));
                 }
@@ -773,6 +808,162 @@ impl App {
         self.zoom = ((self.canvas.width() - 24.0) / r.width()).min((self.canvas.height() - 24.0) / r.height());
         let view = self.canvas.size() / self.zoom;
         self.offset = r.center().to_vec2() - view / 2.0;
+    }
+
+    /// Zooms so `r` (view points on `page`) fills the canvas with a margin, up to 800%.
+    fn zoom_to(&mut self, page: usize, r: Rect) {
+        let r = r.translate(self.page_doc_rect(page).min.to_vec2());
+        let margin = 60.0;
+        let z = ((self.canvas.width() - margin) / r.width().max(1.0)).min((self.canvas.height() - margin) / r.height().max(1.0));
+        self.zoom = z.clamp(0.02, 8.0);
+        self.offset = r.center().to_vec2() - self.canvas.size() / (2.0 * self.zoom);
+    }
+
+    /// Fits the view to the selected markups (on the lead's page).
+    fn zoom_to_selection(&mut self) {
+        let Some(page) = self.lead().map(|a| a.page) else {
+            self.toast("Select markups to zoom to (Z)".into());
+            return;
+        };
+        let r = self.annots.iter().filter(|a| a.page == page && self.selected.contains(&a.id)).fold(Rect::NOTHING, |r, a| r.union(a.bounds()));
+        self.zoom_to(page, r);
+    }
+
+    /// Centres the current match, zooming in only if its text would be too small to read.
+    fn show_hit(&mut self) {
+        let Some((page, rects)) = self.find.cur.and_then(|i| self.find.hits.get(i)).cloned() else { return };
+        let r = rects.iter().fold(Rect::NOTHING, |a, b| a.union(*b));
+        let readable = 14.0 / r.height().max(1.0);
+        if self.zoom < readable {
+            self.zoom = readable.min(8.0);
+        }
+        let c = self.page_doc_rect(page).min + r.center().to_vec2();
+        self.offset = c.to_vec2() - self.canvas.size() / (2.0 * self.zoom);
+    }
+
+    /// One page's matches for the current search.
+    fn on_found(&mut self, page: usize, hits: Vec<Vec<Rect>>) {
+        self.find.pending = self.find.pending.saturating_sub(1);
+        let at = self.find.hits.partition_point(|(p, _)| *p < page);
+        let n = hits.len();
+        self.find.hits.splice(at..at, hits.into_iter().map(|h| (page, h)));
+        // Keep the shown match the same one as earlier pages arrive.
+        if let Some(c) = &mut self.find.cur {
+            if *c >= at {
+                *c += n;
+            }
+        }
+        // Show the first match at or after the page in view as soon as it comes in
+        // (pages are searched from there on, wrapping round).
+        if self.find.cur.is_none() && n > 0 && page >= self.find_from {
+            self.find.cur = Some(at);
+            self.show_hit();
+        }
+        if self.find.pending == 0 && self.find.cur.is_none() && !self.find.hits.is_empty() {
+            self.find.cur = Some(0);
+            self.show_hit();
+        }
+    }
+
+    fn step_hit(&mut self, dir: i32) {
+        let n = self.find.hits.len();
+        if n == 0 {
+            return;
+        }
+        self.find.cur = Some(match self.find.cur {
+            Some(c) => (c as i32 + dir).rem_euclid(n as i32) as usize,
+            None => 0,
+        });
+        self.show_hit();
+    }
+
+    /// Starts searching every page for the find bar's text, from the page in view.
+    fn start_search(&mut self) {
+        self.find.id += 1;
+        self.find.hits.clear();
+        self.find.cur = None;
+        self.find.pending = 0;
+        self.find.more = false;
+        let q = self.find.query.trim().to_string();
+        let Some(w) = &self.worker else { return };
+        w.keep.lock().unwrap().search = self.find.id;
+        if q.chars().count() < 2 || self.pages.is_empty() {
+            return;
+        }
+        let n = self.pages.len();
+        self.find_from = self.current_page();
+        self.find.pending = n;
+        let pages = (0..n).map(|k| (self.find_from + k) % n).collect();
+        w.send(Req::Search { generation: self.generation, id: self.find.id, pages, query: q });
+    }
+
+    /// The find bar, top right of the drawing: text, match count, previous/next.
+    fn find_bar(&mut self, ctx: &egui::Context) {
+        if !self.find.open || self.pages.is_empty() || self.overview {
+            return;
+        }
+        let mut close = false;
+        egui::Area::new(egui::Id::new("greenline-find"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos2(self.canvas.max.x - 360.0, self.canvas.min.y + 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let edit = ui.add(egui::TextEdit::singleline(&mut self.find.query).hint_text("Find in document").desired_width(170.0));
+                        if self.find.focus {
+                            edit.request_focus();
+                            self.find.focus = false;
+                        }
+                        if edit.changed() {
+                            self.start_search();
+                        }
+                        let (enter, shift, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift, i.key_pressed(Key::Escape)));
+                        if edit.lost_focus() && enter {
+                            self.step_hit(if shift { -1 } else { 1 });
+                            edit.request_focus();
+                        }
+                        // F3 while typing (the shortcut handler sees it otherwise).
+                        if edit.has_focus() && ui.input(|i| i.key_pressed(Key::F3)) {
+                            self.step_hit(if shift { -1 } else { 1 });
+                        }
+                        if esc && (edit.has_focus() || edit.lost_focus()) {
+                            close = true;
+                        }
+                        let count = match (self.find.hits.len(), self.find.cur) {
+                            _ if self.find.query.trim().chars().count() < 2 => String::new(),
+                            (0, _) if self.find.pending > 0 => "…".into(),
+                            (0, _) => "No matches".into(),
+                            (n, Some(c)) => format!("{} of {n}{}", c + 1, if self.find.pending > 0 || self.find.more { "+" } else { "" }),
+                            (n, None) => format!("{n}"),
+                        };
+                        ui.add_sized([72.0, 18.0], egui::Label::new(egui::RichText::new(count).weak()));
+                        let any = !self.find.hits.is_empty();
+                        if ui.add_enabled(any, egui::Button::new("⏶")).on_hover_text("Previous (Shift+Enter, Shift+F3)").clicked() {
+                            self.step_hit(-1);
+                        }
+                        if ui.add_enabled(any, egui::Button::new("⏷")).on_hover_text("Next (Enter, F3)").clicked() {
+                            self.step_hit(1);
+                        }
+                        if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if close {
+            self.close_find();
+        }
+    }
+
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.hits.clear();
+        self.find.cur = None;
+        self.find.pending = 0;
+        self.find.id += 1;
+        if let Some(w) = &self.worker {
+            w.keep.lock().unwrap().search = self.find.id;
+        }
     }
 
     fn goto_page(&mut self, i: usize) {
@@ -1388,7 +1579,19 @@ impl App {
             if pressed(Key::Num0) {
                 self.fit_width();
             }
+            if pressed(Key::F) && !self.pages.is_empty() {
+                // Reopened with its old text: search again (closing dropped the results).
+                if !self.find.open && !self.find.query.trim().is_empty() {
+                    self.find.open = true;
+                    self.start_search();
+                }
+                self.find.open = true;
+                self.find.focus = true;
+            }
             return;
+        }
+        if pressed(Key::F3) && !self.find.hits.is_empty() {
+            self.step_hit(if shift { -1 } else { 1 });
         }
         if pressed(Key::O) && !self.pages.is_empty() {
             self.toggle_overview();
@@ -1437,19 +1640,7 @@ impl App {
             }
         }
         if pressed(Key::Escape) {
-            // Cancel any gesture in progress (the rest of it is swallowed until release).
-            if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
-                self.annots = before;
-            }
-            if self.placing.take().is_some() {
-                self.toast("Placing cancelled".into());
-            } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
-                self.set_tool(Tool::Select);
-            } else if !self.selected.is_empty() {
-                self.selected.clear()
-            } else {
-                self.set_tool(Tool::Select)
-            }
+            self.escape();
         }
         for (i, k) in COLOR_KEYS.iter().enumerate() {
             if pressed(*k) {
@@ -1473,6 +1664,9 @@ impl App {
         }
         if pressed(Key::W) {
             self.fit_width();
+        }
+        if pressed(Key::Z) {
+            self.zoom_to_selection();
         }
         if pressed(Key::F) {
             self.fit_page();
@@ -1522,6 +1716,29 @@ impl App {
         }
         if !nudging && pressed(Key::ArrowUp) {
             self.offset.y -= step;
+        }
+    }
+
+    /// Esc: cancels a gesture, then closes the find bar, drops a placement or a
+    /// scale tool, clears the selection, and finally returns to Select.
+    fn escape(&mut self) {
+        // Cancel any gesture in progress (the rest of it is swallowed until release).
+        let mut cancelled = false;
+        if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
+            self.annots = before;
+            cancelled = true;
+        }
+        if self.find.open && !cancelled && self.placing.is_none() {
+            // An open find bar goes first: its highlights are what's on top.
+            self.close_find();
+        } else if self.placing.take().is_some() {
+            self.toast("Placing cancelled".into());
+        } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
+            self.set_tool(Tool::Select);
+        } else if !self.selected.is_empty() {
+            self.selected.clear()
+        } else {
+            self.set_tool(Tool::Select)
         }
     }
 
@@ -2803,6 +3020,20 @@ impl App {
                     pp.rect_stroke(Rect::from_min_max(self.page_to_screen(i, b.min), self.page_to_screen(i, b.max)), 0.0, Stroke::new(1.0, SEL), egui::StrokeKind::Outside);
                 }
             }
+            // Search matches: a soft wash on each, the current one outlined.
+            if self.find.open {
+                let cur = self.find.cur.and_then(|c| self.find.hits.get(c)).map(|h| h as *const _);
+                for h in self.find.hits.iter().filter(|(p, _)| *p == i) {
+                    let current = cur == Some(h as *const _);
+                    for r in &h.1 {
+                        let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(1.5);
+                        pp.rect_filled(r, 2.0, FOUND.gamma_multiply(if current { 0.45 } else { 0.25 }));
+                        if current {
+                            pp.rect_stroke(r, 2.0, Stroke::new(2.0, FOUND), egui::StrokeKind::Outside);
+                        }
+                    }
+                }
+            }
             // Selection, plus what a marquee in progress would add.
             let marquee = match &self.drag {
                 Drag::Marquee { page, start, cur } if *page == i => Some(Rect::from_two_pos(*start, *cur)),
@@ -3209,6 +3440,10 @@ impl App {
                                 }
                                 if ui.button("Actual size").clicked() {
                                     self.set_zoom(1.0, self.canvas.center());
+                                    ui.close();
+                                }
+                                if ui.add_enabled(!self.selected.is_empty(), egui::Button::new("Zoom to selection   (Z)")).clicked() {
+                                    self.zoom_to_selection();
                                     ui.close();
                                 }
                                 ui.separator();
@@ -3775,6 +4010,8 @@ impl App {
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
+                    ("Z", "Zoom to the selected markups"),
+                    ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
                     ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
                     ("Arrows with a selection", "Nudge it 1 pixel at the current zoom (Shift: 10)"),
@@ -3902,6 +4139,7 @@ impl eframe::App for App {
         self.text_editor(&ctx);
         self.scale_window(&ctx);
         self.goto_overlay(&ctx);
+        self.find_bar(&ctx);
         self.help(&ctx);
         self.request_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
@@ -4727,6 +4965,58 @@ mod tests {
         app.set_tool(Tool::Arrow);
         let ar = app.add(0, Kind::Arrow { a: pos2(0.0, 0.0), b: pos2(50.0, 0.0) });
         assert!(app.find(ar).unwrap().style.line.is_none(), "per tool");
+    }
+
+    #[test]
+    fn search_results_arrive_in_any_order_and_step_round() {
+        let mut app = app();
+        app.pages = vec![vec2(600.0, 800.0); 3];
+        app.page_y = vec![0.0, 812.0, 1624.0];
+        app.find.pending = 3;
+        app.find_from = 1;
+        let r = |y: f32| vec![Rect::from_min_size(pos2(100.0, y), vec2(40.0, 10.0))];
+        // Searched from page 2 (index 1) on: its match is shown first.
+        app.on_found(1, vec![r(100.0), r(300.0)]);
+        assert_eq!(app.find.cur, Some(0));
+        assert!(app.zoom >= 1.4 - 1e-3, "zoomed in to read 10 pt text");
+        app.on_found(2, vec![]);
+        app.on_found(0, vec![r(50.0)]);
+        assert_eq!(app.find.hits.iter().map(|h| h.0).collect::<Vec<_>>(), vec![0, 1, 1]);
+        assert_eq!(app.find.cur, Some(1), "still the same match after page 1's arrived");
+        app.step_hit(1);
+        app.step_hit(1);
+        assert_eq!(app.find.cur, Some(0), "wraps round");
+        app.step_hit(-1);
+        assert_eq!(app.find.cur, Some(2));
+        let y = app.offset.y + app.canvas.height() / (2.0 * app.zoom);
+        assert!((y - (812.0 + 305.0)).abs() < 1.0, "centred on it: {y}");
+    }
+
+    #[test]
+    fn esc_closes_the_find_bar_before_anything_else() {
+        let mut app = app();
+        let a = rect(&mut app, 100.0, 100.0);
+        app.selected = vec![a];
+        app.find.open = true;
+        app.find.hits = vec![(0, vec![Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0))])];
+        app.escape();
+        assert!(!app.find.open && app.find.hits.is_empty());
+        assert_eq!(app.selected, vec![a], "the selection stays for the next Esc");
+        app.escape();
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn z_zooms_to_the_selection() {
+        let mut app = app();
+        let a = rect(&mut app, 100.0, 100.0);
+        let b = rect(&mut app, 300.0, 100.0);
+        app.selected = vec![a, b];
+        app.zoom_to_selection();
+        let r = app.annots.iter().fold(Rect::NOTHING, |r, x| r.union(x.bounds()));
+        let (tl, br) = (app.page_to_screen(0, r.min), app.page_to_screen(0, r.max));
+        assert!(app.canvas.contains(tl) && app.canvas.contains(br));
+        assert!((br.x - tl.x) > app.canvas.width() - 80.0, "fills the width");
     }
 
     #[test]

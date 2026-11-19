@@ -22,6 +22,8 @@ pub enum Layer {
 pub struct Keep {
     pub base: HashSet<usize>,
     pub thumbs: HashSet<usize>,
+    /// The search still wanted; page searches for older ones are dropped.
+    pub search: u64,
 }
 
 pub enum Req {
@@ -31,6 +33,9 @@ pub enum Req {
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
+    /// Find `query` on `pages` in turn, for search `id`. The worker searches one
+    /// page per turn and queues the rest behind other work, so renders stay live.
+    Search { generation: u64, id: u64, pages: VecDeque<usize>, query: String },
 }
 
 pub enum Resp {
@@ -41,6 +46,9 @@ pub enum Resp {
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
     PageText { generation: u64, page: usize, text: String },
+    /// Matches on one page for search `id`: per match, a box per line it spans;
+    /// `more` when the page had more than were reported.
+    Found { generation: u64, id: u64, page: usize, hits: Vec<Vec<egui::Rect>>, more: bool },
 }
 
 pub struct Worker {
@@ -108,6 +116,8 @@ fn run(
 ) {
     let mut doc: Option<(u64, PdfDocument)> = None;
     let mut queue: VecDeque<Req> = VecDeque::new();
+    // Thumbnails and a search take turns.
+    let mut thumb_turn = false;
     loop {
         if queue.is_empty() {
             match rx.recv() {
@@ -118,7 +128,7 @@ fn run(
         while let Ok(r) = rx.try_recv() {
             queue.push_back(r);
         }
-        let Some(req) = next_request(&mut queue, &keep) else { continue };
+        let Some(req) = next_request(&mut queue, &keep, &mut thumb_turn) else { continue };
         let resp = match req {
             Req::Open { generation, path } => {
                 doc = None;
@@ -149,6 +159,18 @@ fn run(
                 let text = d.pages().get(page as PdfPageIndex).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
                 Resp::PageText { generation, page, text }
             }
+            Req::Search { generation, id, mut pages, query } => {
+                let Some((g, d)) = &doc else { continue };
+                if *g != generation {
+                    continue;
+                }
+                let Some(page) = pages.pop_front() else { continue };
+                let (hits, more) = d.pages().get(page as PdfPageIndex).ok().and_then(|p| crate::pdf::search_page(&p, &query).ok()).unwrap_or_default();
+                if !pages.is_empty() {
+                    queue.push_back(Req::Search { generation, id, pages, query });
+                }
+                Resp::Found { generation, id, page, hits, more }
+            }
             Req::Export { src, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
                     .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
@@ -164,9 +186,9 @@ fn run(
 }
 
 /// Open/Export first, then the newest patch, then base renders the viewer still
-/// wants, then wanted thumbnails.
-fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
-    if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. })) {
+/// wants, then wanted thumbnails and the current search page by page, in turn.
+fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut bool) -> Option<Req> {
+    if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. } | Req::Search { .. })) {
         return queue.remove(i);
     }
     // Drop renders superseded by a newer request for the same page and layer.
@@ -193,7 +215,17 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
     if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Base, .. })) {
         return queue.remove(i);
     }
-    queue.pop_front()
+    // A search goes a page at a time between renders, taking turns with
+    // thumbnails, so the view and the overview stay live; stale ones are dropped.
+    queue.retain(|r| !matches!(r, Req::Search { id, .. } if *id != keep.search));
+    let search = queue.iter().position(|r| matches!(r, Req::Search { .. }));
+    let thumb = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Thumb, .. }));
+    *thumb_turn = !*thumb_turn;
+    match (search, thumb) {
+        (Some(s), Some(t)) => queue.remove(if *thumb_turn { t } else { s }),
+        (Some(i), None) | (None, Some(i)) => queue.remove(i),
+        (None, None) => queue.pop_front(),
+    }
 }
 
 pub fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
@@ -747,6 +779,44 @@ pub(crate) mod tests {
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         assert!(doc.pages().get(0).unwrap().objects().len() < 5);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A search takes turns with thumbnails, behind base renders; a stale one is dropped.
+    #[test]
+    fn searches_share_the_worker() {
+        let keep = Mutex::new(Keep { base: HashSet::from([0]), thumbs: HashSet::from([1, 2]), search: 7 });
+        let thumb = |page| Req::Render { generation: 1, page, scale: 0.1, origin: [0, 0], size: [10, 10], layer: Layer::Thumb };
+        let search = |id| Req::Search { generation: 1, id, pages: VecDeque::from([0, 1, 2]), query: "x".into() };
+        let mut q = VecDeque::from([search(6), thumb(1), thumb(2), search(7), Req::Render { generation: 1, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base }]);
+        let mut turn = false;
+        let mut order = Vec::new();
+        while let Some(r) = next_request(&mut q, &keep, &mut turn) {
+            order.push(match r {
+                Req::Render { layer: Layer::Base, .. } => "base".to_string(),
+                Req::Render { page, .. } => format!("thumb{page}"),
+                Req::Search { id, .. } => format!("search{id}"),
+                _ => "?".into(),
+            });
+        }
+        assert_eq!(order, ["base", "thumb1", "search7", "thumb2"]);
+    }
+
+    /// Search finds text case-insensitively and reports its box in view points.
+    #[test]
+    fn search_finds_text_in_view_coordinates() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        let font = doc.fonts_mut().helvetica();
+        let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+        // Baseline 100 points up from the bottom: 500 down in view points.
+        page.objects_mut().create_text_object(PdfPoints::new(50.0), PdfPoints::new(100.0), "Check the SILL flashing; sill pan", font, PdfPoints::new(12.0)).unwrap();
+        let (hits, more) = crate::pdf::search_page(&page, "sill").unwrap();
+        assert!(!more);
+        assert_eq!(hits.len(), 2);
+        let r = hits[0][0];
+        assert!(r.min.y > 485.0 && r.max.y < 502.0 && r.min.x > 50.0, "{r:?}");
+        assert!(crate::pdf::search_page(&page, "  ").unwrap().0.is_empty());
     }
 
     /// Page with an inherited MediaBox and a visible, non-printing annotation:
