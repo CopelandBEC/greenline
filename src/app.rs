@@ -510,6 +510,7 @@ impl App {
         self.editing = None;
         self.drag = Drag::None;
         self.placing = None;
+        self.queued_pictures.clear();
         self.annots = Vec::new();
         self.scales = Vec::new();
         self.accepted = Vec::new();
@@ -1625,6 +1626,7 @@ impl App {
             self.toast(format!("Unfinished {what} dropped: its outline crossed itself"));
         }
         self.placing = None;
+        self.queued_pictures.clear();
         self.tool = t;
         if t != Tool::Select {
             self.selected.clear();

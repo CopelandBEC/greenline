@@ -101,7 +101,10 @@ fn store(p: &Prepared) -> anyhow::Result<String> {
     let dest = images_dir().join(&image);
     if !dest.exists() {
         std::fs::create_dir_all(images_dir())?;
-        let tmp = dest.with_extension(format!("{}.{}.tmp", p.ext, std::process::id()));
+        // Unique per import: several may store the same image at once (threads).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("{}.{}-{seq}.tmp", p.ext, std::process::id()));
         std::fs::write(&tmp, &p.bytes)?;
         std::fs::rename(tmp, &dest)?;
     }
