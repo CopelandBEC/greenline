@@ -489,7 +489,7 @@ mod tests {
         // 1/4" = 1'-0": 18 pt on paper (1/4") is 1 ft.
         let scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
         let mk = |pts: Vec<Pos2>, area| Annot {
-            id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None,
+            id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(),
             kind: Kind::Measure { pts, area, name: String::new(), value: String::new(), size: 10.0 },
         };
         let line = mk(vec![pos2(0.0, 0.0), pos2(18.0 * 3.0, 0.0), pos2(18.0 * 3.0, 18.0 * 4.0)], false);
@@ -524,7 +524,7 @@ mod tests {
         assert!(!crosses_itself(&l));
         assert!(!crosses_itself(&[pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0), pos2(0.0, 10.0)]));
         let scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
-        let mut a = vec![Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, kind: Kind::Measure { pts: bowtie, area: true, name: String::new(), value: String::new(), size: 10.0 } }];
+        let mut a = vec![Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Measure { pts: bowtie, area: true, name: String::new(), value: String::new(), size: 10.0 } }];
         relabel(&mut a, &scales, Units::Imperial);
         assert_eq!(a[0].label(), "outline crosses itself");
         assert!(measured(&a[0], &scales).is_none());

@@ -49,7 +49,7 @@ struct Tool {
 
 const TOOLS: &[Tool] = &[
     Tool { name: "guide", doc: "How to work with drawings through Greenline: coordinates, scales, snapping, proposing. Read this first.", params: &[] },
-    Tool { name: "op_reference", doc: "The ops `apply` takes: clouds, callouts, text, arrows, lengths, areas, scales.", params: &[] },
+    Tool { name: "op_reference", doc: "The ops `apply` takes: clouds, callouts, text, arrows, polygons, fills, lengths, areas, scales.", params: &[] },
     Tool { name: "info", doc: "Pages with sizes, scales set and written on each sheet, markup and proposal counts.", params: &[PDF, UNITS] },
     Tool {
         name: "text",
