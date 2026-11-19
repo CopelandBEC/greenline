@@ -516,7 +516,7 @@ pub(crate) mod tests {
     }
 
     fn annot(page: usize, kind: Kind) -> Annot {
-        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None, group: None }
+        Annot { id: 0, page, color: [255, 0, 0], width: 2.0, kind, wrap_w: None, group: None, style: Default::default() }
     }
 
     /// Exports onto pages with every /Rotate value and an offset CropBox, then
@@ -672,6 +672,31 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A filled cloud exports its fill out into the scallops; an open polyline has none.
+    #[test]
+    fn export_fills_and_polylines() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+        let mut cloud = annot(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(50.0, 50.0), pos2(350.0, 250.0)) });
+        cloud.style.fill = Some(crate::annot::Fill { color: [0, 0, 255], alpha: 255 });
+        let poly = annot(0, Kind::Poly { pts: vec![pos2(50.0, 400.0), pos2(350.0, 400.0), pos2(200.0, 550.0)], closed: false });
+        export(pdfium, &src, &out, &[cloud, poly], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let img = render_region(&doc, 0, 1.0, [0, 0], [400, 600]).unwrap();
+        let px = |x: usize, y: usize| img.pixels[y * 400 + x];
+        assert!(px(200, 150).b() > 200 && px(200, 150).r() < 50, "inside is blue: {:?}", px(200, 150));
+        assert!(px(200, 410).r() > 250 && px(200, 410).b() > 250, "an open polyline isn't filled: {:?}", px(200, 410));
+        assert!(px(200, 400).g() < 200, "its first segment is drawn: {:?}", px(200, 400));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Page with an inherited MediaBox and a visible, non-printing annotation:
     /// export must keep the page size and leave the annotation visible.
     #[test]
@@ -736,7 +761,7 @@ mod sample {
         let out = src.with_file_name("sample_markup.pdf");
         let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let pdfium = test_pdfium();
-        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None };
+        let mk = |page, kind| Annot { id: 0, page, color: [228, 0, 0], width: 2.0, kind, wrap_w: None, group: None, style: Default::default() };
         let annots = vec![
             mk(0, Kind::Callout { anchor: pos2(600.0, 500.0), pos: pos2(800.0, 300.0), box_w: 192.0, text: "Confirm drain locations vs. structural — typ. all roof areas".into(), size: 12.0, leaders: vec![pos2(300.0, 620.0)] }),
             mk(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(500.0, 420.0), pos2(700.0, 560.0)) }),

@@ -1,4 +1,4 @@
-use crate::annot::{self, Annot, Kind, Prim, Rgb, COLORS};
+use crate::annot::{self, Annot, Fill, Kind, Prim, Rgb, Style, COLORS, WHITE};
 use crate::measure::{self, Scale, Units};
 use crate::proposals::{self, Proposals};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
@@ -51,6 +51,10 @@ pub enum Tool {
     Arrow,
     Line,
     Pen,
+    /// Click out the corners; double-click or Enter to finish (or drag one segment).
+    Polyline,
+    /// Click out the corners; close on the first or double-click (or drag a rectangle).
+    Polygon,
     /// Length measurement: click its points, double-click or Enter to finish (or drag one segment).
     Length,
     /// Area measurement: click its corners, close on the first or double-click (or drag a rectangle).
@@ -61,7 +65,8 @@ pub enum Tool {
     ScaleRegion,
 }
 
-const TOOLS: [(Tool, &str, Key); 11] = [
+/// Polygon shares N with Polyline, taken with Shift.
+const TOOLS: [(Tool, &str, Key); 13] = [
     (Tool::Select, "Select", Key::V),
     (Tool::Callout, "Callout", Key::C),
     (Tool::Text, "Text", Key::T),
@@ -71,6 +76,8 @@ const TOOLS: [(Tool, &str, Key); 11] = [
     (Tool::Arrow, "Arrow", Key::A),
     (Tool::Line, "Line", Key::L),
     (Tool::Pen, "Pen", Key::P),
+    (Tool::Polyline, "Polyline", Key::N),
+    (Tool::Polygon, "Polygon", Key::N),
     (Tool::Length, "Length", Key::D),
     (Tool::Area, "Area", Key::E),
 ];
@@ -226,6 +233,13 @@ pub struct App {
 
     tool: Tool,
     tool_color: HashMap<Tool, usize>,
+    /// Fill chosen per tool: a colour index (`COLORS`, then white) or none.
+    /// Absent: the markup's own default (callouts white, areas a tint, others none).
+    tool_fill: HashMap<Tool, Option<usize>>,
+    /// Opacity of new fills, 0..=255.
+    fill_alpha: u8,
+    /// The opacity slider's value during a drag (percent), applied on release.
+    fill_pending: Option<f32>,
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -342,6 +356,9 @@ impl App {
             dirty: false,
             tool: Tool::Callout,
             tool_color: HashMap::from([(Tool::Highlight, 5)]),
+            tool_fill: HashMap::new(),
+            fill_alpha: 128,
+            fill_pending: None,
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -855,10 +872,31 @@ impl App {
         *self.tool_color.get(&tool).unwrap_or(&0)
     }
 
+    /// The fill chosen for the current tool, if one was (`Some(None)`: none).
+    fn tool_fill(&self) -> Option<Option<Fill>> {
+        self.tool_fill.get(&self.tool).map(|i| i.map(|i| Fill { color: fill_color(i), alpha: self.fill_alpha }))
+    }
+
+    /// Gives a new markup the current tool's look.
+    fn apply_style(&self, a: &mut Annot) {
+        if let Some(f) = self.tool_fill().filter(|_| a.fillable()) {
+            a.set_fill(f);
+        }
+    }
+
+    /// A markup drawn with the current tool, for previews.
+    fn sketch(&self, page: usize, color: Rgb, kind: Kind) -> Annot {
+        let mut a = Annot { id: 0, page, color, width: self.width, kind, wrap_w: None, group: None, style: Style::default() };
+        self.apply_style(&mut a);
+        a
+    }
+
     fn add(&mut self, page: usize, kind: Kind) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.annots.push(Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None });
+        let mut a = Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None, style: Style::default() };
+        self.apply_style(&mut a);
+        self.annots.push(a);
         self.changed();
         id
     }
@@ -995,7 +1033,7 @@ impl App {
             }
             Kind::Arrow { a: p, b } | Kind::Line { a: p, b } => vec![(Handle::A, *p), (Handle::B, *b)],
             Kind::Pen { .. } => vec![],
-            Kind::Measure { pts, .. } => pts.iter().enumerate().map(|(i, p)| (Handle::Vertex(i), *p)).collect(),
+            Kind::Poly { pts, .. } | Kind::Measure { pts, .. } => pts.iter().enumerate().map(|(i, p)| (Handle::Vertex(i), *p)).collect(),
         }
     }
 
@@ -1028,7 +1066,7 @@ impl App {
             }
             (Kind::Arrow { a, .. } | Kind::Line { a, .. }, Handle::A) => *a = p,
             (Kind::Arrow { b, .. } | Kind::Line { b, .. }, Handle::B) => *b = p,
-            (Kind::Measure { pts, .. }, Handle::Vertex(i)) => {
+            (Kind::Poly { pts, .. } | Kind::Measure { pts, .. }, Handle::Vertex(i)) => {
                 if let Some(v) = pts.get_mut(i) {
                     *v = p;
                 }
@@ -1080,7 +1118,8 @@ impl App {
         self.finish_measure();
         // Still open (an area that crosses itself): it belongs to the old tool.
         if self.building.take().is_some() {
-            self.toast("Unfinished area dropped: its outline crossed itself".into());
+            let what = if self.tool == Tool::Polygon { "polygon" } else { "area" };
+            self.toast(format!("Unfinished {what} dropped: its outline crossed itself"));
         }
         self.placing = None;
         self.tool = t;
@@ -1092,6 +1131,72 @@ impl App {
     fn set_color(&mut self, idx: usize) {
         self.tool_color.insert(self.tool, idx);
         self.edit_selected(|a| a.color = COLORS[idx].0);
+    }
+
+    /// Fill for the tool and the selected markups that take one: a colour
+    /// index (`COLORS`, then white) or none.
+    fn set_fill(&mut self, idx: Option<usize>) {
+        // With Select it's an edit of the selection, not a default for what's placed next.
+        if self.tool != Tool::Select {
+            self.tool_fill.insert(self.tool, idx);
+        }
+        let alpha = self.fill_alpha;
+        // A recoloured fill keeps its opacity.
+        self.edit_fills(|a| {
+            let keep = a.effective_fill().map_or(alpha, |f| f.alpha);
+            a.set_fill(idx.map(|i| Fill { color: fill_color(i), alpha: keep }));
+        });
+    }
+
+    fn set_fill_alpha(&mut self, alpha: u8) {
+        // Never fully clear: that's what None is for, and it would leave nothing to adjust.
+        let alpha = alpha.max(MIN_FILL_ALPHA);
+        self.fill_alpha = alpha;
+        // A callout's or area's default fill becomes a chosen one, so new ones get this opacity.
+        if self.tool != Tool::Select && !self.tool_fill.contains_key(&self.tool) {
+            match self.shown_fill() {
+                Some(f) if f.color == WHITE => {
+                    self.tool_fill.insert(self.tool, Some(COLORS.len()));
+                }
+                Some(f) => {
+                    let i = COLORS.iter().position(|c| c.0 == f.color).unwrap_or(0);
+                    self.tool_fill.insert(self.tool, Some(i));
+                }
+                None => {}
+            }
+        }
+        self.edit_fills(|a| {
+            if let Some(f) = a.effective_fill() {
+                a.set_fill(Some(Fill { alpha, ..f }));
+            }
+        });
+    }
+
+    /// Applies `f` to each selected markup that takes a fill, as one undo step.
+    fn edit_fills(&mut self, mut f: impl FnMut(&mut Annot)) {
+        if self.annots.iter().any(|a| self.selected.contains(&a.id) && a.fillable()) {
+            self.edit_selected(|a| {
+                if a.fillable() {
+                    f(a);
+                }
+            });
+        }
+    }
+
+    /// The fill the toolbar shows: the lead selected markup's, else what the
+    /// current tool will draw.
+    fn shown_fill(&self) -> Option<Fill> {
+        match self.selected.iter().rev().filter_map(|&id| self.find(id)).find(|a| a.fillable()) {
+            Some(a) => a.effective_fill(),
+            None => match self.tool_fill() {
+                Some(f) => f,
+                None => match self.tool {
+                    Tool::Callout => Some(Fill { color: WHITE, alpha: 255 }),
+                    Tool::Area => Some(Fill { color: self.color(), alpha: annot::AREA_TINT }),
+                    _ => None,
+                },
+            },
+        }
     }
 
     fn set_width(&mut self, w: f32) {
@@ -1211,7 +1316,8 @@ impl App {
                 self.finish_measure();
             } else if pressed(Key::Escape) {
                 self.building = None;
-                self.toast("Measurement cancelled".into());
+                let what = if self.outlining() { "Outline" } else { "Measurement" };
+                self.toast(format!("{what} cancelled"));
             } else if pressed(Key::Backspace) || pressed(Key::Delete) {
                 if let Some((_, pts)) = &mut self.building {
                     pts.pop();
@@ -1223,7 +1329,7 @@ impl App {
             return;
         }
         for (t, _, k) in TOOLS {
-            if pressed(k) {
+            if pressed(k) && (k != Key::N || shift == (t == Tool::Polygon)) {
                 self.set_tool(t);
             }
         }
@@ -1526,6 +1632,12 @@ impl App {
                 }
             }
             Drag::Handle { id, before, .. } => {
+                // A polygon's outline mustn't end up crossing itself.
+                if self.find(id).is_some_and(|a| matches!(&a.kind, Kind::Poly { pts, closed: true } if measure::not_simple(pts))) {
+                    self.annots = before;
+                    self.toast("That would make the polygon's outline cross itself".into());
+                    return;
+                }
                 self.undo.push((before, self.scales.clone()));
                 self.redo.clear();
                 self.changed();
@@ -1564,7 +1676,7 @@ impl App {
             }
             return;
         }
-        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate) && !was_editing {
+        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::Polyline | Tool::Polygon) && !was_editing {
             self.measure_point(page, p, double, mods.shift);
             return;
         }
@@ -1638,7 +1750,7 @@ impl App {
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
         let end = bounds.clamp(end);
-        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion) {
+        if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion | Tool::Polyline | Tool::Polygon) {
             self.create_measure(page, start, end);
             return;
         }
@@ -1676,7 +1788,7 @@ impl App {
             Tool::Highlight => Kind::Highlight { rect },
             Tool::Arrow => Kind::Arrow { a: start, b: end },
             Tool::Line => Kind::Line { a: start, b: end },
-            Tool::Select | Tool::Pen | Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion => return,
+            Tool::Select | Tool::Pen | Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion | Tool::Polyline | Tool::Polygon => return,
         };
         self.snapshot();
         let is_text = matches!(kind, Kind::Callout { .. } | Kind::Text { .. });
@@ -1702,7 +1814,7 @@ impl App {
     fn measure_point(&mut self, page: usize, p: Pos2, double: bool, shift: bool) {
         let p = Rect::from_min_size(Pos2::ZERO, self.pages[page]).clamp(p);
         let tol = HIT_PX / self.zoom;
-        let (area, calibrating) = (self.tool == Tool::Area, self.tool == Tool::Calibrate);
+        let (area, calibrating) = (matches!(self.tool, Tool::Area | Tool::Polygon), self.tool == Tool::Calibrate);
         let Some((pg, pts)) = &mut self.building else {
             self.building = Some((page, vec![p]));
             if !calibrating {
@@ -1713,7 +1825,8 @@ impl App {
         };
         if *pg != page {
             let other = *pg + 1;
-            self.toast(format!("Finish the measurement on page {other} first (Enter), or Esc to drop it"));
+            let what = if matches!(self.tool, Tool::Polyline | Tool::Polygon) { "outline" } else { "measurement" };
+            self.toast(format!("Finish the {what} on page {other} first (Enter), or Esc to drop it"));
             return;
         }
         let last = *pts.last().unwrap();
@@ -1742,6 +1855,13 @@ impl App {
             }
             Tool::Area if pts.len() >= 3 => self.add_measure(page, pts, true),
             Tool::Area => self.toast("An area needs at least three points".into()),
+            Tool::Polyline if pts.len() >= 2 => self.add_poly(page, pts, false),
+            Tool::Polygon if pts.len() >= 3 && measure::not_simple(&pts) => {
+                self.building = Some((page, pts));
+                self.toast("The outline crosses itself: Backspace to take back a point, or Esc to drop it".into());
+            }
+            Tool::Polygon if pts.len() >= 3 => self.add_poly(page, pts, true),
+            Tool::Polygon => self.toast("A polygon needs at least three points".into()),
             _ => {}
         }
     }
@@ -1768,6 +1888,13 @@ impl App {
                     self.add_measure(page, annot::rect_pts(r), true);
                 }
             }
+            Tool::Polyline => self.add_poly(page, vec![start, squared], false),
+            Tool::Polygon => {
+                let r = Rect::from_two_pos(start, end);
+                if r.width().min(r.height()) * self.zoom >= 3.0 {
+                    self.add_poly(page, annot::rect_pts(r), true);
+                }
+            }
             Tool::Calibrate => self.set_calibration(page, start, squared),
             Tool::ScaleRegion => {
                 // A calibration line drawn before belongs to the whole page it's on, not this region.
@@ -1779,6 +1906,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Whether the tool clicks out a polyline or polygon (rather than a measurement).
+    fn outlining(&self) -> bool {
+        matches!(self.tool, Tool::Polyline | Tool::Polygon)
+    }
+
+    fn add_poly(&mut self, page: usize, pts: Vec<Pos2>, closed: bool) {
+        self.snapshot();
+        self.add(page, Kind::Poly { pts, closed });
     }
 
     fn add_measure(&mut self, page: usize, pts: Vec<Pos2>, area: bool) {
@@ -2310,8 +2447,10 @@ impl App {
         }
         self.snapshot();
         let id = self.add(page, kind);
-        if matches!(place, Place::Date) {
-            if let Some(a) = self.find_mut(id) {
+        if let Some(a) = self.find_mut(id) {
+            // Placed as previewed: no fill from whatever tool was last used.
+            a.style = Style::default();
+            if matches!(place, Place::Date) {
                 a.color = DATE_COLOR;
             }
         }
@@ -2475,17 +2614,17 @@ impl App {
             // Live preview.
             match &self.drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
-                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate) { square(*start, *cur) } else { *cur };
+                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline) { square(*start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
                         let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };
-                        let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None };
+                        let mut a = self.sketch(i, color, kind);
                         measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
                         paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.7, &self.textures);
                     }
                 }
                 Drag::Pen { page, pts } if *page == i => {
-                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None, group: None };
+                    let a = Annot { id: 0, page: i, color: self.color(), width: self.width, kind: Kind::Pen { pts: pts.clone() }, wrap_w: None, group: None, style: Default::default() };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 1.0, &self.textures);
                 }
                 Drag::Marquee { page, start, cur } if *page == i => {
@@ -2516,9 +2655,13 @@ impl App {
                 }
                 let calibrating = self.tool == Tool::Calibrate;
                 let color = if calibrating { [0, 150, 255] } else { self.color() };
-                let kind = Kind::Measure { pts: pts.clone(), area: self.tool == Tool::Area && pts.len() >= 3, name: String::new(), value: String::new(), size: self.text_size };
-                let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None };
-                if !calibrating {
+                let kind = if self.outlining() {
+                    Kind::Poly { pts: pts.clone(), closed: self.tool == Tool::Polygon && pts.len() >= 3 }
+                } else {
+                    Kind::Measure { pts: pts.clone(), area: self.tool == Tool::Area && pts.len() >= 3, name: String::new(), value: String::new(), size: self.text_size }
+                };
+                let mut a = self.sketch(i, color, kind);
+                if !calibrating && !self.outlining() {
                     measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
                 }
                 paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.8, &self.textures);
@@ -2551,7 +2694,7 @@ impl App {
                 };
                 if let Some((start, cur)) = at {
                     let color = if matches!(place, Place::Date) { DATE_COLOR } else { self.color() };
-                    let a = Annot { id: 0, page: i, color, width: self.width, kind: self.placed_kind(place, start, cur), wrap_w: None, group: None };
+                    let a = Annot { id: 0, page: i, color, width: self.width, kind: self.placed_kind(place, start, cur), wrap_w: None, group: None, style: Default::default() };
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.6, &self.textures);
                     let b = a.bounds();
                     pp.rect_stroke(Rect::from_min_max(self.page_to_screen(i, b.min), self.page_to_screen(i, b.max)), 0.0, Stroke::new(1.0, SEL), egui::StrokeKind::Outside);
@@ -2611,6 +2754,8 @@ impl App {
             Tool::Length => Kind::Measure { pts: vec![start, cur], area: false, name: String::new(), value: String::new(), size },
             Tool::Area => Kind::Measure { pts: annot::rect_pts(rect), area: true, name: String::new(), value: String::new(), size },
             Tool::Calibrate => Kind::Line { a: start, b: cur },
+            Tool::Polyline => Kind::Poly { pts: vec![start, cur], closed: false },
+            Tool::Polygon => Kind::Poly { pts: annot::rect_pts(rect), closed: true },
             Tool::ScaleRegion => Kind::Rect { rect },
             Tool::Select | Tool::Pen => return None,
         })
@@ -2736,7 +2881,8 @@ impl App {
                     if t == Tool::Length {
                         ui.separator();
                     }
-                    if ui.selectable_label(self.tool == t, format!("{label}   ({})", k.name())).clicked() {
+                    let key = if t == Tool::Polygon { format!("Shift+{}", k.name()) } else { k.name().to_string() };
+                    if ui.selectable_label(self.tool == t, format!("{label}   ({key})")).clicked() {
                         self.set_tool(t);
                         ui.close();
                     }
@@ -2762,6 +2908,7 @@ impl App {
                     self.set_color(i);
                 }
             }
+            self.fill_button(ui);
             ui.separator();
             let mut w = self.width;
             if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).prefix("Line ").suffix(" pt")).on_hover_text("[ / ]").changed() {
@@ -2775,6 +2922,56 @@ impl App {
                     }
                 }
             });
+        });
+    }
+
+    /// Fill swatch: opens a picker for the fill colour (or none) and its opacity.
+    fn fill_button(&mut self, ui: &mut Ui) {
+        let shown = self.shown_fill();
+        let (rect, resp) = ui.allocate_exact_size(vec2(26.0, 18.0), Sense::click());
+        let r = rect.shrink2(vec2(4.0, 2.0));
+        let edge = ui.visuals().widgets.inactive.fg_stroke.color;
+        paint_swatch(ui.painter(), r, shown);
+        ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+        let resp = resp.on_hover_text(match shown {
+            Some(f) => format!("Fill: {} at {}% — for shapes and text boxes", fill_name(f.color), (f.alpha as f32 / 2.55).round()),
+            None => "Fill: none — for shapes and text boxes".into(),
+        });
+        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.label("Fill");
+            ui.horizontal(|ui| {
+                let (r, none) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                paint_swatch(ui.painter(), r.shrink(2.0), None);
+                if shown.is_none() {
+                    ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+                }
+                if none.on_hover_text("None").clicked() {
+                    self.set_fill(None);
+                }
+                for i in 0..=COLORS.len() {
+                    let c = fill_color(i);
+                    let (r, sw) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                    paint_swatch(ui.painter(), r.shrink(2.0), Some(Fill { color: c, alpha: 255 }));
+                    ui.painter().rect_stroke(r.shrink(2.0), 3.0, Stroke::new(1.0, edge.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+                    if shown.is_some_and(|f| f.color == c) {
+                        ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+                    }
+                    if sw.on_hover_text(fill_name(c)).clicked() {
+                        self.set_fill(Some(i));
+                    }
+                }
+            });
+            // While dragging, the slider shows the value it will set on release (one undo step per drag).
+            let mut pct = self.fill_pending.unwrap_or_else(|| (shown.map_or(self.fill_alpha, |f| f.alpha) as f32 / 2.55).round());
+            let slider = ui.add_enabled(shown.is_some(), egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").text("Opacity"));
+            if slider.changed() {
+                self.fill_pending = Some(pct);
+            }
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                if let Some(p) = self.fill_pending.take() {
+                    self.set_fill_alpha((p * 2.55).round() as u8);
+                }
+            }
         });
     }
 
@@ -3348,6 +3545,7 @@ impl App {
                     ("T", "Text box (click, or drag for width)"),
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
+                    ("N / Shift+N", "Polyline / polygon: click the corners, double-click or Enter to finish (a polygon also closes on its first point)"),
                     ("D / E", "Measure length / area: click the points, double-click or Enter to finish (drag: one segment / a rectangle)"),
                     ("Y", "Review: markups proposed by agents (greenline-cli); accept or reject each, or a whole batch"),
                     ("U", "Scale: pick the drawing scale, use one written on the sheet, calibrate, or add a region for a detail"),
@@ -3356,7 +3554,7 @@ impl App {
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("1–6", "Colour (applies to all selected)"),
+                    ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill and opacity for shapes and text boxes"),
                     ("[ ]", "Line width   ·   { } text size"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -3567,6 +3765,26 @@ fn triangulate(pts: &[Pos2]) -> Option<Vec<[usize; 3]>> {
     Some(tris)
 }
 
+type Triangles = std::rc::Rc<Vec<[usize; 3]>>;
+
+/// `triangulate` remembered by outline, so a filled cloud or polygon isn't
+/// re-triangulated every frame (the triangles don't change with pan or zoom).
+fn cached_triangles(pts: &[Pos2]) -> Option<Triangles> {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<HashMap<u64, Option<Triangles>>> = RefCell::new(HashMap::new());
+    }
+    let bytes: Vec<u8> = pts.iter().flat_map(|p| [p.x.to_bits().to_le_bytes(), p.y.to_bits().to_le_bytes()]).flatten().collect();
+    let key = sidecar::fnv(&bytes);
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 2000 {
+            c.clear();
+        }
+        c.entry(key).or_insert_with(|| triangulate(pts).map(std::rc::Rc::new)).clone()
+    })
+}
+
 /// `p` moved onto the horizontal or vertical through `from`, whichever is nearer.
 fn square(from: Pos2, p: Pos2) -> Pos2 {
     let d = p - from;
@@ -3591,24 +3809,26 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                     painter.add(Shape::line(pts, s));
                 }
             }
-            Prim::Fill { pts, color, alpha, outline } => {
+            Prim::Fill { pts: page_pts, color, alpha, outline } => {
                 let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
-                let pts = map(pts);
+                let pts = map(page_pts);
                 if convex(&pts) {
                     painter.add(Shape::convex_polygon(pts, col(*color, *alpha), stroke));
                 } else {
-                    // An L- or U-shaped area: egui fills convex outlines only, so fill triangles.
-                    if let Some(tris) = triangulate(&pts) {
+                    // An L- or U-shaped area or a cloud: egui fills convex outlines only, so fill triangles.
+                    if let Some(tris) = cached_triangles(page_pts) {
                         let mut mesh = egui::Mesh::default();
                         for p in &pts {
                             mesh.colored_vertex(*p, col(*color, *alpha));
                         }
-                        for [a, b, c] in tris {
-                            mesh.add_triangle(a as u32, b as u32, c as u32);
+                        for [a, b, c] in tris.iter() {
+                            mesh.add_triangle(*a as u32, *b as u32, *c as u32);
                         }
                         painter.add(Shape::mesh(mesh));
                     }
-                    painter.add(Shape::closed_line(pts, stroke));
+                    if stroke != Stroke::NONE {
+                        painter.add(Shape::closed_line(pts, stroke));
+                    }
                 }
             }
             Prim::Text { origin: o, text, size, color } => {
@@ -3634,6 +3854,40 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                     painter.line_segment([r.right_top(), r.left_bottom()], s);
                 }
             }
+        }
+    }
+}
+
+/// Lowest fill opacity the slider sets (5%); a fill is removed with None.
+const MIN_FILL_ALPHA: u8 = 13;
+
+/// Fill colours: the markup colours, then white.
+fn fill_color(i: usize) -> Rgb {
+    COLORS.get(i).map_or(WHITE, |c| c.0)
+}
+
+fn fill_name(c: Rgb) -> &'static str {
+    COLORS.iter().find(|x| x.0 == c).map_or(if c == WHITE { "White" } else { "Custom" }, |x| x.1)
+}
+
+/// A fill swatch: the colour at its opacity over a light checker, or a red slash for none.
+fn paint_swatch(p: &Painter, r: Rect, fill: Option<Fill>) {
+    p.rect_filled(r, 3.0, Color32::WHITE);
+    match fill {
+        Some(f) => {
+            let h = r.height() / 2.0;
+            let mut x = r.min.x;
+            let mut odd = false;
+            while x < r.max.x && f.alpha < 255 {
+                let w = h.min(r.max.x - x);
+                p.rect_filled(Rect::from_min_size(pos2(x, if odd { r.min.y } else { r.min.y + h }), vec2(w, h)), 0.0, Color32::from_gray(205));
+                x += h;
+                odd = !odd;
+            }
+            p.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(f.color[0], f.color[1], f.color[2], f.alpha));
+        }
+        None => {
+            p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, Color32::from_rgb(220, 0, 0)));
         }
     }
 }
@@ -4049,6 +4303,132 @@ mod tests {
         assert_eq!(measures(&app).len(), 1);
     }
 
+    fn polys(app: &App) -> Vec<(Vec<Pos2>, bool)> {
+        app.annots.iter().filter_map(|a| match &a.kind {
+            Kind::Poly { pts, closed } => Some((pts.clone(), *closed)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn polylines_and_polygons_are_clicked_out() {
+        let mut app = app();
+        app.set_tool(Tool::Polyline);
+        for p in [pos2(100.0, 100.0), pos2(200.0, 100.0), pos2(200.0, 200.0)] {
+            app.click(p, false, PLAIN);
+        }
+        app.click(pos2(200.0, 200.0), true, PLAIN);
+        assert!(app.building.is_none());
+        assert_eq!(polys(&app), vec![(vec![pos2(100.0, 100.0), pos2(200.0, 100.0), pos2(200.0, 200.0)], false)]);
+        // A polygon closes on its first point and takes the tool's fill.
+        app.set_tool(Tool::Polygon);
+        app.fill_alpha = 100;
+        app.set_fill(Some(1));
+        for p in [pos2(300.0, 300.0), pos2(400.0, 300.0), pos2(350.0, 400.0), pos2(301.0, 301.0)] {
+            app.click(p, false, PLAIN);
+        }
+        let ps = polys(&app);
+        assert_eq!(ps.len(), 2);
+        assert_eq!(ps[1], (vec![pos2(300.0, 300.0), pos2(400.0, 300.0), pos2(350.0, 400.0)], true));
+        let a = app.annots.last().unwrap().clone();
+        assert_eq!(a.style.fill, Some(Fill { color: COLORS[1].0, alpha: 100 }));
+        // Filled, so clicking inside selects it; the open polyline's inside doesn't count.
+        app.set_tool(Tool::Select);
+        app.click(pos2(350.0, 330.0), false, PLAIN);
+        assert_eq!(app.selected, vec![a.id]);
+        app.click(pos2(150.0, 150.0), false, PLAIN);
+        assert!(app.selected.is_empty());
+        // Vertices are handles.
+        app.selected = vec![a.id];
+        let id = a.id;
+        drag(&mut app, pos2(350.0, 400.0), pos2(350.0, 450.0), PLAIN);
+        assert_eq!(polys(&app)[1].0[2], pos2(350.0, 450.0));
+        assert_eq!(app.find(id).unwrap().kind_name(), "Polygon");
+    }
+
+    #[test]
+    fn fill_applies_to_selected_shapes_that_take_one() {
+        let mut app = app();
+        let r = rect(&mut app, 100.0, 100.0);
+        let l = app.add(0, Kind::Line { a: pos2(0.0, 0.0), b: pos2(50.0, 50.0) });
+        assert!(app.find(r).unwrap().style.fill.is_none(), "no fill until one is chosen");
+        app.selected = vec![r, l];
+        app.set_fill(Some(COLORS.len()));
+        assert_eq!(app.find(r).unwrap().style.fill.map(|f| f.color), Some(WHITE));
+        assert!(app.find(l).unwrap().style.fill.is_none(), "lines take no fill");
+        app.set_fill_alpha(255);
+        assert_eq!(app.find(r).unwrap().style.fill.map(|f| f.alpha), Some(255));
+        app.undo();
+        assert_eq!(app.find(r).unwrap().style.fill.map(|f| f.alpha), Some(128), "opacity undoes on its own");
+        // A new colour keeps the markup's opacity.
+        app.selected = vec![r];
+        app.fill_alpha = 10;
+        app.set_fill(Some(1));
+        assert_eq!(app.find(r).unwrap().style.fill, Some(Fill { color: COLORS[1].0, alpha: 128 }));
+        app.set_fill(None);
+        assert!(app.find(r).unwrap().style.fill.is_none());
+        assert!(app.find(r).unwrap().style.is_plain(), "plain style is left out of the markups file");
+        // None clears a callout's white box too, and the toolbar says so.
+        let c = callout(&mut app, pos2(300.0, 300.0), pos2(400.0, 400.0));
+        app.selected = vec![c];
+        assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 255 }));
+        app.set_fill(None);
+        assert_eq!(app.shown_fill(), None);
+        let box_fill = app.find(c).unwrap().prims().into_iter().find_map(|p| match p {
+            Prim::Fill { alpha, outline: Some(_), .. } => Some(alpha),
+            _ => None,
+        });
+        assert_eq!(box_fill, Some(0), "the box keeps its outline but no fill");
+        // Opacity never reaches zero, so a fill can always be turned back up.
+        let r2 = rect(&mut app, 400.0, 100.0);
+        app.selected = vec![r2];
+        app.set_fill(Some(2));
+        app.set_fill_alpha(0);
+        assert!(app.shown_fill().is_some_and(|f| f.alpha == MIN_FILL_ALPHA));
+        // With nothing selected, a callout's opacity sticks for the next ones.
+        app.selected.clear();
+        app.set_tool(Tool::Callout);
+        app.set_fill_alpha(51);
+        assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 51 }));
+        let c2 = callout(&mut app, pos2(300.0, 500.0), pos2(400.0, 600.0));
+        assert_eq!(app.find(c2).unwrap().effective_fill(), Some(Fill { color: WHITE, alpha: 51 }));
+    }
+
+    #[test]
+    fn placed_dates_take_no_tool_fill() {
+        let mut app = app();
+        app.set_tool(Tool::Text);
+        app.set_fill(Some(COLORS.len()));
+        app.date_text = "2026-11-19".into();
+        app.start_placing(Place::Date);
+        app.click(pos2(100.0, 100.0), false, PLAIN);
+        let a = app.annots.last().unwrap();
+        assert!(matches!(a.kind, Kind::Text { .. }));
+        assert!(a.style.fill.is_none());
+    }
+
+    #[test]
+    fn a_vertex_drag_cant_make_a_polygon_cross_itself() {
+        let mut app = app();
+        let id = app.add(0, Kind::Poly { pts: annot::rect_pts(Rect::from_min_max(pos2(100.0, 100.0), pos2(200.0, 200.0))), closed: true });
+        app.selected = vec![id];
+        drag(&mut app, pos2(200.0, 100.0), pos2(50.0, 150.0), PLAIN);
+        assert_eq!(polys(&app)[0].0[1], pos2(200.0, 100.0), "put back");
+        assert!(app.undo.is_empty(), "and nothing to undo");
+        drag(&mut app, pos2(200.0, 100.0), pos2(250.0, 80.0), PLAIN);
+        assert_eq!(polys(&app)[0].0[1], pos2(250.0, 80.0));
+    }
+
+    #[test]
+    fn filled_clouds_triangulate() {
+        let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 250.0));
+        let pts = annot::cloud_pts(rect);
+        let tris = cached_triangles(&pts).expect("a cloud outline is simple");
+        let area: f32 = tris.iter().map(|[a, b, c]| cross(pts[*a], pts[*b], pts[*c]).abs() / 2.0).sum();
+        assert!((area as f64 - measure::area_pt2(&pts)).abs() < 1.0, "{area}");
+        assert!(std::rc::Rc::ptr_eq(&tris, &cached_triangles(&pts).unwrap()), "second call is cached");
+    }
+
     #[test]
     fn drags_make_a_segment_or_a_rectangle() {
         let mut app = app();
@@ -4208,7 +4588,7 @@ mod tests {
     #[test]
     fn accepted_groups_stay_together_and_read_only_cant_accept() {
         let (mut app, dir) = reviewing("groups");
-        app.annots.push(Annot { id: 50, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: Some(2), kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)) } });
+        app.annots.push(Annot { id: 50, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: Some(2), style: Default::default(), kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)) } });
         app.next_id = 51;
         app.poll_proposals(10.0);
         app.read_only = true;
@@ -4315,7 +4695,7 @@ mod tests {
 
     #[test]
     fn receipt_ids_arent_handed_out_again() {
-        let a = Annot { id: 3, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: None, kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0)) } };
+        let a = Annot { id: 3, page: 0, color: [0; 3], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Rect { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0)) } };
         assert_eq!(first_free_id(&[a.clone()], &["1/5:12".into(), "1/scale:{\"page\":0}".into()]), 13);
         assert_eq!(first_free_id(&[a], &[]), 4);
         assert_eq!(first_free_id(&[], &[]), 1);

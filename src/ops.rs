@@ -3,7 +3,7 @@
 //! displayed (origin top-left, y down, 72 per paper inch); pages count from 1.
 //! A batch is checked whole: one bad op and nothing is proposed.
 
-use crate::annot::{self, Annot, Kind, Rgb, COLORS};
+use crate::annot::{self, Annot, Fill, Kind, Rgb, COLORS};
 use crate::measure::{self, Scale, Units};
 use egui::{pos2, Pos2, Rect, Vec2};
 use serde_json::{Map, Value};
@@ -17,13 +17,17 @@ coordinates `text`, `paths`, `snap` and `render` report).
 Common fields: "color" (green, red, blue, black, orange, yellow or "#rrggbb";
 default green, highlight yellow), "width" (line width in points, default 2),
 "size" (text size in points, default 12; 10 for measurement labels),
-"group" (any string: ops on one page with the same group select and move together).
+"group" (any string: ops on one page with the same group select and move together),
+"fill" (a colour as for "color", or "white": fills a cloud, rect, polygon, area, callout or
+text box) with "opacity" (0 to 100, default 50).
 
   {"op": "cloud",     "page": 4, "rect": [x0, y0, x1, y1]}
   {"op": "rect",      "page": 4, "rect": [...]}
   {"op": "highlight", "page": 4, "rect": [...]}
   {"op": "arrow",     "page": 4, "from": [x, y], "to": [x, y]}       arrowhead at "to"
   {"op": "line",      "page": 4, "from": [x, y], "to": [x, y]}
+  {"op": "polyline",  "page": 4, "points": [[x, y], [x, y], ...]}
+  {"op": "polygon",   "page": 4, "points": [[x, y], [x, y], [x, y], ...]}   closed; mustn't cross itself
   {"op": "callout",   "page": 4, "target": [x, y], "at": [x, y], "text": "...",
                       "targets": [[x, y], ...], "box_width": 200}
         leader arrow to "target" (and to each of "targets"); "at" is the note box's
@@ -97,7 +101,11 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
                 })
             }
         };
-        let mut a = Annot { id: first_id + batch.annots.len() as u64, page, color, width, kind, wrap_w: None, group };
+        let mut a = Annot { id: first_id + batch.annots.len() as u64, page, color, width, kind, wrap_w: None, group, style: Default::default() };
+        a.style.fill = f.fill().map_err(ctx)?;
+        if a.style.fill.is_some() && !a.fillable() {
+            return Err(ctx("\"fill\" is for clouds, rects, polygons, areas, callouts and text boxes".into()));
+        }
         if let Kind::Callout { box_w, .. } | Kind::Text { box_w, .. } = a.kind {
             a.wrap_w = Some(box_w);
             a.fit_box_w();
@@ -203,16 +211,36 @@ impl Fields<'_> {
     }
 
     fn color(&self, default: Rgb) -> Result<Rgb, String> {
-        let Some(v) = self.o.get("color").filter(|v| !v.is_null()) else { return Ok(default) };
-        let s = v.as_str().ok_or("\"color\" must be a name or \"#rrggbb\"")?.trim();
+        Ok(self.color_of("color")?.unwrap_or(default))
+    }
+
+    /// A colour name, "white" or "#rrggbb" under `key`, if given.
+    fn color_of(&self, key: &str) -> Result<Option<Rgb>, String> {
+        let Some(v) = self.o.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+        let s = v.as_str().ok_or(format!("\"{key}\" must be a name or \"#rrggbb\""))?.trim();
         if let Some(hex) = s.strip_prefix('#') {
-            let n = u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6).ok_or("\"color\" hex must be #rrggbb")?;
-            return Ok([(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+            let n = u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6).ok_or(format!("\"{key}\" hex must be #rrggbb"))?;
+            return Ok(Some([(n >> 16) as u8, (n >> 8) as u8, n as u8]));
         }
-        COLORS.iter().find(|(_, name)| name.eq_ignore_ascii_case(s)).map(|(c, _)| *c).ok_or_else(|| {
+        if key == "fill" && s.eq_ignore_ascii_case("white") {
+            return Ok(Some(annot::WHITE));
+        }
+        COLORS.iter().find(|(_, name)| name.eq_ignore_ascii_case(s)).map(|(c, _)| Some(*c)).ok_or_else(|| {
             let names: Vec<String> = COLORS.iter().map(|(_, n)| n.to_lowercase()).collect();
             format!("unknown colour \"{s}\": use {} or #rrggbb", names.join(", "))
         })
+    }
+
+    fn fill(&self) -> Result<Option<Fill>, String> {
+        let opacity = self.num_or("opacity", 50.0)?;
+        if !(0.0..=100.0).contains(&opacity) {
+            return Err("\"opacity\" must be 0 to 100".into());
+        }
+        match self.color_of("fill")? {
+            Some(color) => Ok(Some(Fill { color, alpha: (opacity * 2.55).round() as u8 })),
+            None if self.o.contains_key("opacity") => Err("\"opacity\" goes with \"fill\"".into()),
+            None => Ok(None),
+        }
     }
 
     fn size(&self, default: f32) -> Result<f32, String> {
@@ -238,6 +266,17 @@ impl Fields<'_> {
             "highlight" => Kind::Highlight { rect: self.rect("rect", page)? },
             "arrow" => Kind::Arrow { a: self.point("from", page)?, b: self.point("to", page)? },
             "line" => Kind::Line { a: self.point("from", page)?, b: self.point("to", page)? },
+            "polyline" => Kind::Poly { pts: self.points("points", page, 2)?, closed: false },
+            "polygon" => {
+                let pts = self.points("points", page, 3)?;
+                if measure::area_pt2(&pts) < 1.0 {
+                    return Err("the polygon is empty".into());
+                }
+                if measure::not_simple(&pts) {
+                    return Err("the polygon's outline crosses or touches itself".into());
+                }
+                Kind::Poly { pts, closed: true }
+            }
             "callout" => {
                 let size = self.size(12.0)?;
                 let leaders = match self.o.get("targets") {
@@ -259,7 +298,7 @@ impl Fields<'_> {
                 Kind::Measure { pts, area: true, name: self.opt_text("name"), value: String::new(), size: self.size(10.0)? }
             }
             "" | "?" => return Err("needs \"op\"".into()),
-            other => return Err(format!("unknown op \"{other}\": cloud, rect, highlight, arrow, line, callout, text, length, area or scale")),
+            other => return Err(format!("unknown op \"{other}\": cloud, rect, highlight, arrow, line, polyline, polygon, callout, text, length, area or scale")),
         })
     }
 
@@ -306,7 +345,7 @@ fn trim(v: f64) -> String {
 pub fn grid(page: usize, size: Vec2, step: f32) -> Vec<Annot> {
     let mut out = Vec::new();
     let c: Rgb = [0, 150, 255];
-    let mk = |kind| Annot { id: 0, page, color: c, width: 0.3, kind, wrap_w: None, group: None };
+    let mk = |kind| Annot { id: 0, page, color: c, width: 0.3, kind, wrap_w: None, group: None, style: Default::default() };
     let mut x = step;
     while x < size.x {
         out.push(mk(Kind::Line { a: pos2(x, 0.0), b: pos2(x, size.y) }));
@@ -365,6 +404,24 @@ mod tests {
         assert!((b.scales[0].ratio() - 50.0).abs() < 1e-9);
         assert!((b.scales[1].ratio() - 48.0).abs() < 1e-6, "{:?}", b.scales[1]);
         assert!(b.scales[1].region.is_some());
+    }
+
+    #[test]
+    fn polygons_and_fills() {
+        let ops = json!([
+            {"op": "polygon", "page": 1, "points": [[10, 10], [100, 10], [50, 90]], "fill": "red", "opacity": 20},
+            {"op": "polyline", "page": 1, "points": [[10, 10], [100, 10]]},
+            {"op": "callout", "page": 1, "target": [10, 10], "at": [100, 100], "text": "x", "fill": "#ffff00"},
+        ]);
+        let b = parse(&ops, &pages(), 1, 1).unwrap();
+        assert!(matches!(b.annots[0].kind, Kind::Poly { closed: true, .. }));
+        assert_eq!(b.annots[0].style.fill, Some(Fill { color: COLORS[1].0, alpha: 51 }));
+        assert!(matches!(b.annots[1].kind, Kind::Poly { closed: false, .. }));
+        assert_eq!(b.annots[2].style.fill, Some(Fill { color: [255, 255, 0], alpha: 128 }));
+        let bad = |ops: Value| parse(&ops, &pages(), 1, 1).unwrap_err();
+        assert!(bad(json!([{"op": "line", "page": 1, "from": [0, 0], "to": [9, 9], "fill": "red"}])).contains("\"fill\" is for"));
+        assert!(bad(json!([{"op": "polygon", "page": 1, "points": [[0, 0], [100, 100], [100, 0], [0, 40]]}])).contains("crosses"));
+        assert!(bad(json!([{"op": "rect", "page": 1, "rect": [0, 0, 9, 9], "opacity": 20}])).contains("goes with"));
     }
 
     #[test]

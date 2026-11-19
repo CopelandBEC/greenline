@@ -134,7 +134,7 @@ pub fn crosses(s: &[Pos2; 2], r: Rect) -> bool {
         return true;
     }
     let ann = crate::annot::Annot {
-        id: 0, page: 0, color: [0; 3], width: 0.0, wrap_w: None, group: None,
+        id: 0, page: 0, color: [0; 3], width: 0.0, wrap_w: None, group: None, style: Default::default(),
         kind: crate::annot::Kind::Line { a: s[0], b: s[1] },
     };
     ann.touches(r)

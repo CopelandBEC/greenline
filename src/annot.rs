@@ -24,6 +24,31 @@ pub struct Annot {
     /// Markups sharing a group id on one page select and move together.
     #[serde(default)]
     pub group: Option<u64>,
+    /// Fill and other looks beyond colour and width; files from before 1.6 have none.
+    #[serde(default, skip_serializing_if = "Style::is_plain")]
+    pub style: Style,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Style {
+    /// Colour inside a closed shape or text box. `None`: shapes stay open,
+    /// callouts keep their white box, text has no box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
+}
+
+impl Style {
+    pub fn is_plain(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fill {
+    pub color: Rgb,
+    /// 0..=255.
+    pub alpha: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +64,8 @@ pub enum Kind {
     Arrow { a: Pos2, b: Pos2 },
     Line { a: Pos2, b: Pos2 },
     Pen { pts: Vec<Pos2> },
+    /// Straight segments through `pts`: a polyline, or a polygon when `closed`.
+    Poly { pts: Vec<Pos2>, closed: bool },
     /// Stamp or signature from the image library (`stamps`), drawn into `rect`.
     /// `image` is the stored file's name; `name` is what the markup list shows.
     Image { rect: Rect, image: String, name: String },
@@ -60,6 +87,9 @@ pub enum Prim {
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
+
+/// Opacity of an area measurement's tint when it has no fill of its own.
+pub const AREA_TINT: u8 = 40;
 
 /// Markup colours, by name. The first is the default for new markups: CopelandBEC medium green.
 pub const COLORS: [(Rgb, &str); 6] = [
@@ -230,6 +260,8 @@ impl Annot {
             Kind::Arrow { .. } => "Arrow",
             Kind::Line { .. } => "Line",
             Kind::Pen { .. } => "Pen",
+            Kind::Poly { closed: false, .. } => "Polyline",
+            Kind::Poly { closed: true, .. } => "Polygon",
             Kind::Image { .. } => "Stamp",
             Kind::Measure { area: false, .. } => "Length",
             Kind::Measure { area: true, .. } => "Area",
@@ -266,7 +298,7 @@ impl Annot {
             Kind::Rect { rect } | Kind::Highlight { rect } => rect.expand(w),
             Kind::Image { rect, .. } => *rect,
             Kind::Arrow { a, b } | Kind::Line { a, b } => Rect::from_two_pos(*a, *b).expand(arrow_len(w) + w),
-            Kind::Pen { pts } => {
+            Kind::Pen { pts } | Kind::Poly { pts, .. } => {
                 let mut r = Rect::NOTHING;
                 for p in pts {
                     r.extend_with(*p);
@@ -307,7 +339,7 @@ impl Annot {
                 *a += d;
                 *b += d;
             }
-            Kind::Pen { pts } | Kind::Measure { pts, .. } => pts.iter_mut().for_each(|p| *p += d),
+            Kind::Pen { pts } | Kind::Poly { pts, .. } | Kind::Measure { pts, .. } => pts.iter_mut().for_each(|p| *p += d),
         }
     }
 
@@ -325,6 +357,11 @@ impl Annot {
         }
         if self.value_box().is_some_and(|(r, _)| r.contains(p)) {
             return 0.0;
+        }
+        if let Some(o) = self.filled_outline() {
+            if inside(&o, p) {
+                return 0.0;
+            }
         }
         let mut best = f32::INFINITY;
         for prim in self.prims() {
@@ -359,6 +396,11 @@ impl Annot {
         if self.value_box().is_some_and(|(b, _)| b.intersects(r)) {
             return true;
         }
+        if let Some(o) = self.filled_outline() {
+            if inside(&o, r.center()) || o.iter().any(|p| r.contains(*p)) {
+                return true;
+            }
+        }
         let r = r.expand(self.width / 2.0);
         self.prims().iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
@@ -386,15 +428,30 @@ impl Annot {
                 for tip in leaders {
                     arrow_path_prims(&mut out, &[knee], *tip, w, c);
                 }
-                out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 255, outline: Some((c, w)) });
+                let fill = self.style.fill.unwrap_or(Fill { color: WHITE, alpha: 255 });
+                out.push(Prim::Fill { pts: rect_pts(r), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
                 text_prims(&mut out, r, text, *size, c);
             }
             Kind::Text { text, size, .. } => {
                 let r = self.text_box().unwrap();
+                self.fill_prims(&mut out, rect_pts(r));
                 text_prims(&mut out, r, text, *size, c);
             }
-            Kind::Cloud { rect } => out.push(Prim::Stroke { pts: cloud_pts(*rect), closed: true, width: w, color: c }),
-            Kind::Rect { rect } => out.push(Prim::Stroke { pts: rect_pts(*rect), closed: true, width: w, color: c }),
+            Kind::Cloud { rect } => {
+                let pts = cloud_pts(*rect);
+                self.fill_prims(&mut out, pts.clone());
+                out.push(Prim::Stroke { pts, closed: true, width: w, color: c });
+            }
+            Kind::Rect { rect } => {
+                self.fill_prims(&mut out, rect_pts(*rect));
+                out.push(Prim::Stroke { pts: rect_pts(*rect), closed: true, width: w, color: c });
+            }
+            Kind::Poly { pts, closed } => {
+                if *closed && pts.len() >= 3 {
+                    self.fill_prims(&mut out, pts.clone());
+                }
+                out.push(Prim::Stroke { pts: pts.clone(), closed: *closed, width: w, color: c });
+            }
             Kind::Highlight { rect } => out.push(Prim::Fill { pts: rect_pts(*rect), color: c, alpha: 90, outline: None }),
             Kind::Arrow { a, b } => arrow_prims(&mut out, *a, *b, w, c),
             Kind::Line { a, b } => out.push(Prim::Stroke { pts: vec![*a, *b], closed: false, width: w, color: c }),
@@ -402,7 +459,8 @@ impl Annot {
             Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
             Kind::Measure { pts, area, value, size, .. } => {
                 if *area && pts.len() >= 3 {
-                    out.push(Prim::Fill { pts: pts.clone(), color: c, alpha: 40, outline: Some((c, w)) });
+                    let fill = self.style.fill.unwrap_or(Fill { color: c, alpha: AREA_TINT });
+                    out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
                 } else if pts.len() >= 2 {
                     out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c });
                     // Ticks square to the line at both ends, like a dimension.
@@ -421,6 +479,58 @@ impl Annot {
             }
         }
         out
+    }
+
+    /// The fill a markup has when none is chosen: a callout's white box, an area's tint.
+    pub fn default_fill(&self) -> Option<Fill> {
+        match self.kind {
+            Kind::Callout { .. } => Some(Fill { color: WHITE, alpha: 255 }),
+            Kind::Measure { area: true, .. } => Some(Fill { color: self.color, alpha: AREA_TINT }),
+            _ => None,
+        }
+    }
+
+    /// The fill that's drawn, if any.
+    pub fn effective_fill(&self) -> Option<Fill> {
+        self.style.fill.or_else(|| self.default_fill()).filter(|f| f.alpha > 0)
+    }
+
+    /// Sets the fill; `None` clears even a default one (a transparent fill is stored).
+    pub fn set_fill(&mut self, fill: Option<Fill>) {
+        self.style.fill = match fill {
+            None if self.default_fill().is_some() => Some(Fill { color: WHITE, alpha: 0 }),
+            f => f,
+        };
+    }
+
+    /// Whether the markup can take a fill: closed shapes and text boxes.
+    pub fn fillable(&self) -> bool {
+        match &self.kind {
+            Kind::Callout { .. } | Kind::Text { .. } | Kind::Cloud { .. } | Kind::Rect { .. } => true,
+            Kind::Poly { closed, .. } => *closed,
+            Kind::Measure { area, .. } => *area,
+            _ => false,
+        }
+    }
+
+    /// The closed outline whose inside is filled, when the markup has a fill.
+    /// (A callout's box always counts, through `text_box`.)
+    fn filled_outline(&self) -> Option<Vec<Pos2>> {
+        if !self.style.fill.is_some_and(|f| f.alpha > 0) {
+            return None;
+        }
+        match &self.kind {
+            Kind::Cloud { rect } => Some(cloud_pts(*rect)),
+            Kind::Rect { rect } => Some(rect_pts(*rect)),
+            Kind::Poly { pts, closed: true } | Kind::Measure { pts, area: true, .. } if pts.len() >= 3 => Some(pts.clone()),
+            _ => None,
+        }
+    }
+
+    fn fill_prims(&self, out: &mut Vec<Prim>, pts: Vec<Pos2>) {
+        if let Some(f) = self.style.fill.filter(|f| f.alpha > 0) {
+            out.push(Prim::Fill { pts, color: f.color, alpha: f.alpha, outline: None });
+        }
     }
 }
 
@@ -685,7 +795,7 @@ mod tests {
 
     #[test]
     fn fit_box_shrinks_and_keeps_callout_edge() {
-        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0, leaders: vec![] } };
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0, leaders: vec![] } };
         let right = a.text_box().unwrap().max.x;
         a.fit_box_w();
         let r = a.text_box().unwrap();
@@ -699,7 +809,7 @@ mod tests {
     #[test]
     fn extra_leaders_meet_the_first_bend() {
         let a = Annot {
-            id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None,
+            id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, style: Default::default(),
             kind: Kind::Callout {
                 anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0,
                 text: "Note".into(), size: 12.0, leaders: vec![pos2(200.0, 400.0), pos2(600.0, 300.0)],
@@ -726,7 +836,7 @@ mod tests {
 
     #[test]
     fn marquee_touches_lines_not_empty_space() {
-        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind };
+        let ann = |kind| Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, style: Default::default(), kind };
         let box_at = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), vec2(10.0, 10.0));
         let diag = ann(Kind::Line { a: pos2(0.0, 0.0), b: pos2(100.0, 100.0) });
         assert!(diag.touches(box_at(45.0, 45.0)));
@@ -753,7 +863,7 @@ mod tests {
 
     #[test]
     fn image_hits_inside_and_labels_by_name() {
-        let a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, kind: Kind::Image { rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)), image: "x.png".into(), name: "NC seal".into() } };
+        let a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Image { rect: Rect::from_min_size(pos2(10.0, 10.0), vec2(50.0, 50.0)), image: "x.png".into(), name: "NC seal".into() } };
         assert_eq!(a.distance(pos2(30.0, 30.0)), 0.0);
         assert!((a.distance(pos2(100.0, 30.0)) - 39.0).abs() < 1e-3, "outline distance less half the line width");
         assert!(a.touches(Rect::from_min_size(pos2(20.0, 20.0), vec2(5.0, 5.0))));
