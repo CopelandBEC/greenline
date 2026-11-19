@@ -1633,7 +1633,7 @@ impl App {
             }
             Drag::Handle { id, before, .. } => {
                 // A polygon's outline mustn't end up crossing itself.
-                if self.find(id).is_some_and(|a| matches!(&a.kind, Kind::Poly { pts, closed: true } if measure::crosses_itself(pts))) {
+                if self.find(id).is_some_and(|a| matches!(&a.kind, Kind::Poly { pts, closed: true } if measure::not_simple(pts))) {
                     self.annots = before;
                     self.toast("That would make the polygon's outline cross itself".into());
                     return;
@@ -1856,7 +1856,7 @@ impl App {
             Tool::Area if pts.len() >= 3 => self.add_measure(page, pts, true),
             Tool::Area => self.toast("An area needs at least three points".into()),
             Tool::Polyline if pts.len() >= 2 => self.add_poly(page, pts, false),
-            Tool::Polygon if pts.len() >= 3 && measure::crosses_itself(&pts) => {
+            Tool::Polygon if pts.len() >= 3 && measure::not_simple(&pts) => {
                 self.building = Some((page, pts));
                 self.toast("The outline crosses itself: Backspace to take back a point, or Esc to drop it".into());
             }
@@ -2614,7 +2614,7 @@ impl App {
             // Live preview.
             match &self.drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
-                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate) { square(*start, *cur) } else { *cur };
+                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline) { square(*start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
                         let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };

@@ -272,8 +272,8 @@ impl Fields<'_> {
                 if measure::area_pt2(&pts) < 1.0 {
                     return Err("the polygon is empty".into());
                 }
-                if measure::crosses_itself(&pts) {
-                    return Err("the polygon's outline crosses itself".into());
+                if measure::not_simple(&pts) {
+                    return Err("the polygon's outline crosses or touches itself".into());
                 }
                 Kind::Poly { pts, closed: true }
             }

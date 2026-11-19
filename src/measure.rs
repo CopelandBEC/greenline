@@ -143,6 +143,37 @@ pub fn crosses_itself(pts: &[Pos2]) -> bool {
     false
 }
 
+/// Whether a closed outline crosses or touches itself anywhere but where
+/// neighbouring edges meet (a polygon's fill would come out different on screen and in export).
+pub fn not_simple(pts: &[Pos2]) -> bool {
+    let n = pts.len();
+    if n < 4 {
+        return false;
+    }
+    let orient = |a: Pos2, b: Pos2, c: Pos2| {
+        let v = (b.x - a.x) as f64 * (c.y - a.y) as f64 - (b.y - a.y) as f64 * (c.x - a.x) as f64;
+        if v.abs() < 1e-6 { 0.0 } else { v.signum() }
+    };
+    let on = |a: Pos2, b: Pos2, p: Pos2| p.x >= a.x.min(b.x) - 1e-4 && p.x <= a.x.max(b.x) + 1e-4 && p.y >= a.y.min(b.y) - 1e-4 && p.y <= a.y.max(b.y) + 1e-4;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        for j in i + 2..n {
+            if (j + 1) % n == i {
+                continue;
+            }
+            let (c, d) = (pts[j], pts[(j + 1) % n]);
+            let (o1, o2, o3, o4) = (orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b));
+            if o1 * o2 < 0.0 && o3 * o4 < 0.0 {
+                return true;
+            }
+            if (o1 == 0.0 && on(a, b, c)) || (o2 == 0.0 && on(a, b, d)) || (o3 == 0.0 && on(c, d, a)) || (o4 == 0.0 && on(c, d, b)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Why a measurement has no value: no scale where it is, or an area outline that crosses itself.
 pub fn problem(a: &Annot, scales: &[Scale]) -> Option<&'static str> {
     let Kind::Measure { pts, area, .. } = &a.kind else { return None };
@@ -524,6 +555,10 @@ mod tests {
         assert!(!crosses_itself(&l));
         assert!(!crosses_itself(&[pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0), pos2(0.0, 10.0)]));
         let scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
+        // A polygon touching itself at a corner isn't simple either; a plain one is.
+        let touching = [pos2(100.0, 100.0), pos2(100.0, 250.0), pos2(200.0, 200.0), pos2(300.0, 100.0), pos2(300.0, 300.0), pos2(200.0, 200.0)];
+        assert!(not_simple(&touching), "but it touches");
+        assert!(!not_simple(&[pos2(0.0, 0.0), pos2(10.0, 0.0), pos2(10.0, 10.0), pos2(0.0, 10.0)]));
         let mut a = vec![Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Measure { pts: bowtie, area: true, name: String::new(), value: String::new(), size: 10.0 } }];
         relabel(&mut a, &scales, Units::Imperial);
         assert_eq!(a[0].label(), "outline crosses itself");
