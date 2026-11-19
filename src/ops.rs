@@ -18,6 +18,7 @@ Common fields: "color" (green, red, blue, black, orange, yellow or "#rrggbb";
 default green, highlight yellow), "width" (line width in points, default 2),
 "size" (text size in points, default 12; 10 for measurement labels),
 "group" (any string: ops on one page with the same group select and move together),
+"bold", "italic", "underline" (true: the whole note of a callout or text box),
 "fill" (a colour as for "color", or "white": fills a cloud, rect, polygon, area, callout or
 text box) with "opacity" (0 to 100, default 50),
 "line" (a line type: dashed, dotted, dash-dot, or a name from the pattern library; for
@@ -137,6 +138,16 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
             }
         };
         let mut a = Annot { id: first_id + batch.annots.len() as u64, page, color, width, kind, wrap_w: None, group, style: Default::default() };
+        for (key, flag) in [("bold", &mut a.style.bold), ("italic", &mut a.style.italic), ("underline", &mut a.style.underline)] {
+            match o.get(key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Bool(b)) => *flag = *b,
+                Some(_) => return Err(ctx(format!("\"{key}\" must be true or false"))),
+            }
+        }
+        if (a.style.bold || a.style.italic || a.style.underline) && !matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. }) {
+            return Err(ctx("\"bold\", \"italic\" and \"underline\" are for callouts and text boxes".into()));
+        }
         a.style.fill = f.fill().map_err(ctx)?;
         if a.style.fill.is_some() && !a.fillable() {
             return Err(ctx("\"fill\" is for clouds, rects, polygons, areas, callouts and text boxes".into()));

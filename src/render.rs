@@ -396,8 +396,10 @@ impl Images<'_> {
 
 /// Fonts for text prims: built-in Helvetica plus system faces embedded on demand.
 struct TextFonts {
-    helvetica: PdfFontToken,
-    embedded: std::collections::HashMap<usize, PdfFontToken>,
+    /// Helvetica, -Bold, -Oblique, -BoldOblique (indexed bold * 1 + italic * 2).
+    helvetica: [PdfFontToken; 4],
+    /// By system face and whether its bold / italic version was used.
+    embedded: std::collections::HashMap<(usize, bool, bool), PdfFontToken>,
     missing: usize,
 }
 
@@ -460,24 +462,31 @@ fn emit_prims<'a>(
                 let obj = path_object(doc, &pts, true, outline, Some(color(c, alpha)))?;
                 objects.add_path_object(obj)?;
             }
-            Prim::Text { origin, text, size, color: c } => {
+            Prim::Text { origin, text, size, color: c, bold, italic } => {
                 let (runs, lost) = font_runs(&text);
                 fonts.missing += lost;
                 let mut x = 0.0;
                 for (key, run) in runs {
                     let f = match key {
-                        None => fonts.helvetica,
-                        Some(i) => match fonts.embedded.get(&i) {
-                            Some(t) => *t,
-                            None => {
-                                let t = doc.fonts_mut().load_true_type_from_file(&crate::fonts::faces()[i].path, true)?;
-                                fonts.embedded.insert(i, t);
-                                t
+                        None => fonts.helvetica[bold as usize + 2 * italic as usize],
+                        Some(i) => {
+                            // Characters beyond WinAnsi in a bold or italic note: the styled
+                            // face of the Helvetica-metric font where the system has one.
+                            let styled = (i == 0 && (bold || italic)).then(|| crate::fonts::styled(bold, italic)).flatten().filter(|f| run.chars().all(|c| f.covers(c)));
+                            let key = (i, styled.is_some() && bold, styled.is_some() && italic);
+                            match fonts.embedded.get(&key) {
+                                Some(t) => *t,
+                                None => {
+                                    let path = styled.map_or(&crate::fonts::faces()[i].path, |f| &f.path);
+                                    let t = doc.fonts_mut().load_true_type_from_file(path, true)?;
+                                    fonts.embedded.insert(key, t);
+                                    t
+                                }
                             }
-                        },
+                        }
                     };
                     let o = m.map(origin) + ux * (x * k);
-                    x += crate::annot::text_width(&run, size);
+                    x += crate::annot::text_width_b(&run, size, bold);
                     let mut obj = PdfPageTextObject::new(doc, &run, f, PdfPoints::new(size * k))?;
                     obj.set_fill_color(color(c, 255))?;
                     obj.apply_matrix(PdfMatrix::new(ux.x, ux.y, uy.x, uy.y, o.x, o.y))?;
@@ -517,7 +526,8 @@ pub fn export(
     author: &str,
 ) -> anyhow::Result<usize> {
     let mut doc = pdfium.load_pdf_from_file(src, None)?;
-    let helvetica = doc.fonts_mut().helvetica();
+    let f = doc.fonts_mut();
+    let helvetica = [f.helvetica(), f.helvetica_bold(), f.helvetica_oblique(), f.helvetica_bold_oblique()];
     let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
     let mut images = Images { src: images, scaled: HashMap::new() };
     let n = doc.pages().len();
@@ -799,6 +809,30 @@ pub(crate) mod tests {
             });
         }
         assert_eq!(order, ["base", "thumb1", "search7", "thumb2"]);
+    }
+
+    /// Bold and italic notes export in Helvetica-Bold / -Oblique.
+    #[test]
+    fn export_bold_and_italic_fonts() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+        let mut b = annot(0, Kind::Text { pos: pos2(40.0, 40.0), box_w: 300.0, text: "Bold note".into(), size: 14.0 });
+        b.style.bold = true;
+        let mut i = annot(0, Kind::Text { pos: pos2(40.0, 140.0), box_w: 300.0, text: "Italic note".into(), size: 14.0 });
+        i.style.italic = true;
+        export(pdfium, &src, &out, &[b, i], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let fonts: Vec<String> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| t.font().name())).collect();
+        assert!(fonts.iter().any(|f| f.contains("Bold")) && fonts.iter().any(|f| f.contains("Oblique")), "{fonts:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Search finds text case-insensitively and reports its box in view points.

@@ -66,6 +66,52 @@ pub fn faces() -> &'static [Face] {
     })
 }
 
+/// Bold, italic and bold-italic faces of the first (Helvetica-metric) face, for
+/// formatted markup text on screen; `None` where the system lacks one.
+#[cfg(not(windows))]
+fn styled_candidates(bold: bool, italic: bool) -> Vec<String> {
+    let name = match (bold, italic) {
+        (true, true) => "LiberationSans-BoldItalic.ttf",
+        (true, false) => "LiberationSans-Bold.ttf",
+        (false, true) => "LiberationSans-Italic.ttf",
+        (false, false) => "LiberationSans-Regular.ttf",
+    };
+    ["/usr/share/fonts/liberation", "/usr/share/fonts/TTF", "/usr/share/fonts/truetype/liberation"].iter().map(|d| format!("{d}/{name}")).collect()
+}
+
+#[cfg(windows)]
+fn styled_candidates(bold: bool, italic: bool) -> Vec<String> {
+    let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let name = match (bold, italic) {
+        (true, true) => "arialbi.ttf",
+        (true, false) => "arialbd.ttf",
+        (false, true) => "ariali.ttf",
+        (false, false) => "arial.ttf",
+    };
+    vec![format!(r"{dir}\Fonts\{name}")]
+}
+
+/// The styled face, if the system has it (`None` for plain: that's `faces()[0]`).
+pub fn styled(bold: bool, italic: bool) -> Option<&'static Face> {
+    static STYLED: OnceLock<[Option<Face>; 3]> = OnceLock::new();
+    let all = STYLED.get_or_init(|| {
+        let load = |b, i| styled_candidates(b, i).into_iter().find_map(|path| std::fs::read(&path).ok().map(|data| Face { path, data }));
+        [load(true, false), load(false, true), load(true, true)]
+    });
+    match (bold, italic) {
+        (true, false) => all[0].as_ref(),
+        (false, true) => all[1].as_ref(),
+        (true, true) => all[2].as_ref(),
+        (false, false) => None,
+    }
+}
+
+/// Advance width (1/1000 em) of `c` in bold: the bold face's where it has the
+/// character, else the plain fallback's.
+pub fn advance_bold(c: char) -> Option<f32> {
+    styled(true, false).filter(|f| f.covers(c)).and_then(|f| f.advance(c)).or_else(|| advance(c))
+}
+
 /// Index into `faces()` of the first face with a glyph for `c`.
 pub fn face_for(c: char) -> Option<usize> {
     faces().iter().position(|f| f.covers(c))
