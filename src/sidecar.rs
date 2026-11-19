@@ -139,12 +139,12 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
 pub fn retire(pdf: &Path) -> anyhow::Result<bool> {
     let Some(_lock) = lock(pdf)? else { return Ok(false) };
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    for f in [file_for(pdf), crate::proposals::file_for(pdf)] {
-        if f.exists() {
-            let stem = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            std::fs::rename(&f, f.with_file_name(format!("{stem}.replaced-{stamp}")))?;
-        }
+    let f = file_for(pdf);
+    if f.exists() {
+        let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::rename(&f, f.with_file_name(format!("{name}.replaced-{stamp}")))?;
     }
+    crate::proposals::retire(pdf, &format!("replaced-{stamp}"))?;
     Ok(true)
 }
 

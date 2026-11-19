@@ -92,6 +92,22 @@ pub fn update<T>(pdf: &Path, f: impl FnOnce(&mut Proposals) -> anyhow::Result<T>
     update_file(&file_for(pdf), pdf, f)
 }
 
+/// Renames `pdf`'s proposals aside (to `<file>.<suffix>`) under their lock, so
+/// an agent's `apply` running at the same moment can't write the old ones back.
+pub fn retire(pdf: &Path, suffix: &str) -> anyhow::Result<()> {
+    let path = file_for(pdf);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("lock"))?;
+    lock.lock()?;
+    if path.exists() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::rename(&path, path.with_file_name(format!("{name}.{suffix}")))?;
+    }
+    Ok(())
+}
+
 /// `update` on the proposals file `path` for `pdf`.
 pub fn update_file<T>(path: &Path, pdf: &Path, f: impl FnOnce(&mut Proposals) -> anyhow::Result<T>) -> anyhow::Result<T> {
     if let Some(dir) = path.parent() {
