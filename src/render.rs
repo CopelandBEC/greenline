@@ -33,6 +33,8 @@ pub enum Req {
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
+    /// Write a new PDF of `pages` blank pages, `size` points each.
+    Create { path: PathBuf, size: Vec2, pages: usize },
     /// Find `query` on `pages` in turn, for search `id`. The worker searches one
     /// page per turn and queues the rest behind other work, so renders stay live.
     Search { generation: u64, id: u64, pages: VecDeque<usize>, query: String },
@@ -46,6 +48,8 @@ pub enum Resp {
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
     PageText { generation: u64, page: usize, text: String },
+    /// A blank PDF written (its path), or why not.
+    Created(Result<PathBuf, String>),
     /// Matches on one page for search `id`: per match, a box per line it spans;
     /// `more` when the page had more than were reported.
     Found { generation: u64, id: u64, page: usize, hits: Vec<Vec<egui::Rect>>, more: bool },
@@ -171,6 +175,7 @@ fn run(
                 }
                 Resp::Found { generation, id, page, hits, more }
             }
+            Req::Create { path, size, pages } => Resp::Created(create_blank(pdfium, &path, size, pages).map(|_| path).map_err(|e| e.to_string())),
             Req::Export { src, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
                     .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
@@ -226,6 +231,21 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut 
         (Some(i), None) | (None, Some(i)) => queue.remove(i),
         (None, None) => queue.pop_front(),
     }
+}
+
+/// Writes a PDF of `pages` blank pages of `size` points (via a temporary file,
+/// so a failed write leaves nothing half-done behind).
+pub fn create_blank(pdfium: &Pdfium, path: &Path, size: Vec2, pages: usize) -> anyhow::Result<()> {
+    let mut doc = pdfium.create_new_pdf()?;
+    for _ in 0..pages.max(1) {
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(size.x), PdfPoints::new(size.y)))?;
+    }
+    let tmp = path.with_extension(format!("pdf.{}.part", std::process::id()));
+    let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| Ok(std::fs::rename(&tmp, path)?));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
 }
 
 pub fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
@@ -832,6 +852,23 @@ pub(crate) mod tests {
         let page = doc.pages().get(0).unwrap();
         let fonts: Vec<String> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| t.font().name())).collect();
         assert!(fonts.iter().any(|f| f.contains("Bold")) && fonts.iter().any(|f| f.contains("Oblique")), "{fonts:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new blank document has the pages asked for, at the size asked for.
+    #[test]
+    fn creates_blank_documents() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blank.pdf");
+        create_blank(pdfium, &path, vec2(1224.0, 792.0), 3).unwrap();
+        let doc = pdfium.load_pdf_from_file(&path, None).unwrap();
+        assert_eq!(doc.pages().len(), 3);
+        let p = doc.pages().get(2).unwrap();
+        assert_eq!((p.width().value, p.height().value), (1224.0, 792.0));
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 1, "no temporary file left");
         std::fs::remove_dir_all(&dir).ok();
     }
 

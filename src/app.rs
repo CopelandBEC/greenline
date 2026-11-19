@@ -44,6 +44,10 @@ enum Pick {
     Images(stamps::Use),
     /// Bluebeam line type / hatch files to import.
     Patterns,
+    /// Where to save a new blank document: page size (points) and count.
+    NewDoc(Vec2, usize),
+    /// A photo or sketch to place as a markup.
+    Picture,
     /// The shared pattern library folder.
     PatternDir,
 }
@@ -154,6 +158,32 @@ struct Mods {
     shift: bool,
 }
 
+/// Page sizes offered for a new document: name and portrait size in points.
+const PAGE_SIZES: [(&str, Vec2); 9] = [
+    ("Letter  8.5 × 11 in", Vec2::new(612.0, 792.0)),
+    ("Legal  8.5 × 14 in", Vec2::new(612.0, 1008.0)),
+    ("Tabloid  11 × 17 in", Vec2::new(792.0, 1224.0)),
+    ("ARCH C  18 × 24 in", Vec2::new(1296.0, 1728.0)),
+    ("ARCH D  24 × 36 in", Vec2::new(1728.0, 2592.0)),
+    ("ARCH E  36 × 48 in", Vec2::new(2592.0, 3456.0)),
+    ("A4  210 × 297 mm", Vec2::new(595.3, 841.9)),
+    ("A3  297 × 420 mm", Vec2::new(841.9, 1190.6)),
+    ("A1  594 × 841 mm", Vec2::new(1683.8, 2383.9)),
+];
+
+/// The New document window's choices.
+struct NewDoc {
+    size: usize,
+    landscape: bool,
+    pages: usize,
+}
+
+impl Default for NewDoc {
+    fn default() -> Self {
+        Self { size: 0, landscape: false, pages: 1 }
+    }
+}
+
 /// The find bar (Ctrl+F) and its results.
 #[derive(Default)]
 struct Find {
@@ -250,6 +280,8 @@ pub struct App {
     building: Option<(usize, Vec<Pos2>)>,
     scale_win: ScaleWin,
     find: Find,
+    /// The New document window, while open.
+    new_doc: Option<NewDoc>,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -390,6 +422,7 @@ impl App {
             building: None,
             scale_win: ScaleWin::default(),
             find: Find::default(),
+            new_doc: None,
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -582,6 +615,14 @@ impl App {
             }
             Pick::Images(_) => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
             Pick::Patterns => d.add_filter("Bluebeam line types and hatches", &["blx", "bhx"]),
+            Pick::Picture => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
+            Pick::NewDoc(..) => {
+                let d = d.add_filter("PDF", &["pdf"]).set_file_name("Untitled.pdf");
+                match self.path.as_ref().and_then(|p| p.parent()) {
+                    Some(dir) => d.set_directory(dir),
+                    None => d,
+                }
+            }
             Pick::PatternDir => d,
         };
         let (tx, rx) = mpsc::channel();
@@ -591,6 +632,8 @@ impl App {
                 Pick::Open => d.pick_file().into_iter().collect(),
                 Pick::Export(..) => d.save_file().into_iter().collect(),
                 Pick::Images(_) | Pick::Patterns => d.pick_files().unwrap_or_default(),
+                Pick::Picture => d.pick_file().into_iter().collect(),
+                Pick::NewDoc(..) => d.save_file().into_iter().collect(),
                 Pick::PatternDir => d.pick_folder().into_iter().collect(),
             };
             tx.send((pick, paths)).ok();
@@ -635,6 +678,18 @@ impl App {
                     }
                 }
             }
+            Pick::NewDoc(size, pages) => {
+                if let (Some(path), Some(w)) = (paths.into_iter().next(), &self.worker) {
+                    // The dialog may leave off the extension.
+                    let path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) { path } else { path.with_extension("pdf") };
+                    w.send(Req::Create { path, size, pages });
+                }
+            }
+            Pick::Picture => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.place_picture(&p, None);
+                }
+            }
             Pick::PatternDir => {
                 if let Some(dir) = paths.into_iter().next() {
                     self.prefs.pattern_dir = Some(dir);
@@ -642,6 +697,27 @@ impl App {
                     self.reload_patterns();
                 }
             }
+        }
+    }
+
+    /// Stores a photo or sketch and places it: at `at` (screen) when dropped on
+    /// a sheet, otherwise with the next click (or drag to size).
+    fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
+        let (image, name, px) = match stamps::store_picture(src) {
+            Ok(r) => r,
+            Err(e) => {
+                self.toast(format!("Could not add the image: {e}"));
+                return;
+            }
+        };
+        let aspect = px.x / px.y.max(1.0);
+        // As if at 150 dpi, but no wider than 60% of the page in view.
+        let page_w = self.pages.get(self.current_page()).map_or(612.0, |s| s.x);
+        let width = (px.x / 150.0 * 72.0).min(page_w * 0.6).max(36.0);
+        self.set_tool(Tool::Select);
+        self.start_placing(Place::Image { image, name, aspect, width });
+        if let Some((page, p)) = at.and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s)))) {
+            self.place(page, p, p);
         }
     }
 
@@ -724,6 +800,8 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::Created(Ok(path)) => self.open(path),
+                Resp::Created(Err(e)) => self.toast(format!("Could not create the document: {e}")),
                 Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
                     self.find.more |= more;
                     self.on_found(page, hits);
@@ -898,6 +976,50 @@ impl App {
         self.find.pending = n;
         let pages = (0..n).map(|k| (self.find_from + k) % n).collect();
         w.send(Req::Search { generation: self.generation, id: self.find.id, pages, query: q });
+    }
+
+    /// The New document window: page size, orientation and count, then where to save it.
+    fn new_doc_window(&mut self, ctx: &egui::Context) {
+        let Some(nd) = &mut self.new_doc else { return };
+        let mut open = true;
+        let mut create = None;
+        let mut cancel = false;
+        egui::Window::new("New document").open(&mut open).resizable(false).collapsible(false).anchor(Align2::CENTER_TOP, vec2(0.0, 80.0)).show(ctx, |ui| {
+            egui::Grid::new("newdoc").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Page size");
+                egui::ComboBox::from_id_salt("newsize").width(180.0).selected_text(PAGE_SIZES[nd.size].0).show_ui(ui, |ui| {
+                    for (i, (name, _)) in PAGE_SIZES.iter().enumerate() {
+                        ui.selectable_value(&mut nd.size, i, *name);
+                    }
+                });
+                ui.end_row();
+                ui.label("Orientation");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut nd.landscape, false, "Portrait");
+                    ui.selectable_value(&mut nd.landscape, true, "Landscape");
+                });
+                ui.end_row();
+                ui.label("Pages");
+                ui.add(egui::DragValue::new(&mut nd.pages).range(1..=200));
+                ui.end_row();
+            });
+            ui.weak("Then drop in images (or Insert image) and mark up as usual.");
+            ui.horizontal(|ui| {
+                if ui.button("Create…").on_hover_text("Choose where to save it").clicked() {
+                    let s = PAGE_SIZES[nd.size].1;
+                    create = Some((if nd.landscape { vec2(s.y, s.x) } else { s }, nd.pages));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if let Some((size, pages)) = create {
+            self.ask = Some(Pick::NewDoc(size, pages));
+            self.new_doc = None;
+        } else if !open || cancel {
+            self.new_doc = None;
+        }
     }
 
     /// The find bar, top right of the drawing: text, match count, previous/next.
@@ -1580,6 +1702,9 @@ impl App {
         if cmd {
             if pressed(Key::O) {
                 self.ask = Some(Pick::Open);
+            }
+            if pressed(Key::N) {
+                self.new_doc.get_or_insert_with(NewDoc::default);
             }
             if pressed(Key::E) {
                 let alt = ctx.input(|i| i.modifiers.alt);
@@ -3208,6 +3333,9 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
+            if ui.button("New").on_hover_text("A blank document to mark up (Ctrl+N)").clicked() {
+                self.new_doc.get_or_insert_with(NewDoc::default);
+            }
             if ui.button("Open").on_hover_text("Ctrl+O").clicked() {
                 self.ask = Some(Pick::Open);
             }
@@ -3279,6 +3407,10 @@ impl App {
                     }
                 }
                 ui.separator();
+                if ui.add_enabled(!self.pages.is_empty(), egui::Button::new("Insert image…")).on_hover_text("A photo or sketch as a markup (or drop a PNG/JPEG on a sheet)").clicked() {
+                    self.ask = Some(Pick::Picture);
+                    ui.close();
+                }
                 if ui.selectable_label(self.scale_win.open, "Scale   (U)").on_hover_text("Set the drawing scale for measuring").clicked() {
                     self.scale_win.open = !self.scale_win.open;
                     ui.close();
@@ -4080,6 +4212,8 @@ impl App {
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
+                    ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
+                    ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
                     ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
@@ -4147,8 +4281,18 @@ impl eframe::App for App {
         self.poll_worker(&ctx);
         self.poll_dialog();
 
-        if let Some(p) = ctx.input(|i| i.raw.dropped_files.iter().next().map(|f| f.path().to_path_buf())) {
-            self.open(p);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() {
+            let at = ctx.input(|i| i.pointer.hover_pos());
+            for p in dropped {
+                // An image dropped on a sheet is placed there; a PDF opens.
+                if stamps::is_picture(&p) && !self.pages.is_empty() {
+                    self.place_picture(&p, at);
+                } else {
+                    self.open(p);
+                    break;
+                }
+            }
         }
 
         // Measurements read from the scales as they are now (cheap: measurements only).
@@ -4209,6 +4353,7 @@ impl eframe::App for App {
         self.scale_window(&ctx);
         self.goto_overlay(&ctx);
         self.find_bar(&ctx);
+        self.new_doc_window(&ctx);
         self.help(&ctx);
         self.request_renders(&ctx, now);
         self.show_dialog(&ctx, frame);

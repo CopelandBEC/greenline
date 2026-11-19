@@ -26,6 +26,8 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
 | `W` / `F` / `Z` | Fit width / fit page / zoom to the selected markups — or click the zoom % in the status bar for fit, actual size and presets |
 | `Ctrl+F` | Find text in the document: matches are highlighted on the sheets; `Enter` / `F3` next, `Shift` for previous, `Esc` closes |
+| `Ctrl+N` | New blank document: Letter to ARCH E or A4–A1, portrait or landscape, any number of pages, saved where you choose |
+| Drop an image | A PNG or JPEG dropped on a sheet is placed there as a markup, full colour (tool menu ▸ **Insert image…** too); resize it by its corners |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
