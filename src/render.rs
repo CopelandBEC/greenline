@@ -398,7 +398,8 @@ impl Images<'_> {
 struct TextFonts {
     /// Helvetica, -Bold, -Oblique, -BoldOblique (indexed bold * 1 + italic * 2).
     helvetica: [PdfFontToken; 4],
-    embedded: std::collections::HashMap<usize, PdfFontToken>,
+    /// By system face and whether its bold / italic version was used.
+    embedded: std::collections::HashMap<(usize, bool, bool), PdfFontToken>,
     missing: usize,
 }
 
@@ -468,14 +469,21 @@ fn emit_prims<'a>(
                 for (key, run) in runs {
                     let f = match key {
                         None => fonts.helvetica[bold as usize + 2 * italic as usize],
-                        Some(i) => match fonts.embedded.get(&i) {
-                            Some(t) => *t,
-                            None => {
-                                let t = doc.fonts_mut().load_true_type_from_file(&crate::fonts::faces()[i].path, true)?;
-                                fonts.embedded.insert(i, t);
-                                t
+                        Some(i) => {
+                            // Characters beyond WinAnsi in a bold or italic note: the styled
+                            // face of the Helvetica-metric font where the system has one.
+                            let styled = (i == 0 && (bold || italic)).then(|| crate::fonts::styled(bold, italic)).flatten().filter(|f| run.chars().all(|c| f.covers(c)));
+                            let key = (i, styled.is_some() && bold, styled.is_some() && italic);
+                            match fonts.embedded.get(&key) {
+                                Some(t) => *t,
+                                None => {
+                                    let path = styled.map_or(&crate::fonts::faces()[i].path, |f| &f.path);
+                                    let t = doc.fonts_mut().load_true_type_from_file(path, true)?;
+                                    fonts.embedded.insert(key, t);
+                                    t
+                                }
                             }
-                        },
+                        }
                     };
                     let o = m.map(origin) + ux * (x * k);
                     x += crate::annot::text_width_b(&run, size, bold);

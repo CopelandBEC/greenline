@@ -163,6 +163,7 @@ pub fn char_width_b(c: char, size: f32, bold: bool) -> f32 {
     let w = match c as u32 {
         32..=126 if bold => HELV_BOLD[(c as u32 - 32) as usize] as f32,
         32..=126 => HELV[(c as u32 - 32) as usize] as f32,
+        _ if bold => crate::fonts::advance_bold(c).unwrap_or(611.0),
         _ => crate::fonts::advance(c).unwrap_or(556.0),
     };
     w * size / 1000.0

@@ -1140,7 +1140,7 @@ impl App {
     /// The bold / italic / underline the toolbar shows: the note being typed or
     /// the lead selected one, else what new notes get.
     fn shown_format(&self) -> [bool; 3] {
-        let note = self.editing.or_else(|| self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| a.text_size().is_some())));
+        let note = self.editing.or_else(|| self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. }))));
         match note.and_then(|id| self.find(id)) {
             Some(a) => [a.style.bold, a.style.italic, a.style.underline],
             None => self.text_format,
@@ -1158,15 +1158,23 @@ impl App {
         };
         let notes = |a: &Annot| ids.contains(&a.id) && matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. });
         if self.annots.iter().any(notes) {
-            self.snapshot();
+            // While typing, the edit (begun with its own undo step) takes the change with it.
+            if self.editing.is_none() {
+                self.snapshot();
+            }
             for a in self.annots.iter_mut().filter(|a| notes(a)) {
                 [&mut a.style.bold, &mut a.style.italic, &mut a.style.underline][which].clone_from(&on);
-                // Bold text is wider: keep the box fitted.
+                // Bold text is wider: refit the box from the width it wraps at.
                 if which == 0 && self.editing != Some(a.id) {
+                    a.widen_for_edit();
                     a.fit_box_w();
                 }
             }
             self.changed();
+        }
+        // A click on B / I / U mustn't end the typing.
+        if self.editing.is_some() {
+            self.edit_needs_focus = true;
         }
     }
 
@@ -4583,9 +4591,9 @@ fn install_fonts(ctx: &egui::Context) {
     family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
     for (b, i) in [(true, false), (false, true), (true, true)] {
         let mut styled = Vec::new();
-        if let Some(data) = crate::fonts::styled(b, i) {
+        if let Some(face) = crate::fonts::styled(b, i) {
             let name = format!("styled-{b}-{i}");
-            fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(data.to_vec())));
+            fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(face.data().to_vec())));
             styled.push(name);
         }
         styled.extend(family.iter().cloned());
@@ -5120,9 +5128,32 @@ mod tests {
         app.click(pos2(400.0, 100.0), false, PLAIN);
         let t = app.editing.unwrap();
         assert!(app.find(t).unwrap().style.underline);
-        // While typing, the toggle is for that note.
+        // While typing, the toggle is for that note, with the edit's own undo step,
+        // and typing carries on.
+        let steps = app.undo.len();
+        app.edit_needs_focus = false;
         app.toggle_format(1);
         assert!(app.find(t).unwrap().style.italic);
+        assert_eq!(app.undo.len(), steps);
+        assert!(app.edit_needs_focus);
+    }
+
+    #[test]
+    fn bold_on_and_off_leaves_a_fitted_note_as_it_was() {
+        let mut app = app();
+        let t = app.add(0, Kind::Text { pos: pos2(100.0, 100.0), box_w: 192.0, text: "Window head".into(), size: 12.0 });
+        app.find_mut(t).unwrap().fit_box_w();
+        let before = app.find(t).unwrap().text_box().unwrap();
+        // A measurement last in the selection doesn't confuse the toggle.
+        let m = app.add(0, Kind::Measure { pts: vec![pos2(0.0, 0.0), pos2(50.0, 0.0)], area: false, name: String::new(), value: String::new(), size: 10.0 });
+        app.selected = vec![t, m];
+        app.toggle_format(0);
+        assert_eq!(app.shown_format()[0], true);
+        let bold = app.find(t).unwrap().text_box().unwrap();
+        assert_eq!(bold.height(), before.height(), "still one line");
+        app.toggle_format(0);
+        assert!(!app.find(t).unwrap().style.bold);
+        assert_eq!(app.find(t).unwrap().text_box().unwrap(), before);
     }
 
     #[test]
