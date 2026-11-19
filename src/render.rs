@@ -22,6 +22,8 @@ pub enum Layer {
 pub struct Keep {
     pub base: HashSet<usize>,
     pub thumbs: HashSet<usize>,
+    /// The search still wanted; page searches for older ones are dropped.
+    pub search: u64,
 }
 
 pub enum Req {
@@ -31,6 +33,8 @@ pub enum Req {
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
+    /// Find `query` on one page, for search `id`.
+    Search { generation: u64, id: u64, page: usize, query: String },
 }
 
 pub enum Resp {
@@ -41,6 +45,8 @@ pub enum Resp {
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
     PageText { generation: u64, page: usize, text: String },
+    /// Matches on one page for search `id`: per match, a box per line it spans.
+    Found { generation: u64, id: u64, page: usize, hits: Vec<Vec<egui::Rect>> },
 }
 
 pub struct Worker {
@@ -149,6 +155,14 @@ fn run(
                 let text = d.pages().get(page as PdfPageIndex).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
                 Resp::PageText { generation, page, text }
             }
+            Req::Search { generation, id, page, query } => {
+                let Some((g, d)) = &doc else { continue };
+                if *g != generation {
+                    continue;
+                }
+                let hits = d.pages().get(page as PdfPageIndex).ok().and_then(|p| crate::pdf::search_page(&p, &query).ok()).unwrap_or_default();
+                Resp::Found { generation, id, page, hits }
+            }
             Req::Export { src, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
                     .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
@@ -166,7 +180,7 @@ fn run(
 /// Open/Export first, then the newest patch, then base renders the viewer still
 /// wants, then wanted thumbnails.
 fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
-    if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. })) {
+    if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. } | Req::Search { .. })) {
         return queue.remove(i);
     }
     // Drop renders superseded by a newer request for the same page and layer.
@@ -191,6 +205,11 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>) -> Option<Req> {
         _ => true,
     });
     if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Base, .. })) {
+        return queue.remove(i);
+    }
+    // A search goes page by page between renders, so the view stays live; stale ones are dropped.
+    queue.retain(|r| !matches!(r, Req::Search { id, .. } if *id != keep.search));
+    if let Some(i) = queue.iter().position(|r| matches!(r, Req::Search { .. })) {
         return queue.remove(i);
     }
     queue.pop_front()
@@ -747,6 +766,23 @@ pub(crate) mod tests {
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         assert!(doc.pages().get(0).unwrap().objects().len() < 5);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Search finds text case-insensitively and reports its box in view points.
+    #[test]
+    fn search_finds_text_in_view_coordinates() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        let font = doc.fonts_mut().helvetica();
+        let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0), PdfPoints::new(600.0))).unwrap();
+        // Baseline 100 points up from the bottom: 500 down in view points.
+        page.objects_mut().create_text_object(PdfPoints::new(50.0), PdfPoints::new(100.0), "Check the SILL flashing; sill pan", font, PdfPoints::new(12.0)).unwrap();
+        let hits = crate::pdf::search_page(&page, "sill").unwrap();
+        assert_eq!(hits.len(), 2);
+        let r = hits[0][0];
+        assert!(r.min.y > 485.0 && r.max.y < 502.0 && r.min.x > 50.0, "{r:?}");
+        assert!(crate::pdf::search_page(&page, "  ").unwrap().is_empty());
     }
 
     /// Page with an inherited MediaBox and a visible, non-printing annotation:
