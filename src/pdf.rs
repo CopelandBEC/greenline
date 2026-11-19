@@ -59,10 +59,11 @@ pub fn text_runs(page: &PdfPage) -> anyhow::Result<Vec<TextRun>> {
 }
 
 /// Where `query` appears on the page (case-insensitive): one entry per match,
-/// with a box per line it spans, in view points.
-pub fn search_page(page: &PdfPage, query: &str) -> anyhow::Result<Vec<Vec<Rect>>> {
+/// with a box per line it spans, in view points; and whether there were more
+/// than the 5000 reported.
+pub fn search_page(page: &PdfPage, query: &str) -> anyhow::Result<(Vec<Vec<Rect>>, bool)> {
     if query.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let m = ViewToUser::for_page(page)?;
     let text = page.text()?;
@@ -73,11 +74,11 @@ pub fn search_page(page: &PdfPage, query: &str) -> anyhow::Result<Vec<Vec<Rect>>
         if !rects.is_empty() {
             out.push(rects);
         }
-        if out.len() >= 2000 {
-            break;
+        if out.len() >= 5000 {
+            return Ok((out, search.find_next().is_some()));
         }
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Straight line segments drawn on the page (curves skipped), in view points,

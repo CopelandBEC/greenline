@@ -165,6 +165,8 @@ struct Find {
     hits: Vec<(usize, Vec<Rect>)>,
     /// Pages still to report for the current search.
     pending: usize,
+    /// A page had more matches than were reported.
+    more: bool,
     /// Index into `hits` of the match shown.
     cur: Option<usize>,
     focus: bool,
@@ -516,6 +518,9 @@ impl App {
         }
         self.doc_h = y;
         self.fit_pending = true;
+        if self.find.open {
+            self.start_search();
+        }
         let name = self.file_name();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — Greenline")));
         let n = self.annots.len();
@@ -716,7 +721,10 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
-                Resp::Found { generation, id, page, hits } if generation == self.generation && id == self.find.id => self.on_found(page, hits),
+                Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
+                    self.find.more |= more;
+                    self.on_found(page, hits);
+                }
                 Resp::PageText { generation, page, text } if generation == self.generation => {
                     self.scale_win.found.insert(page, measure::find_scales(&text));
                 }
@@ -875,6 +883,7 @@ impl App {
         self.find.hits.clear();
         self.find.cur = None;
         self.find.pending = 0;
+        self.find.more = false;
         let q = self.find.query.trim().to_string();
         let Some(w) = &self.worker else { return };
         w.keep.lock().unwrap().search = self.find.id;
@@ -884,10 +893,8 @@ impl App {
         let n = self.pages.len();
         self.find_from = self.current_page();
         self.find.pending = n;
-        for k in 0..n {
-            let page = (self.find_from + k) % n;
-            w.send(Req::Search { generation: self.generation, id: self.find.id, page, query: q.clone() });
-        }
+        let pages = (0..n).map(|k| (self.find_from + k) % n).collect();
+        w.send(Req::Search { generation: self.generation, id: self.find.id, pages, query: q });
     }
 
     /// The find bar, top right of the drawing: text, match count, previous/next.
@@ -915,6 +922,10 @@ impl App {
                             self.step_hit(if shift { -1 } else { 1 });
                             edit.request_focus();
                         }
+                        // F3 while typing (the shortcut handler sees it otherwise).
+                        if edit.has_focus() && ui.input(|i| i.key_pressed(Key::F3)) {
+                            self.step_hit(if shift { -1 } else { 1 });
+                        }
                         if esc && (edit.has_focus() || edit.lost_focus()) {
                             close = true;
                         }
@@ -922,7 +933,7 @@ impl App {
                             _ if self.find.query.trim().chars().count() < 2 => String::new(),
                             (0, _) if self.find.pending > 0 => "…".into(),
                             (0, _) => "No matches".into(),
-                            (n, Some(c)) => format!("{} of {n}{}", c + 1, if self.find.pending > 0 { "+" } else { "" }),
+                            (n, Some(c)) => format!("{} of {n}{}", c + 1, if self.find.pending > 0 || self.find.more { "+" } else { "" }),
                             (n, None) => format!("{n}"),
                         };
                         ui.add_sized([72.0, 18.0], egui::Label::new(egui::RichText::new(count).weak()));
@@ -940,13 +951,18 @@ impl App {
                 });
             });
         if close {
-            self.find.open = false;
-            self.find.hits.clear();
-            self.find.cur = None;
-            self.find.id += 1;
-            if let Some(w) = &self.worker {
-                w.keep.lock().unwrap().search = self.find.id;
-            }
+            self.close_find();
+        }
+    }
+
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.hits.clear();
+        self.find.cur = None;
+        self.find.pending = 0;
+        self.find.id += 1;
+        if let Some(w) = &self.worker {
+            w.keep.lock().unwrap().search = self.find.id;
         }
     }
 
@@ -1624,19 +1640,7 @@ impl App {
             }
         }
         if pressed(Key::Escape) {
-            // Cancel any gesture in progress (the rest of it is swallowed until release).
-            if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
-                self.annots = before;
-            }
-            if self.placing.take().is_some() {
-                self.toast("Placing cancelled".into());
-            } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
-                self.set_tool(Tool::Select);
-            } else if !self.selected.is_empty() {
-                self.selected.clear()
-            } else {
-                self.set_tool(Tool::Select)
-            }
+            self.escape();
         }
         for (i, k) in COLOR_KEYS.iter().enumerate() {
             if pressed(*k) {
@@ -1712,6 +1716,29 @@ impl App {
         }
         if !nudging && pressed(Key::ArrowUp) {
             self.offset.y -= step;
+        }
+    }
+
+    /// Esc: cancels a gesture, then closes the find bar, drops a placement or a
+    /// scale tool, clears the selection, and finally returns to Select.
+    fn escape(&mut self) {
+        // Cancel any gesture in progress (the rest of it is swallowed until release).
+        let mut cancelled = false;
+        if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
+            self.annots = before;
+            cancelled = true;
+        }
+        if self.find.open && !cancelled && self.placing.is_none() {
+            // An open find bar goes first: its highlights are what's on top.
+            self.close_find();
+        } else if self.placing.take().is_some() {
+            self.toast("Placing cancelled".into());
+        } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
+            self.set_tool(Tool::Select);
+        } else if !self.selected.is_empty() {
+            self.selected.clear()
+        } else {
+            self.set_tool(Tool::Select)
         }
     }
 
@@ -4963,6 +4990,20 @@ mod tests {
         assert_eq!(app.find.cur, Some(2));
         let y = app.offset.y + app.canvas.height() / (2.0 * app.zoom);
         assert!((y - (812.0 + 305.0)).abs() < 1.0, "centred on it: {y}");
+    }
+
+    #[test]
+    fn esc_closes_the_find_bar_before_anything_else() {
+        let mut app = app();
+        let a = rect(&mut app, 100.0, 100.0);
+        app.selected = vec![a];
+        app.find.open = true;
+        app.find.hits = vec![(0, vec![Rect::from_min_size(pos2(0.0, 0.0), vec2(5.0, 5.0))])];
+        app.escape();
+        assert!(!app.find.open && app.find.hits.is_empty());
+        assert_eq!(app.selected, vec![a], "the selection stays for the next Esc");
+        app.escape();
+        assert!(app.selected.is_empty());
     }
 
     #[test]
