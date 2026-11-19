@@ -66,6 +66,46 @@ pub fn faces() -> &'static [Face] {
     })
 }
 
+/// Bold, italic and bold-italic faces of the first (Helvetica-metric) face, for
+/// formatted markup text on screen; `None` where the system lacks one.
+#[cfg(not(windows))]
+fn styled_candidates(bold: bool, italic: bool) -> Vec<String> {
+    let name = match (bold, italic) {
+        (true, true) => "LiberationSans-BoldItalic.ttf",
+        (true, false) => "LiberationSans-Bold.ttf",
+        (false, true) => "LiberationSans-Italic.ttf",
+        (false, false) => "LiberationSans-Regular.ttf",
+    };
+    ["/usr/share/fonts/liberation", "/usr/share/fonts/TTF", "/usr/share/fonts/truetype/liberation"].iter().map(|d| format!("{d}/{name}")).collect()
+}
+
+#[cfg(windows)]
+fn styled_candidates(bold: bool, italic: bool) -> Vec<String> {
+    let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let name = match (bold, italic) {
+        (true, true) => "arialbi.ttf",
+        (true, false) => "arialbd.ttf",
+        (false, true) => "ariali.ttf",
+        (false, false) => "arial.ttf",
+    };
+    vec![format!(r"{dir}\Fonts\{name}")]
+}
+
+/// The styled face's font data, if the system has it.
+pub fn styled(bold: bool, italic: bool) -> Option<&'static [u8]> {
+    static STYLED: OnceLock<[Option<Vec<u8>>; 3]> = OnceLock::new();
+    let all = STYLED.get_or_init(|| {
+        let load = |b, i| styled_candidates(b, i).into_iter().find_map(|p| std::fs::read(p).ok());
+        [load(true, false), load(false, true), load(true, true)]
+    });
+    match (bold, italic) {
+        (true, false) => all[0].as_deref(),
+        (false, true) => all[1].as_deref(),
+        (true, true) => all[2].as_deref(),
+        (false, false) => None,
+    }
+}
+
 /// Index into `faces()` of the first face with a glyph for `c`.
 pub fn face_for(c: char) -> Option<usize> {
     faces().iter().position(|f| f.covers(c))

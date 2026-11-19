@@ -44,6 +44,17 @@ pub struct Style {
     /// Hatch inside a closed shape, in the markup's colour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hatch: Option<HatchFill>,
+    /// Text in a callout or text box: bold, italic, underlined (the whole note).
+    #[serde(skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub underline: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Style {
@@ -89,7 +100,7 @@ pub enum Prim {
     /// Closed polygon fill with optional outline. `alpha` 0..=255.
     Fill { pts: Vec<Pos2>, color: Rgb, alpha: u8, outline: Option<(Rgb, f32)> },
     /// One line of Helvetica text; `origin` is the left end of the baseline.
-    Text { origin: Pos2, text: String, size: f32, color: Rgb },
+    Text { origin: Pos2, text: String, size: f32, color: Rgb, bold: bool, italic: bool },
     /// Library image stretched over `rect` (it keeps its aspect when resized).
     Image { rect: Rect, image: String },
     /// Many separate segments of one width and colour (a hatch), placed at
@@ -117,6 +128,19 @@ pub const COLORS: [(Rgb, &str); 6] = [
 // ---------------------------------------------------------------------------
 // Text layout (Helvetica metrics; Liberation Sans on screen is metric-compatible)
 
+/// Helvetica-Bold AFM advance widths for ASCII 32..=126, in 1/1000 em.
+const HELV_BOLD: [u16; 95] = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, // ' '..'/'
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, // 0-9
+    333, 333, 584, 584, 584, 611, 975, // :;<=>?@
+    722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, // A-M
+    722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, // N-Z
+    333, 278, 333, 584, 556, 333, // [\]^_`
+    556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, // a-m
+    611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, // n-z
+    389, 280, 389, 584, // {|}~
+];
+
 /// Helvetica AFM advance widths for ASCII 32..=126, in 1/1000 em.
 const HELV: [u16; 95] = [
     278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // ' '..'/'
@@ -131,7 +155,13 @@ const HELV: [u16; 95] = [
 ];
 
 pub fn char_width(c: char, size: f32) -> f32 {
+    char_width_b(c, size, false)
+}
+
+/// Advance of `c` in Helvetica, or Helvetica-Bold when `bold` (italic doesn't change widths).
+pub fn char_width_b(c: char, size: f32, bold: bool) -> f32 {
     let w = match c as u32 {
+        32..=126 if bold => HELV_BOLD[(c as u32 - 32) as usize] as f32,
         32..=126 => HELV[(c as u32 - 32) as usize] as f32,
         _ => crate::fonts::advance(c).unwrap_or(556.0),
     };
@@ -139,11 +169,21 @@ pub fn char_width(c: char, size: f32) -> f32 {
 }
 
 pub fn text_width(s: &str, size: f32) -> f32 {
-    s.chars().map(|c| char_width(c, size)).sum()
+    text_width_b(s, size, false)
+}
+
+pub fn text_width_b(s: &str, size: f32, bold: bool) -> f32 {
+    s.chars().map(|c| char_width_b(c, size, bold)).sum()
 }
 
 /// Greedy word wrap. Explicit newlines are kept; over-long words are broken.
 pub fn wrap(text: &str, size: f32, max_w: f32) -> Vec<String> {
+    wrap_b(text, size, max_w, false)
+}
+
+pub fn wrap_b(text: &str, size: f32, max_w: f32, bold: bool) -> Vec<String> {
+    let text_width = |s: &str, size: f32| text_width_b(s, size, bold);
+    let char_width = |c: char, size: f32| char_width_b(c, size, bold);
     let mut out = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
@@ -181,11 +221,19 @@ pub fn ascent(size: f32) -> f32 {
 }
 
 pub fn text_lines(text: &str, size: f32, box_w: f32) -> Vec<String> {
-    wrap(text, size, (box_w - 2.0 * pad(size)).max(size))
+    text_lines_b(text, size, box_w, false)
+}
+
+pub fn text_lines_b(text: &str, size: f32, box_w: f32, bold: bool) -> Vec<String> {
+    wrap_b(text, size, (box_w - 2.0 * pad(size)).max(size), bold)
 }
 
 pub fn box_rect(pos: Pos2, box_w: f32, text: &str, size: f32) -> Rect {
-    let n = text_lines(text, size, box_w).len().max(1) as f32;
+    box_rect_b(pos, box_w, text, size, false)
+}
+
+pub fn box_rect_b(pos: Pos2, box_w: f32, text: &str, size: f32, bold: bool) -> Rect {
+    let n = text_lines_b(text, size, box_w, bold).len().max(1) as f32;
     Rect::from_min_size(pos, vec2(box_w, 2.0 * pad(size) + n * line_h(size)))
 }
 
@@ -200,7 +248,7 @@ impl Annot {
     pub fn text_box(&self) -> Option<Rect> {
         match &self.kind {
             Kind::Callout { pos, box_w, text, size, .. } | Kind::Text { pos, box_w, text, size } => {
-                Some(box_rect(*pos, *box_w, text, *size))
+                Some(box_rect_b(*pos, *box_w, text, *size, self.style.bold))
             }
             _ => None,
         }
@@ -227,7 +275,8 @@ impl Annot {
             Kind::Callout { text, .. } | Kind::Text { text, .. } => text.clone(),
             _ => return,
         };
-        let widest = text_lines(&text, size, r.width()).iter().map(|l| text_width(l.trim_end(), size)).fold(0.0, f32::max);
+        let bold = self.style.bold;
+        let widest = text_lines_b(&text, size, r.width(), bold).iter().map(|l| text_width_b(l.trim_end(), size, bold)).fold(0.0, f32::max);
         // A little slack so float rounding never re-wraps the last word.
         let fit = (widest + 2.0 * pad(size) + 0.5).max(4.0 * size);
         if fit < r.width() {
@@ -500,12 +549,12 @@ impl Annot {
                 }
                 let fill = self.style.fill.unwrap_or(Fill { color: WHITE, alpha: 255 });
                 out.push(Prim::Fill { pts: rect_pts(r), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
-                text_prims(&mut out, r, text, *size, c);
+                text_prims(&mut out, r, text, *size, c, &self.style);
             }
             Kind::Text { text, size, .. } => {
                 let r = self.text_box().unwrap();
                 self.fill_prims(&mut out, rect_pts(r));
-                text_prims(&mut out, r, text, *size, c);
+                text_prims(&mut out, r, text, *size, c, &self.style);
             }
             Kind::Cloud { rect } => {
                 let pts = cloud_pts(*rect);
@@ -546,7 +595,7 @@ impl Annot {
                 }
                 if let Some((r, origin)) = self.value_box() {
                     out.push(Prim::Fill { pts: rect_pts(r), color: WHITE, alpha: 235, outline: None });
-                    out.push(Prim::Text { origin, text: value.clone(), size: *size, color: c });
+                    out.push(Prim::Text { origin, text: value.clone(), size: *size, color: c, bold: false, italic: false });
                 }
             }
         }
@@ -620,14 +669,20 @@ impl Annot {
     }
 }
 
-fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb) {
+fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb, style: &Style) {
     let x = r.min.x + pad(size);
-    for (i, line) in text_lines(text, size, r.width()).into_iter().enumerate() {
+    for (i, line) in text_lines_b(text, size, r.width(), style.bold).into_iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let y = r.min.y + pad(size) + i as f32 * line_h(size) + ascent(size);
-        out.push(Prim::Text { origin: pos2(x, y), text: line, size, color });
+        if style.underline {
+            // Helvetica's underline: 0.1 em below the baseline, 0.05 em thick.
+            let w = text_width_b(line.trim_end(), size, style.bold);
+            let uy = y + 0.1 * size;
+            out.push(Prim::Stroke { pts: vec![pos2(x, uy), pos2(x + w, uy)], closed: false, width: 0.05 * size, color });
+        }
+        out.push(Prim::Text { origin: pos2(x, y), text: line, size, color, bold: style.bold, italic: style.italic });
     }
 }
 
@@ -970,6 +1025,24 @@ mod tests {
                 assert!(pts.iter().all(|q| b.contains(*q)));
             }
         }
+    }
+
+    #[test]
+    fn bold_text_is_wider_and_underline_runs_under_each_line() {
+        assert!(text_width_b("Window head", 12.0, true) > text_width("Window head", 12.0));
+        assert_eq!(text_width_b("ll", 10.0, true), 2.0 * 2.78);
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Text { pos: pos2(0.0, 0.0), box_w: 120.0, text: "Seal the head flashing to the jamb".into(), size: 12.0 } };
+        let plain = a.text_box().unwrap();
+        a.style.bold = true;
+        a.style.underline = true;
+        assert!(a.text_box().unwrap().height() >= plain.height(), "bold wraps sooner");
+        let prims = a.prims();
+        let lines = prims.iter().filter(|p| matches!(p, Prim::Text { bold: true, .. })).count();
+        let unders = prims.iter().filter(|p| matches!(p, Prim::Stroke { .. })).count();
+        assert!(lines >= 2 && unders == lines, "{lines} lines, {unders} underlines");
+        // Old files without the flags read as plain.
+        let s: Style = serde_json::from_str("{}").unwrap();
+        assert!(!s.bold && !s.italic && !s.underline && s.is_plain());
     }
 
     #[test]

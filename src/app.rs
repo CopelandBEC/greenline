@@ -275,6 +275,8 @@ pub struct App {
     tool_line: HashMap<Tool, Arc<LineType>>,
     /// Hatch per tool (absent: none).
     tool_hatch: HashMap<Tool, HatchFill>,
+    /// Bold, italic, underline for new notes.
+    text_format: [bool; 3],
     /// Line types and hatches to pick from.
     patterns: patterns::Library,
     width: f32,
@@ -402,6 +404,7 @@ impl App {
             hatch_scale_pending: None,
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
+            text_format: [false; 3],
             patterns: patterns::Library::default(),
             width: 2.0,
             text_size: 12.0,
@@ -1129,6 +1132,42 @@ impl App {
         if a.hatchable() {
             a.style.hatch = self.tool_hatch.get(&self.tool).cloned();
         }
+        if a.text_size().is_some() && !matches!(a.kind, Kind::Measure { .. }) {
+            [a.style.bold, a.style.italic, a.style.underline] = self.text_format;
+        }
+    }
+
+    /// The bold / italic / underline the toolbar shows: the note being typed or
+    /// the lead selected one, else what new notes get.
+    fn shown_format(&self) -> [bool; 3] {
+        let note = self.editing.or_else(|| self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| a.text_size().is_some())));
+        match note.and_then(|id| self.find(id)) {
+            Some(a) => [a.style.bold, a.style.italic, a.style.underline],
+            None => self.text_format,
+        }
+    }
+
+    /// Turns bold (0), italic (1) or underline (2) on or off for new notes and the
+    /// selected or edited ones, as the toolbar shows it.
+    fn toggle_format(&mut self, which: usize) {
+        let on = !self.shown_format()[which];
+        self.text_format[which] = on;
+        let ids: Vec<u64> = match self.editing {
+            Some(id) => vec![id],
+            None => self.selected.clone(),
+        };
+        let notes = |a: &Annot| ids.contains(&a.id) && matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. });
+        if self.annots.iter().any(notes) {
+            self.snapshot();
+            for a in self.annots.iter_mut().filter(|a| notes(a)) {
+                [&mut a.style.bold, &mut a.style.italic, &mut a.style.underline][which].clone_from(&on);
+                // Bold text is wider: keep the box fitted.
+                if which == 0 && self.editing != Some(a.id) {
+                    a.fit_box_w();
+                }
+            }
+            self.changed();
+        }
     }
 
     fn set_line_type(&mut self, lt: Option<Arc<LineType>>) {
@@ -1578,6 +1617,11 @@ impl App {
             }
             if pressed(Key::Num0) {
                 self.fit_width();
+            }
+            for (i, k) in [Key::B, Key::I, Key::U].into_iter().enumerate() {
+                if pressed(k) {
+                    self.toggle_format(i);
+                }
             }
             if pressed(Key::F) && !self.pages.is_empty() {
                 // Reopened with its old text: search again (closing dropped the results).
@@ -3108,9 +3152,14 @@ impl App {
         let pad = annot::pad(size);
         let pos = self.page_to_screen(page, r.min + vec2(pad, pad));
         let width = (r.width() - 2.0 * pad) * z;
-        let font = FontId::new((size * z * k.0).max(6.0), helv());
+        let font = FontId::new((size * z * k.0).max(6.0), helv_styled(a.style.bold, a.style.italic));
         let mut text = text_of(a).to_string();
         let needs_focus = std::mem::take(&mut self.edit_needs_focus);
+        for (i, k) in [Key::B, Key::I, Key::U].into_iter().enumerate() {
+            if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::COMMAND, k)) {
+                self.toggle_format(i);
+            }
+        }
         
         let resp = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
@@ -3257,6 +3306,17 @@ impl App {
                     }
                 }
             });
+            let fmt = self.shown_format();
+            let labels = [
+                (egui::RichText::new("B").strong(), "Bold (Ctrl+B)"),
+                (egui::RichText::new("I").italics(), "Italic (Ctrl+I)"),
+                (egui::RichText::new("U").underline(), "Underline (Ctrl+U)"),
+            ];
+            for (i, (label, tip)) in labels.into_iter().enumerate() {
+                if ui.add(egui::Button::selectable(fmt[i], label).min_size(vec2(20.0, 0.0))).on_hover_text(tip).clicked() {
+                    self.toggle_format(i);
+                }
+            }
         });
     }
 
@@ -3997,6 +4057,7 @@ impl App {
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
+                    ("Ctrl+B / I / U", "Bold / italic / underline the note being typed or the selected notes (also the B I U buttons)"),
                     ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill, opacity and hatch"),
                     ("Line sample beside the width", "Line type: dashed, dotted, or one from the pattern library (set its folder below)"),
                     ("[ ]", "Line width   ·   { } text size"),
@@ -4344,16 +4405,16 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                     }
                 }
             }
-            Prim::Text { origin: o, text, size, color } => {
+            Prim::Text { origin: o, text, size, color, bold, italic } => {
                 let fs = size * z * k.0;
                 let o = to(*o);
                 if fs < 3.0 {
                     // Too small to read: a grey bar where the line of text is.
-                    let w = annot::text_width(text, *size) * z;
+                    let w = annot::text_width_b(text, *size, *bold) * z;
                     painter.line_segment([o - vec2(0.0, fs * 0.3), o + vec2(w, -fs * 0.3)], Stroke::new(fs.max(0.7), col(*color, 120)));
                     continue;
                 }
-                painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv()), col(*color, 255));
+                painter.text(o - vec2(0.0, k.1 * size * z), Align2::LEFT_TOP, text, FontId::new(fs, helv_styled(*bold, *italic)), col(*color, 255));
             }
             Prim::Image { rect, image } => {
                 let r = Rect::from_min_max(to(rect.min), to(rect.max));
@@ -4497,6 +4558,17 @@ fn helv() -> FontFamily {
     FontFamily::Name("helv".into())
 }
 
+/// Markup text family for a style: the styled face where the system has one,
+/// falling back to the plain family.
+fn helv_styled(bold: bool, italic: bool) -> FontFamily {
+    match (bold, italic) {
+        (false, false) => helv(),
+        (true, false) => FontFamily::Name("helv-b".into()),
+        (false, true) => FontFamily::Name("helv-i".into()),
+        (true, true) => FontFamily::Name("helv-bi".into()),
+    }
+}
+
 /// Markup text in the same fonts and order export uses (Liberation Sans, then
 /// the Noto fallbacks in `fonts`), so what's on screen is what gets embedded.
 /// UI text is Montserrat (`theme`).
@@ -4509,6 +4581,16 @@ fn install_fonts(ctx: &egui::Context) {
         family.push(name);
     }
     family.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    for (b, i) in [(true, false), (false, true), (true, true)] {
+        let mut styled = Vec::new();
+        if let Some(data) = crate::fonts::styled(b, i) {
+            let name = format!("styled-{b}-{i}");
+            fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(data.to_vec())));
+            styled.push(name);
+        }
+        styled.extend(family.iter().cloned());
+        fonts.families.insert(helv_styled(b, i), styled);
+    }
     fonts.families.insert(helv(), family);
     crate::theme::add_font(&mut fonts);
     ctx.set_fonts(fonts);
@@ -5017,6 +5099,30 @@ mod tests {
         let (tl, br) = (app.page_to_screen(0, r.min), app.page_to_screen(0, r.max));
         assert!(app.canvas.contains(tl) && app.canvas.contains(br));
         assert!((br.x - tl.x) > app.canvas.width() - 80.0, "fills the width");
+    }
+
+    #[test]
+    fn bold_italic_underline_apply_to_notes_and_new_ones() {
+        let mut app = app();
+        let c = callout(&mut app, pos2(100.0, 100.0), pos2(200.0, 200.0));
+        let r = rect(&mut app, 300.0, 300.0);
+        app.selected = vec![c, r];
+        app.toggle_format(0);
+        assert!(app.find(c).unwrap().style.bold);
+        assert!(!app.find(r).unwrap().style.bold, "shapes have no text");
+        assert_eq!(app.shown_format(), [true, false, false]);
+        app.undo();
+        assert!(!app.find(c).unwrap().style.bold);
+        // With nothing selected it's for the next note.
+        app.selected.clear();
+        app.toggle_format(2);
+        app.set_tool(Tool::Text);
+        app.click(pos2(400.0, 100.0), false, PLAIN);
+        let t = app.editing.unwrap();
+        assert!(app.find(t).unwrap().style.underline);
+        // While typing, the toggle is for that note.
+        app.toggle_format(1);
+        assert!(app.find(t).unwrap().style.italic);
     }
 
     #[test]
