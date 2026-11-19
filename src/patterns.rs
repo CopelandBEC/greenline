@@ -27,16 +27,17 @@ impl LineType {
         let unit = if self.scale_with_width { w } else { 1.0 };
         let mut r = 0.0f32;
         for l in &self.lines {
+            // A symbol can turn any way at a corner: its farthest point from its origin.
             let mut side = 0.0f32;
             for c in &l.comps {
-                if let Comp::Symbol { left, right, stretch, paths, .. } = c {
-                    side = side.max((left + right) * stretch);
+                if let Comp::Symbol { stretch, paths, .. } = c {
                     for p in paths.iter().flatten() {
-                        side = side.max(p.y.abs()).max(p.x.abs() * stretch);
+                        side = side.max(vec2(p.x * stretch, p.y).length());
                     }
                 }
             }
-            r = r.max(l.offset.abs() + side);
+            // Offset corners are mitred out to 4x the offset (`offset_path`).
+            r = r.max(4.0 * l.offset.abs() + side);
         }
         r * unit
     }
@@ -333,9 +334,9 @@ impl Library {
         let mut lib = Library::default();
         lib.line_types.extend(builtin_line_types().into_iter().map(|l| (String::new(), Arc::new(l))));
         lib.hatches.extend(builtin_hatches().into_iter().map(|h| (String::new(), Arc::new(h))));
-        let mut dirs = vec![own_dir()];
-        dirs.extend(shared.map(Path::to_path_buf));
-        for dir in dirs {
+        let mut dirs = vec![(own_dir(), "")];
+        dirs.extend(shared.map(|p| (p.to_path_buf(), " (shared)")));
+        for (dir, tag) in dirs {
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
             // A firm's folder may sort its files into subfolders (Hatches, Line Types).
@@ -346,29 +347,66 @@ impl Library {
             }
             files.sort();
             for f in files {
-                lib.add_file(&f);
+                lib.add_file(&f, tag);
             }
         }
         lib
     }
 
-    fn add_file(&mut self, f: &Path) {
+    /// Adds a library file's patterns under its file name; `tag` tells a shared
+    /// folder's file from one of the same name in the user's own library.
+    fn add_file(&mut self, f: &Path, tag: &str) {
         let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         if ext != "blx" && ext != "bhx" {
             return;
         }
-        let set = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let taken = |s: &str| self.line_types.iter().any(|(x, _)| x == s) || self.hatches.iter().any(|(x, _)| x == s);
+        let mut set = stem.clone();
+        if !tag.is_empty() && taken(&set) {
+            set = format!("{stem}{tag}");
+        }
+        // A file in a subfolder can share a name with another: number it.
+        let mut n = 2;
+        while taken(&set) {
+            set = format!("{stem}{tag} {n}");
+            n += 1;
+        }
         let read = std::fs::read(f).map_err(anyhow::Error::from).map(|b| String::from_utf8_lossy(&b).into_owned());
         let res = read.and_then(|xml| {
+            // The same pattern already offered (a file imported and also in the shared folder): once is enough.
+            // Names repeat within a file sometimes (Bluebeam doesn't mind): number the repeats.
+            let unique = |name: &str, used: &mut Vec<String>| {
+                let base = name.trim().to_string();
+                let mut name = base.clone();
+                let mut k = 2;
+                while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+                    name = format!("{base} {k}");
+                    k += 1;
+                }
+                used.push(name.clone());
+                name
+            };
+            let mut used = Vec::new();
             if ext == "blx" {
                 let lts = parse_blx(&xml)?;
                 let n = lts.len();
-                self.line_types.extend(lts.into_iter().map(|l| (set.clone(), Arc::new(l))));
+                for mut l in lts {
+                    if !self.line_types.iter().any(|(_, x)| x.lines == l.lines && x.scale_with_width == l.scale_with_width && x.name.trim() == l.name.trim()) {
+                        l.name = unique(&l.name, &mut used);
+                        self.line_types.push((set.clone(), Arc::new(l)));
+                    }
+                }
                 Ok(n)
             } else {
                 let hs = parse_bhx(&xml)?;
                 let n = hs.len();
-                self.hatches.extend(hs.into_iter().map(|h| (set.clone(), Arc::new(h))));
+                for mut h in hs {
+                    if !self.hatches.iter().any(|(_, x)| x.name.trim() == h.name.trim() && x.tile == h.tile && x.lines == h.lines && x.dots == h.dots) {
+                        h.name = unique(&h.name, &mut used);
+                        self.hatches.push((set.clone(), Arc::new(h)));
+                    }
+                }
                 Ok(n)
             }
         });
@@ -586,18 +624,20 @@ pub fn hatch_segments(outline: &[Pos2], h: &Hatch, scale: f32) -> HatchSegs {
     if too_dense(bounds, h, scale) {
         return Vec::new();
     }
-    let edges: Vec<(Pos2, Pos2)> = (0..outline.len()).map(|i| (outline[i], outline[(i + 1) % outline.len()])).collect();
+    let edges = Edges::new(outline, bounds, tile.y);
     let (nx, ny) = ((bounds.width() / tile.x).ceil() as i32, (bounds.height() / tile.y).ceil() as i32);
     for iy in -1..=ny {
         for ix in -1..=nx {
             let o = bounds.min + vec2(ix as f32 * tile.x, iy as f32 * tile.y);
             let map = |p: Pos2| o + vec2(p.x * tile.x, p.y * tile.y);
             for [a, b] in &h.lines {
-                clip_segment(map(*a), map(*b), outline, &edges, bounds, &mut groups[0].1);
+                clip_segment(map(*a), map(*b), &edges, bounds, &mut groups[0].1);
             }
             for (p, d) in &h.dots {
+                // Dots grow and shrink with the pattern; line weights stay put.
+                let d = &(d * scale);
                 let p = map(*p);
-                if bounds.contains(p) && crate::annot::inside(outline, p) {
+                if bounds.contains(p) && edges.inside(p) {
                     let i = match groups.iter().position(|(w, _)| w == d) {
                         Some(i) => i,
                         None => {
@@ -619,15 +659,59 @@ pub fn too_dense(bounds: Rect, h: &Hatch, scale: f32) -> bool {
     (bounds.width() / tile.x + 2.0) * (bounds.height() / tile.y + 2.0) * (h.lines.len() + h.dots.len()).max(1) as f32 > MAX_HATCH
 }
 
+/// A polygon's edges filed by horizontal band, so clipping and inside tests
+/// look only at the edges near a point (a cloud has thousands).
+struct Edges {
+    top: f32,
+    band: f32,
+    rows: Vec<Vec<(Pos2, Pos2)>>,
+}
+
+impl Edges {
+    fn new(poly: &[Pos2], bounds: Rect, tile_h: f32) -> Self {
+        let n = ((bounds.height() / tile_h.max(1.0)).ceil() as usize).clamp(1, 4096);
+        let band = bounds.height().max(1e-3) / n as f32;
+        let mut e = Edges { top: bounds.min.y, band, rows: vec![Vec::new(); n] };
+        for i in 0..poly.len() {
+            let (p, q) = (poly[i], poly[(i + 1) % poly.len()]);
+            let (r0, r1) = (e.row(p.y.min(q.y)), e.row(p.y.max(q.y)));
+            for row in &mut e.rows[r0..=r1] {
+                row.push((p, q));
+            }
+        }
+        e
+    }
+
+    fn row(&self, y: f32) -> usize {
+        (((y - self.top) / self.band).floor().max(0.0) as usize).min(self.rows.len().max(1) - 1)
+    }
+
+    /// Edges that may meet the band of heights `y0..=y1` (a few may repeat).
+    fn near(&self, y0: f32, y1: f32) -> impl Iterator<Item = &(Pos2, Pos2)> {
+        self.rows[self.row(y0)..=self.row(y1)].iter().flatten()
+    }
+
+    /// Even-odd test, along a ray through `p`'s band only.
+    fn inside(&self, p: Pos2) -> bool {
+        let mut odd = false;
+        for &(a, b) in &self.rows[self.row(p.y)] {
+            if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+                odd = !odd;
+            }
+        }
+        odd
+    }
+}
+
 /// Pushes the parts of segment `a`–`b` inside the polygon.
-fn clip_segment(a: Pos2, b: Pos2, poly: &[Pos2], edges: &[(Pos2, Pos2)], bounds: Rect, out: &mut Vec<[Pos2; 2]>) {
+fn clip_segment(a: Pos2, b: Pos2, edges: &Edges, bounds: Rect, out: &mut Vec<[Pos2; 2]>) {
     let sb = Rect::from_two_pos(a, b);
     if !sb.intersects(bounds) {
         return;
     }
     let d = b - a;
     let mut ts = vec![0.0f32, 1.0];
-    for &(p, q) in edges {
+    for &(p, q) in edges.near(sb.min.y, sb.max.y) {
         if p.x.max(q.x) < sb.min.x || p.x.min(q.x) > sb.max.x || p.y.max(q.y) < sb.min.y || p.y.min(q.y) > sb.max.y {
             continue;
         }
@@ -649,7 +733,7 @@ fn clip_segment(a: Pos2, b: Pos2, poly: &[Pos2], edges: &[(Pos2, Pos2)], bounds:
             continue;
         }
         let mid = a + d * ((w[0] + w[1]) / 2.0);
-        if crate::annot::inside(poly, mid) {
+        if edges.inside(mid) {
             out.push([a + d * w[0], a + d * w[1]]);
         }
     }
@@ -785,7 +869,42 @@ mod tests {
         assert!(t.elapsed().as_millis() < 500, "{:?}", t.elapsed());
         let lts = parse_blx(BLX).unwrap();
         assert_eq!(lt.reach(2.0), 0.0, "plain dashes stay on the line");
-        assert!((lts[1].reach(1.0) - 11.0).abs() < 1e-3, "rigid insulation: {}", lts[1].reach(1.0));
+        // Rigid insulation's cross reaches 8.8 along and 8 across: about 11.9 turned any way.
+        assert!((lts[1].reach(1.0) - 11.89).abs() < 0.01, "rigid insulation: {}", lts[1].reach(1.0));
+        // An offset line's mitred corners stay inside the reach.
+        let off = LineType { name: "o".into(), scale_with_width: false, lines: vec![LinePattern { offset: -10.0, comps: vec![Comp::Dash(1000.0)] }] };
+        let mut out = Vec::new();
+        pattern_prims(&mut out, &[pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 10.0)], false, &off, 1.0, [0; 3]);
+        let far = out.iter().flat_map(|p| match p { Prim::Stroke { pts, .. } => pts.clone(), _ => vec![] }).map(|p| p.x - 100.0).fold(0.0, f32::max);
+        assert!(far <= off.reach(1.0), "{far} > {}", off.reach(1.0));
+    }
+
+    #[test]
+    fn a_big_hatched_cloud_clips_quickly() {
+        let pts = crate::annot::cloud_pts(Rect::from_min_max(pos2(0.0, 0.0), pos2(3000.0, 3000.0)));
+        assert!(pts.len() > 4000);
+        let t = std::time::Instant::now();
+        let segs = hatch_segments(&pts, &builtin_hatches()[0], 1.0);
+        assert!(!segs.is_empty());
+        assert!(t.elapsed().as_millis() < 1500, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn library_files_of_the_same_name_stay_apart_and_repeats_show_once() {
+        let mut lib = Library::default();
+        let dir = std::env::temp_dir().join(format!("greenline-pat-{}", std::process::id()));
+        let (own, shared) = (dir.join("own"), dir.join("shared"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(own.join("Std.blx"), BLX).unwrap();
+        std::fs::write(shared.join("Std.blx"), BLX).unwrap();
+        std::fs::write(shared.join("Std.bhx"), BHX).unwrap();
+        lib.add_file(&own.join("Std.blx"), "");
+        lib.add_file(&shared.join("Std.blx"), " (shared)");
+        lib.add_file(&shared.join("Std.bhx"), " (shared)");
+        assert_eq!(lib.line_types.len(), 3, "identical line types once");
+        assert_eq!(lib.hatches[0].0, "Std (shared)", "a different file of the same name is told apart");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

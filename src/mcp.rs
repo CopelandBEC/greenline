@@ -49,7 +49,8 @@ struct Tool {
 
 const TOOLS: &[Tool] = &[
     Tool { name: "guide", doc: "How to work with drawings through Greenline: coordinates, scales, snapping, proposing. Read this first.", params: &[] },
-    Tool { name: "op_reference", doc: "The ops `apply` takes: clouds, callouts, text, arrows, polygons, fills, lengths, areas, scales.", params: &[] },
+    Tool { name: "op_reference", doc: "The ops `apply` takes: clouds, callouts, text, arrows, polygons, fills, line types, hatches, lengths, areas, scales.", params: &[] },
+    Tool { name: "patterns", doc: "Line types and hatches ops can name, by library.", params: &[] },
     Tool { name: "info", doc: "Pages with sizes, scales set and written on each sheet, markup and proposal counts.", params: &[PDF, UNITS] },
     Tool {
         name: "text",
@@ -204,6 +205,7 @@ fn run(t: &Tool, call: Call) -> Value {
     let result = match t.name {
         "guide" => Ok(vec![text(cli::GUIDE)]),
         "op_reference" => Ok(vec![text(crate::ops::REFERENCE)]),
+        "patterns" => Ok(vec![text(serde_json::to_string_pretty(&cli::patterns_json()).unwrap_or_default())]),
         name => cli::run_with(name, &call.pdf, call.id, call.flags, call.ops).map_err(|e| e.to_string()).map(|v| {
             let mut content = vec![text(serde_json::to_string_pretty(&v).unwrap_or_default())];
             if name == "render" {

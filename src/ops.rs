@@ -72,8 +72,9 @@ fn pick<'a, T>(entries: impl Iterator<Item = (&'a str, &'a str, &'a T)>, want: &
         [one] => Ok(one.2),
         [] => Err(format!("no {what} \"{want}\": see `greenline-cli patterns`")),
         _ => Err(format!(
-            "{} {what}s are called \"{want}\": name one as {}",
+            "{} {} are called \"{want}\": name one as {}",
             found.len(),
+            if what == "hatch" { "hatches" } else { "line types" },
             found.iter().map(|(s, n, _)| format!("\"{s}/{n}\"")).collect::<Vec<_>>().join(" or ")
         )),
     }

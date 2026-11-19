@@ -128,6 +128,17 @@ pub fn run_with(cmd: &str, file: &str, id: Option<String>, flags: HashMap<String
     command(cmd, &a, &doc, pdf::pdfium()?)
 }
 
+/// The pattern library as `patterns` reports it.
+pub fn patterns_json() -> Value {
+    let lib = ops::library();
+    let entry = |set: &str, name: &str| json!({ "name": name.trim(), "library": if set.is_empty() { "built-in" } else { set } });
+    json!({
+        "line_types": lib.line_types.iter().map(|(s, l)| entry(s, &l.name)).collect::<Vec<_>>(),
+        "hatches": lib.hatches.iter().map(|(s, h)| entry(s, &h.name)).collect::<Vec<_>>(),
+        "problems": lib.problems,
+    })
+}
+
 /// Runs one command; its JSON result, or `Null` when it printed text itself.
 pub fn run(args: Vec<String>) -> anyhow::Result<Value> {
     let a = Args::parse(args).map_err(anyhow::Error::msg)?;
@@ -148,15 +159,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<Value> {
             println!("{}", ops::REFERENCE);
             Ok(Value::Null)
         }
-        "patterns" => {
-            let lib = ops::library();
-            let entry = |set: &str, name: &str| json!({ "name": name.trim(), "library": if set.is_empty() { "built-in" } else { set } });
-            Ok(json!({
-                "line_types": lib.line_types.iter().map(|(s, l)| entry(s, &l.name)).collect::<Vec<_>>(),
-                "hatches": lib.hatches.iter().map(|(s, h)| entry(s, &h.name)).collect::<Vec<_>>(),
-                "problems": lib.problems,
-            }))
-        }
+        "patterns" => Ok(patterns_json()),
         "mcp" => {
             crate::mcp::serve();
             Ok(Value::Null)
