@@ -20,7 +20,8 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `D` `E` | Measure a length or an area: click the points, double-click or `Enter` to finish (drag for one segment or a rectangle); `Shift` squares a point to the last |
 | `U` | Scale for measuring: pick the drawing scale, use one written on the sheet, calibrate on a known dimension, or add a region for a detail at its own scale. A reduced or scanned set needs calibrating |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
-| `1`–`6`, `[` `]`, `{` `}` | Colour (CopelandBEC medium green by default, then red, blue, black, orange, yellow), line width, text size; the swatch beside the colours sets a fill and its opacity for shapes and text boxes |
+| `1`–`6`, `[` `]`, `{` `}` | Colour (CopelandBEC medium green by default, then red, blue, black, orange, yellow), line width, text size; the swatch beside the colours sets a fill, its opacity and a hatch; the sample beside the width picks a line type (dashed, dotted, or from the pattern library) |
+| Pattern library | Bluebeam line type (`.blx`) and hatch (`.bhx`) files: import your own from the line type and hatch lists, or point `F1` at a shared folder (your firm's standards); markups keep their pattern, so they draw the same elsewhere |
 | `S` `O` `M` `G` | Thumbnails, overview, markup list, go to page |
 | `W` / `F` | Fit width / fit page — or click the zoom % in the status bar for fit, actual size and presets |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |

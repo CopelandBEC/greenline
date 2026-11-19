@@ -3014,6 +3014,7 @@ impl App {
             if ui.add(egui::DragValue::new(&mut w).range(0.5..=12.0).speed(0.1).prefix("Line ").suffix(" pt")).on_hover_text("[ / ]").changed() {
                 self.set_width(w);
             }
+            self.line_type_button(ui);
             let cur_size = self.lead_text_size().unwrap_or(self.text_size);
             egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("Text {cur_size} pt")).show_ui(ui, |ui| {
                 for s in TEXT_SIZES {
@@ -3071,6 +3072,98 @@ impl App {
                 if let Some(p) = self.fill_pending.take() {
                     self.set_fill_alpha((p * 2.55).round() as u8);
                 }
+            }
+            ui.separator();
+            self.hatch_picker(ui);
+        });
+    }
+
+    /// Hatch list in the fill picker: none, then each library hatch with a sample.
+    fn hatch_picker(&mut self, ui: &mut Ui) {
+        let shown = self.shown_hatch();
+        ui.horizontal(|ui| {
+            ui.label("Hatch");
+            if let Some(h) = &shown {
+                let mut s = h.scale;
+                let r = ui.add(egui::DragValue::new(&mut s).range(0.1..=20.0).speed(0.02).prefix("Scale ").suffix("×"));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    self.set_hatch(Some(HatchFill { pattern: h.pattern.clone(), scale: s }));
+                }
+            }
+        });
+        let mut pick: Option<Option<Arc<Hatch>>> = None;
+        egui::ScrollArea::vertical().id_salt("hatches").max_height(260.0).show(ui, |ui| {
+            if ui.selectable_label(shown.is_none(), "None").clicked() {
+                pick = Some(None);
+            }
+            let mut last_set: Option<&str> = None;
+            for (set, h) in &self.patterns.hatches {
+                if last_set != Some(set.as_str()) && !set.is_empty() {
+                    ui.weak(set);
+                }
+                last_set = Some(set.as_str());
+                let on = shown.as_ref().is_some_and(|s| *s.pattern == **h);
+                let row = ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(28.0, 18.0), Sense::hover());
+                    paint_hatch_sample(ui.painter(), r, h, &self.textures);
+                    ui.selectable_label(on, h.name.trim())
+                });
+                if row.inner.clicked() {
+                    pick = Some(Some(h.clone()));
+                }
+            }
+        });
+        if ui.button("Import hatches (.bhx)…").on_hover_text("Add Bluebeam hatch files to your own library. A shared folder can be set in F1.").clicked() {
+            self.ask = Some(Pick::Patterns);
+        }
+        if let Some(p) = pick {
+            let scale = shown.map_or(1.0, |s| s.scale);
+            self.set_hatch(p.map(|pattern| HatchFill { pattern, scale }));
+        }
+    }
+
+    /// Line type button beside the width: a sample of the current one; opens the list.
+    fn line_type_button(&mut self, ui: &mut Ui) {
+        let shown = self.shown_line_type();
+        let ink = ui.visuals().strong_text_color();
+        let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 18.0), Sense::click());
+        paint_line_sample(ui.painter(), rect.shrink2(vec2(3.0, 0.0)), shown.as_deref(), ink, &self.textures);
+        if resp.hovered() {
+            ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color), egui::StrokeKind::Inside);
+        }
+        let resp = resp.on_hover_text(format!("Line type: {}", shown.as_ref().map_or("solid", |l| l.name.as_str())));
+        egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            let mut pick: Option<Option<Arc<LineType>>> = None;
+            egui::ScrollArea::vertical().id_salt("linetypes").max_height(360.0).show(ui, |ui| {
+                let row = |ui: &mut Ui, lt: Option<&LineType>, name: &str, on: bool| {
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(90.0, 18.0), Sense::hover());
+                        paint_line_sample(ui.painter(), r, lt, ink, &self.textures);
+                        ui.selectable_label(on, name).clicked()
+                    })
+                    .inner
+                };
+                if row(ui, None, "Solid", shown.is_none()) {
+                    pick = Some(None);
+                }
+                let mut last_set: Option<&str> = None;
+                for (set, lt) in &self.patterns.line_types {
+                    if last_set != Some(set.as_str()) && !set.is_empty() {
+                        ui.weak(set);
+                    }
+                    last_set = Some(set.as_str());
+                    if row(ui, Some(lt), &lt.name, shown.as_ref().is_some_and(|s| **s == **lt)) {
+                        pick = Some(Some(lt.clone()));
+                    }
+                }
+            });
+            if ui.button("Import line types (.blx)…").on_hover_text("Add Bluebeam line type files to your own library. A shared folder can be set in F1.").clicked() {
+                self.ask = Some(Pick::Patterns);
+                ui.close();
+            }
+            if let Some(p) = pick {
+                self.set_line_type(p);
+                ui.close();
             }
         });
     }
@@ -3654,7 +3747,8 @@ impl App {
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill and opacity for shapes and text boxes"),
+                    ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill, opacity and hatch"),
+                    ("Line sample beside the width", "Line type: dashed, dotted, or one from the pattern library (set its folder below)"),
                     ("[ ]", "Line width   ·   { } text size"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -3693,6 +3787,29 @@ impl App {
                     }
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Pattern library folder:");
+                match &self.prefs.pattern_dir {
+                    Some(d) => ui.monospace(d.display().to_string()),
+                    None => ui.weak("none"),
+                };
+                if ui.button("Choose…").on_hover_text("A folder of Bluebeam line type (.blx) and hatch (.bhx) files, such as your firm's shared standards").clicked() {
+                    self.ask = Some(Pick::PatternDir);
+                }
+                if self.prefs.pattern_dir.is_some() && ui.button("Clear").clicked() {
+                    self.prefs.pattern_dir = None;
+                    self.prefs_dirty = true;
+                    self.reload_patterns();
+                }
+                if ui.button("Reload").on_hover_text("Read the library again after its files change").clicked() {
+                    self.reload_patterns();
+                }
+            });
+            let (nl, nh) = (self.patterns.line_types.len(), self.patterns.hatches.len());
+            ui.weak(format!("{nl} line types and {nh} hatches; your own imports are kept in {}.", patterns::own_dir().display()));
+            for p in self.patterns.problems.iter().take(3) {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("Couldn't read {p}"));
+            }
             ui.weak(format!("Markups autosave to {} as you go; the original PDF is never modified.", sidecar::dir().display()));
             ui.weak(format!("Greenline {}", env!("CARGO_PKG_VERSION")));
         });
@@ -3978,6 +4095,36 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
         }
     }
+}
+
+/// A short sample of line type `lt` (solid when `None`) across `r`.
+fn paint_line_sample(p: &Painter, r: Rect, lt: Option<&LineType>, ink: Color32, images: &HashMap<String, TextureHandle>) {
+    let c = [ink.r(), ink.g(), ink.b()];
+    let y = r.center().y;
+    // Symbols are drawn in points; fit the tallest across the row's height.
+    let z = 1.0;
+    let mut prims = Vec::new();
+    let path = [pos2(0.0, 0.0), pos2(r.width() / z, 0.0)];
+    match lt {
+        Some(lt) => patterns::pattern_prims(&mut prims, &path, false, lt, 1.0, c),
+        None => prims.push(Prim::Stroke { pts: path.to_vec(), closed: false, width: 1.0, color: c }),
+    }
+    let p = p.with_clip_rect(r);
+    paint_prims(&p, pos2(r.min.x, y), z, &prims, (1.0, 0.0), 1.0, images);
+}
+
+/// A swatch of hatch `h` filling `r`, at a size that shows its pattern.
+fn paint_hatch_sample(p: &Painter, r: Rect, h: &Hatch, images: &HashMap<String, TextureHandle>) {
+    p.rect_filled(r, 2.0, Color32::WHITE);
+    // Show about two tiles across.
+    let z = r.width() / (2.0 * h.tile.x.max(1.0));
+    let outline = annot::rect_pts(Rect::from_min_size(Pos2::ZERO, r.size() / z));
+    let prims: Vec<Prim> = patterns::cached_hatch(&outline, h, 1.0)
+        .iter()
+        .map(|(w, segs)| Prim::Segments { segs: segs.clone(), width: *w, color: [40, 40, 40] })
+        .collect();
+    paint_prims(&p.with_clip_rect(r), r.min, z, &prims, (1.0, 0.0), 1.0, images);
+    p.rect_stroke(r, 2.0, Stroke::new(1.0, Color32::from_gray(160)), egui::StrokeKind::Inside);
 }
 
 /// Lowest fill opacity the slider sets (5%); a fill is removed with None.
@@ -4514,6 +4661,38 @@ mod tests {
         assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 51 }));
         let c2 = callout(&mut app, pos2(300.0, 500.0), pos2(400.0, 600.0));
         assert_eq!(app.find(c2).unwrap().effective_fill(), Some(Fill { color: WHITE, alpha: 51 }));
+    }
+
+    #[test]
+    fn line_types_and_hatches_go_where_they_fit() {
+        let mut app = app();
+        let r = rect(&mut app, 100.0, 100.0);
+        let t = app.add(0, Kind::Text { pos: pos2(300.0, 300.0), box_w: 100.0, text: "x".into(), size: 12.0 });
+        let dashed = Arc::new(patterns::builtin_line_types()[0].clone());
+        let hatch = Arc::new(patterns::builtin_hatches()[1].clone());
+        app.selected = vec![r, t];
+        app.set_line_type(Some(dashed.clone()));
+        app.set_hatch(Some(HatchFill { pattern: hatch.clone(), scale: 1.0 }));
+        let (ra, ta) = (app.find(r).unwrap().clone(), app.find(t).unwrap().clone());
+        assert_eq!(ra.style.line.as_deref(), Some(&*dashed));
+        assert!(ra.style.hatch.is_some());
+        assert!(ta.style.line.is_none() && ta.style.hatch.is_none(), "text takes neither");
+        assert!(ra.prims().iter().any(|p| matches!(p, Prim::Segments { .. })), "hatched");
+        assert!(ra.prims().iter().filter(|p| matches!(p, Prim::Stroke { .. })).count() > 4, "dashed outline");
+        // Hatched insides select on click, like filled ones.
+        assert_eq!(ra.distance(pos2(150.0, 150.0)), 0.0);
+        // The markups file carries the whole pattern, and reads back the same.
+        let json = serde_json::to_string(&ra).unwrap();
+        let back: Annot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.style, ra.style);
+        // New markups with the tool get its line type.
+        app.set_tool(Tool::Line);
+        app.set_line_type(Some(dashed.clone()));
+        let l = app.add(0, Kind::Line { a: pos2(0.0, 0.0), b: pos2(50.0, 0.0) });
+        assert!(app.find(l).unwrap().style.line.is_some());
+        app.set_tool(Tool::Arrow);
+        let ar = app.add(0, Kind::Arrow { a: pos2(0.0, 0.0), b: pos2(50.0, 0.0) });
+        assert!(app.find(ar).unwrap().style.line.is_none(), "per tool");
     }
 
     #[test]

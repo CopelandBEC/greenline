@@ -702,13 +702,19 @@ pub(crate) mod tests {
         let mut cloud = annot(0, Kind::Cloud { rect: egui::Rect::from_min_max(pos2(50.0, 50.0), pos2(350.0, 250.0)) });
         cloud.style.fill = Some(crate::annot::Fill { color: [0, 0, 255], alpha: 255 });
         let poly = annot(0, Kind::Poly { pts: vec![pos2(50.0, 400.0), pos2(350.0, 400.0), pos2(200.0, 550.0)], closed: false });
-        export(pdfium, &src, &out, &[cloud, poly], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let mut hatched = annot(0, Kind::Rect { rect: egui::Rect::from_min_max(pos2(20.0, 280.0), pos2(380.0, 380.0)) });
+        hatched.style.hatch = Some(crate::patterns::HatchFill { pattern: std::sync::Arc::new(crate::patterns::builtin_hatches()[2].clone()), scale: 1.0 });
+        export(pdfium, &src, &out, &[cloud, poly, hatched], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let img = render_region(&doc, 0, 1.0, [0, 0], [400, 600]).unwrap();
         let px = |x: usize, y: usize| img.pixels[y * 400 + x];
         assert!(px(200, 150).b() > 200 && px(200, 150).r() < 50, "inside is blue: {:?}", px(200, 150));
         assert!(px(200, 410).r() > 250 && px(200, 410).b() > 250, "an open polyline isn't filled: {:?}", px(200, 410));
         assert!(px(200, 400).g() < 200, "its first segment is drawn: {:?}", px(200, 400));
+        // Horizontal hatch lines every 8 points from the top of the rectangle: dark at 284, light at 288.
+        assert!(px(200, 284).g() < 200 && px(200, 288).g() > 230, "{:?} {:?}", px(200, 284), px(200, 288));
+        let page = doc.pages().get(0).unwrap();
+        assert!(page.objects().len() < 20, "the hatch is one path, not hundreds: {}", page.objects().len());
         std::fs::remove_dir_all(&dir).ok();
     }
 
