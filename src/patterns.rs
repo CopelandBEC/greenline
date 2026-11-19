@@ -582,8 +582,7 @@ pub fn cached_hatch(outline: &[Pos2], h: &Hatch, scale: f32) -> (Arc<HatchSegs>,
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {
-        // Key → (segments, how many points they hold, last use).
-        static CACHE: RefCell<(HashMap<u64, (Arc<HatchSegs>, usize, u64)>, u64)> = RefCell::new((HashMap::new(), 0));
+        static CACHE: RefCell<(HashMap<u64, Cached>, u64)> = RefCell::new((HashMap::new(), 0));
     }
     let origin = outline.iter().fold(Rect::NOTHING, |r, p| r.union(Rect::from_min_max(*p, *p))).min.to_vec2();
     let rel: Vec<Pos2> = outline.iter().map(|p| *p - origin).collect();
@@ -613,6 +612,9 @@ pub fn cached_hatch(outline: &[Pos2], h: &Hatch, scale: f32) -> (Arc<HatchSegs>,
     });
     (segs, origin)
 }
+
+/// A cached hatch: its segments, how many there are, and when it was last used.
+type Cached = (Arc<HatchSegs>, usize, u64);
 
 /// The most hatch elements one markup draws: past this the pattern is too
 /// dense for its size and is left out (the picker says so) rather than coarsened.
