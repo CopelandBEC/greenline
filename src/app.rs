@@ -233,8 +233,9 @@ pub struct App {
 
     tool: Tool,
     tool_color: HashMap<Tool, usize>,
-    /// Fill colour index per tool (`COLORS`, then white); none when absent.
-    tool_fill: HashMap<Tool, usize>,
+    /// Fill chosen per tool: a colour index (`COLORS`, then white) or none.
+    /// Absent: the markup's own default (callouts white, areas a tint, others none).
+    tool_fill: HashMap<Tool, Option<usize>>,
     /// Opacity of new fills, 0..=255.
     fill_alpha: u8,
     width: f32,
@@ -868,23 +869,30 @@ impl App {
         *self.tool_color.get(&tool).unwrap_or(&0)
     }
 
-    /// Fill for new markups made with the current tool.
-    fn fill(&self) -> Option<Fill> {
-        self.tool_fill.get(&self.tool).map(|&i| Fill { color: fill_color(i), alpha: self.fill_alpha })
+    /// The fill chosen for the current tool, if one was (`Some(None)`: none).
+    fn tool_fill(&self) -> Option<Option<Fill>> {
+        self.tool_fill.get(&self.tool).map(|i| i.map(|i| Fill { color: fill_color(i), alpha: self.fill_alpha }))
     }
 
-    /// Look of new markups made with the current tool.
-    fn new_style(&self) -> Style {
-        Style { fill: self.fill() }
+    /// Gives a new markup the current tool's look.
+    fn apply_style(&self, a: &mut Annot) {
+        if let Some(f) = self.tool_fill().filter(|_| a.fillable()) {
+            a.set_fill(f);
+        }
+    }
+
+    /// A markup drawn with the current tool, for previews.
+    fn sketch(&self, page: usize, color: Rgb, kind: Kind) -> Annot {
+        let mut a = Annot { id: 0, page, color, width: self.width, kind, wrap_w: None, group: None, style: Style::default() };
+        self.apply_style(&mut a);
+        a
     }
 
     fn add(&mut self, page: usize, kind: Kind) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let mut a = Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None, style: self.new_style() };
-        if !a.fillable() {
-            a.style.fill = None;
-        }
+        let mut a = Annot { id, page, color: self.color(), width: self.width, kind, wrap_w: None, group: None, style: Style::default() };
+        self.apply_style(&mut a);
         self.annots.push(a);
         self.changed();
         id
@@ -1125,39 +1133,51 @@ impl App {
     /// Fill for the tool and the selected markups that take one: a colour
     /// index (`COLORS`, then white) or none.
     fn set_fill(&mut self, idx: Option<usize>) {
-        match idx {
-            Some(i) => self.tool_fill.insert(self.tool, i),
-            None => self.tool_fill.remove(&self.tool),
-        };
-        let fill = idx.map(|i| Fill { color: fill_color(i), alpha: self.fill_alpha });
-        self.edit_fills(|f| *f = fill);
+        // With Select it's an edit of the selection, not a default for what's placed next.
+        if self.tool != Tool::Select {
+            self.tool_fill.insert(self.tool, idx);
+        }
+        let alpha = self.fill_alpha;
+        // A recoloured fill keeps its opacity.
+        self.edit_fills(|a| {
+            let keep = a.effective_fill().map_or(alpha, |f| f.alpha);
+            a.set_fill(idx.map(|i| Fill { color: fill_color(i), alpha: keep }));
+        });
     }
 
     fn set_fill_alpha(&mut self, alpha: u8) {
         self.fill_alpha = alpha;
-        self.edit_fills(|f| {
-            if let Some(f) = f {
-                f.alpha = alpha;
+        self.edit_fills(|a| {
+            if let Some(f) = a.effective_fill() {
+                a.set_fill(Some(Fill { alpha, ..f }));
             }
         });
     }
 
-    /// Applies `f` to the fill of each selected markup that takes one, as one undo step.
-    fn edit_fills(&mut self, mut f: impl FnMut(&mut Option<Fill>)) {
+    /// Applies `f` to each selected markup that takes a fill, as one undo step.
+    fn edit_fills(&mut self, mut f: impl FnMut(&mut Annot)) {
         if self.annots.iter().any(|a| self.selected.contains(&a.id) && a.fillable()) {
             self.edit_selected(|a| {
                 if a.fillable() {
-                    f(&mut a.style.fill);
+                    f(a);
                 }
             });
         }
     }
 
-    /// The fill the toolbar shows: the lead selected markup's, else the tool's.
+    /// The fill the toolbar shows: the lead selected markup's, else what the
+    /// current tool will draw.
     fn shown_fill(&self) -> Option<Fill> {
         match self.selected.iter().rev().filter_map(|&id| self.find(id)).find(|a| a.fillable()) {
-            Some(a) => a.style.fill,
-            None => self.fill(),
+            Some(a) => a.effective_fill(),
+            None => match self.tool_fill() {
+                Some(f) => f,
+                None => match self.tool {
+                    Tool::Callout => Some(Fill { color: WHITE, alpha: 255 }),
+                    Tool::Area => Some(Fill { color: self.color(), alpha: annot::AREA_TINT }),
+                    _ => None,
+                },
+            },
         }
     }
 
@@ -1594,6 +1614,12 @@ impl App {
                 }
             }
             Drag::Handle { id, before, .. } => {
+                // A polygon's outline mustn't end up crossing itself.
+                if self.find(id).is_some_and(|a| matches!(&a.kind, Kind::Poly { pts, closed: true } if measure::crosses_itself(pts))) {
+                    self.annots = before;
+                    self.toast("That would make the polygon's outline cross itself".into());
+                    return;
+                }
                 self.undo.push((before, self.scales.clone()));
                 self.redo.clear();
                 self.changed();
@@ -2572,7 +2598,7 @@ impl App {
                     let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
                         let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };
-                        let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None, style: Default::default() };
+                        let mut a = self.sketch(i, color, kind);
                         measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
                         paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.7, &self.textures);
                     }
@@ -2614,7 +2640,7 @@ impl App {
                 } else {
                     Kind::Measure { pts: pts.clone(), area: self.tool == Tool::Area && pts.len() >= 3, name: String::new(), value: String::new(), size: self.text_size }
                 };
-                let mut a = Annot { id: 0, page: i, color, width: self.width, kind, wrap_w: None, group: None, style: self.new_style() };
+                let mut a = self.sketch(i, color, kind);
                 if !calibrating && !self.outlining() {
                     measure::relabel(std::slice::from_mut(&mut a), &self.scales, self.prefs.units);
                 }
@@ -4309,10 +4335,37 @@ mod tests {
         assert_eq!(app.find(r).unwrap().style.fill.map(|f| f.alpha), Some(255));
         app.undo();
         assert_eq!(app.find(r).unwrap().style.fill.map(|f| f.alpha), Some(128), "opacity undoes on its own");
+        // A new colour keeps the markup's opacity.
         app.selected = vec![r];
+        app.fill_alpha = 10;
+        app.set_fill(Some(1));
+        assert_eq!(app.find(r).unwrap().style.fill, Some(Fill { color: COLORS[1].0, alpha: 128 }));
         app.set_fill(None);
         assert!(app.find(r).unwrap().style.fill.is_none());
         assert!(app.find(r).unwrap().style.is_plain(), "plain style is left out of the markups file");
+        // None clears a callout's white box too, and the toolbar says so.
+        let c = callout(&mut app, pos2(300.0, 300.0), pos2(400.0, 400.0));
+        app.selected = vec![c];
+        assert_eq!(app.shown_fill(), Some(Fill { color: WHITE, alpha: 255 }));
+        app.set_fill(None);
+        assert_eq!(app.shown_fill(), None);
+        let box_fill = app.find(c).unwrap().prims().into_iter().find_map(|p| match p {
+            Prim::Fill { alpha, outline: Some(_), .. } => Some(alpha),
+            _ => None,
+        });
+        assert_eq!(box_fill, Some(0), "the box keeps its outline but no fill");
+    }
+
+    #[test]
+    fn a_vertex_drag_cant_make_a_polygon_cross_itself() {
+        let mut app = app();
+        let id = app.add(0, Kind::Poly { pts: annot::rect_pts(Rect::from_min_max(pos2(100.0, 100.0), pos2(200.0, 200.0))), closed: true });
+        app.selected = vec![id];
+        drag(&mut app, pos2(200.0, 100.0), pos2(50.0, 150.0), PLAIN);
+        assert_eq!(polys(&app)[0].0[1], pos2(200.0, 100.0), "put back");
+        assert!(app.undo.is_empty(), "and nothing to undo");
+        drag(&mut app, pos2(200.0, 100.0), pos2(250.0, 80.0), PLAIN);
+        assert_eq!(polys(&app)[0].0[1], pos2(250.0, 80.0));
     }
 
     #[test]

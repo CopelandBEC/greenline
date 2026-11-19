@@ -88,6 +88,9 @@ pub enum Prim {
 
 pub const WHITE: Rgb = [255, 255, 255];
 
+/// Opacity of an area measurement's tint when it has no fill of its own.
+pub const AREA_TINT: u8 = 40;
+
 /// Markup colours, by name. The first is the default for new markups: CopelandBEC medium green.
 pub const COLORS: [(Rgb, &str); 6] = [
     ([0x6B, 0x9A, 0x1E], "Green"),
@@ -456,7 +459,7 @@ impl Annot {
             Kind::Image { rect, image, .. } => out.push(Prim::Image { rect: *rect, image: image.clone() }),
             Kind::Measure { pts, area, value, size, .. } => {
                 if *area && pts.len() >= 3 {
-                    let fill = self.style.fill.unwrap_or(Fill { color: c, alpha: 40 });
+                    let fill = self.style.fill.unwrap_or(Fill { color: c, alpha: AREA_TINT });
                     out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
                 } else if pts.len() >= 2 {
                     out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c });
@@ -476,6 +479,28 @@ impl Annot {
             }
         }
         out
+    }
+
+    /// The fill a markup has when none is chosen: a callout's white box, an area's tint.
+    pub fn default_fill(&self) -> Option<Fill> {
+        match self.kind {
+            Kind::Callout { .. } => Some(Fill { color: WHITE, alpha: 255 }),
+            Kind::Measure { area: true, .. } => Some(Fill { color: self.color, alpha: AREA_TINT }),
+            _ => None,
+        }
+    }
+
+    /// The fill that's drawn, if any.
+    pub fn effective_fill(&self) -> Option<Fill> {
+        self.style.fill.or_else(|| self.default_fill()).filter(|f| f.alpha > 0)
+    }
+
+    /// Sets the fill; `None` clears even a default one (a transparent fill is stored).
+    pub fn set_fill(&mut self, fill: Option<Fill>) {
+        self.style.fill = match fill {
+            None if self.default_fill().is_some() => Some(Fill { color: WHITE, alpha: 0 }),
+            f => f,
+        };
     }
 
     /// Whether the markup can take a fill: closed shapes and text boxes.
