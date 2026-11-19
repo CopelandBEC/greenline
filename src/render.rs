@@ -234,19 +234,24 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut 
 }
 
 /// Writes a new PDF of `pages` blank pages of `size` points. It never replaces
-/// a file: written to a temporary file, then linked into place, which fails if
-/// anything is already at `path`.
+/// a file: `path` is created exclusively (failing if anything is there), and
+/// removed again if writing fails.
 pub fn create_blank(pdfium: &Pdfium, path: &Path, size: Vec2, pages: usize) -> anyhow::Result<()> {
     let mut doc = pdfium.create_new_pdf()?;
     for _ in 0..pages.max(1) {
         doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(size.x), PdfPoints::new(size.y)))?;
     }
-    let tmp = path.with_extension(format!("pdf.{}.part", std::process::id()));
-    let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| {
-        std::fs::hard_link(&tmp, path).map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists { anyhow::anyhow!("{} already exists", path.display()) } else { e.into() })
-    });
-    let _ = std::fs::remove_file(&tmp);
-    saved
+    let bytes = doc.save_to_bytes()?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists { anyhow::anyhow!("{} already exists", path.display()) } else { anyhow::Error::from(e) }
+    })?;
+    let written = std::io::Write::write_all(&mut f, &bytes).and_then(|_| f.sync_all());
+    if let Err(e) = written {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 pub fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
