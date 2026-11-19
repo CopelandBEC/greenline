@@ -677,6 +677,9 @@ impl App {
         self.last_nudge = (0.0, Vec::new());
         self.fit_pending = false;
         self.save_retry_at = 0.0;
+        // A toolbar drag (opacity, hatch scale) mustn't land on the next tab's selection.
+        self.fill_pending = None;
+        self.hatch_scale_pending = None;
     }
 
     /// Shows tab `i`.
@@ -965,6 +968,12 @@ impl App {
         let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
         if real_out == *src || dunce::canonicalize(&out).is_ok_and(|o| o == *src) {
             self.toast("Refusing to overwrite the original PDF".into());
+            return;
+        }
+        // Nor a PDF open in another tab.
+        let open_elsewhere = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter_map(|p| p.path.as_ref()).any(|p| *p == real_out || dunce::canonicalize(&out).is_ok_and(|o| o == *p));
+        if open_elsewhere {
+            self.toast("That PDF is open in another tab: export to another name".into());
             return;
         }
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
@@ -4862,6 +4871,10 @@ impl eframe::App for App {
             self.save_sidecar();
         }
         self.save_parked(now);
+        // Background tabs still unsaved: keep retrying even when nothing else wakes the window.
+        if self.tabs.iter().filter_map(|t| t.parked.as_ref()).any(|p| p.dirty && !p.read_only) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
         // Wake once a second to notice proposals an agent adds.
         if self.path.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
