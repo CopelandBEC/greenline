@@ -8,6 +8,7 @@ pub mod fonts;
 pub mod mcp;
 pub mod measure;
 pub mod ops;
+pub mod patterns;
 pub mod pdf;
 pub mod proposals;
 pub mod render;

@@ -19,7 +19,12 @@ default green, highlight yellow), "width" (line width in points, default 2),
 "size" (text size in points, default 12; 10 for measurement labels),
 "group" (any string: ops on one page with the same group select and move together),
 "fill" (a colour as for "color", or "white": fills a cloud, rect, polygon, area, callout or
-text box) with "opacity" (0 to 100, default 50).
+text box) with "opacity" (0 to 100, default 50),
+"line" (a line type: dashed, dotted, dash-dot, or a name from the pattern library; for
+shapes, lines, arrows, polylines and callouts),
+"hatch" (a hatch: diagonal, crosshatch, horizontal, or a name from the pattern library; for
+clouds, rects, polygons and areas) with "hatch_scale" (default 1).
+`greenline-cli patterns` lists the library's line types and hatches.
 
   {"op": "cloud",     "page": 4, "rect": [x0, y0, x1, y1]}
   {"op": "rect",      "page": 4, "rect": [...]}
@@ -44,6 +49,12 @@ text box) with "opacity" (0 to 100, default 50).
         for a detail drawn at its own scale. "ratio" is real length per paper length
         (48 for 1/4" = 1'-0", 50 for 1:50). Lengths: 12'-6", 12' 6 1/2", 150", 3.2 m, 3200 mm.
 "##;
+
+/// The pattern library (built-ins, the user's own, the shared folder in prefs), read once.
+pub fn library() -> &'static crate::patterns::Library {
+    static LIB: std::sync::OnceLock<crate::patterns::Library> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| crate::patterns::Library::load(crate::sidecar::load_prefs().pattern_dir.as_deref()))
+}
 
 /// What a batch of ops adds.
 #[derive(Debug, Default, Clone)]
@@ -105,6 +116,30 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
         a.style.fill = f.fill().map_err(ctx)?;
         if a.style.fill.is_some() && !a.fillable() {
             return Err(ctx("\"fill\" is for clouds, rects, polygons, areas, callouts and text boxes".into()));
+        }
+        if let Some(name) = f.o.get("line").filter(|v| !v.is_null()) {
+            let name = name.as_str().ok_or(ctx("\"line\" must be a line type's name".into()))?;
+            if !a.takes_line_type() {
+                return Err(ctx("\"line\" is for clouds, rects, lines, arrows, pens, polylines, polygons and callouts".into()));
+            }
+            let lib = library();
+            let lt = lib.line_types.iter().find(|(_, l)| l.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| ctx(format!("no line type \"{name}\": see `greenline-cli patterns`")))?;
+            a.style.line = Some(lt.1.clone());
+        }
+        if let Some(name) = f.o.get("hatch").filter(|v| !v.is_null()) {
+            let name = name.as_str().ok_or(ctx("\"hatch\" must be a hatch's name".into()))?;
+            if !a.hatchable() {
+                return Err(ctx("\"hatch\" is for clouds, rects, polygons and areas".into()));
+            }
+            let scale = f.num_or("hatch_scale", 1.0).map_err(ctx)?;
+            if !(0.1..=20.0).contains(&scale) {
+                return Err(ctx("\"hatch_scale\" must be 0.1 to 20".into()));
+            }
+            let lib = library();
+            let h = lib.hatches.iter().find(|(_, h)| h.name.trim().eq_ignore_ascii_case(name.trim())).ok_or_else(|| ctx(format!("no hatch \"{name}\": see `greenline-cli patterns`")))?;
+            a.style.hatch = Some(crate::patterns::HatchFill { pattern: h.1.clone(), scale });
+        } else if f.o.contains_key("hatch_scale") {
+            return Err(ctx("\"hatch_scale\" goes with \"hatch\"".into()));
         }
         if let Kind::Callout { box_w, .. } | Kind::Text { box_w, .. } = a.kind {
             a.wrap_w = Some(box_w);

@@ -384,6 +384,21 @@ fn emit_prims<'a>(
     let k = m.u.length();
     for prim in prims {
         match prim {
+            Prim::Segments { segs, width, color: c } if !segs.is_empty() => {
+                // One path object for the whole hatch: far smaller than one per segment.
+                let first = m.map(segs[0][0]);
+                let mut obj = PdfPagePathObject::new(doc, PdfPoints::new(first.x), PdfPoints::new(first.y), Some(color(c, 255)), Some(PdfPoints::new(width * k)), None)?;
+                for (i, [a, b]) in segs.iter().enumerate() {
+                    let (a, b) = (m.map(*a), m.map(*b));
+                    if i > 0 {
+                        obj.move_to(PdfPoints::new(a.x), PdfPoints::new(a.y))?;
+                    }
+                    // A dot: a zero-length segment, which round caps draw as a dot.
+                    obj.line_to(PdfPoints::new(b.x), PdfPoints::new(b.y))?;
+                }
+                obj.set_line_cap(PdfPageObjectLineCap::Round)?;
+                objects.add_path_object(obj)?;
+            }
             Prim::Stroke { pts, closed, width, color: c } if pts.len() >= 2 => {
                 let pts: Vec<Pos2> = pts.iter().map(|p| m.map(*p)).collect();
                 let obj = path_object(doc, &pts, closed, Some((c, width * k)), None)?;

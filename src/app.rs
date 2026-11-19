@@ -1,4 +1,6 @@
 use crate::annot::{self, Annot, Fill, Kind, Prim, Rgb, Style, COLORS, WHITE};
+use crate::patterns::{self, Hatch, HatchFill, LineType};
+use std::sync::Arc;
 use crate::measure::{self, Scale, Units};
 use crate::proposals::{self, Proposals};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
@@ -38,6 +40,10 @@ enum Pick {
     /// Save-as for an export of this source PDF.
     Export(ExportMode, PathBuf),
     Images(stamps::Use),
+    /// Bluebeam line type / hatch files to import.
+    Patterns,
+    /// The shared pattern library folder.
+    PatternDir,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -240,6 +246,12 @@ pub struct App {
     fill_alpha: u8,
     /// The opacity slider's value during a drag (percent), applied on release.
     fill_pending: Option<f32>,
+    /// Line type per tool (absent or `None`: solid).
+    tool_line: HashMap<Tool, Arc<LineType>>,
+    /// Hatch per tool (absent: none).
+    tool_hatch: HashMap<Tool, HatchFill>,
+    /// Line types and hatches to pick from.
+    patterns: patterns::Library,
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -294,6 +306,7 @@ impl App {
         };
         let mut app = Self::with(worker, status, prefs);
         app.library = stamps::Library::load();
+        app.reload_patterns();
         if let Some(p) = path {
             app.open(p);
         }
@@ -359,6 +372,9 @@ impl App {
             tool_fill: HashMap::new(),
             fill_alpha: 128,
             fill_pending: None,
+            tool_line: HashMap::new(),
+            tool_hatch: HashMap::new(),
+            patterns: patterns::Library::default(),
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -528,6 +544,8 @@ impl App {
                 }
             }
             Pick::Images(_) => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
+            Pick::Patterns => d.add_filter("Bluebeam line types and hatches", &["blx", "bhx"]),
+            Pick::PatternDir => d,
         };
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
@@ -535,7 +553,8 @@ impl App {
             let paths = match pick {
                 Pick::Open => d.pick_file().into_iter().collect(),
                 Pick::Export(..) => d.save_file().into_iter().collect(),
-                Pick::Images(_) => d.pick_files().unwrap_or_default(),
+                Pick::Images(_) | Pick::Patterns => d.pick_files().unwrap_or_default(),
+                Pick::PatternDir => d.pick_folder().into_iter().collect(),
             };
             tx.send((pick, paths)).ok();
             ctx.request_repaint();
@@ -568,6 +587,34 @@ impl App {
                     self.import_images(kind, paths);
                 }
             }
+            Pick::Patterns => {
+                if !paths.is_empty() {
+                    match patterns::import(&paths) {
+                        Ok(n) => {
+                            self.reload_patterns();
+                            self.toast(format!("Imported {n} line types and hatches into your library"));
+                        }
+                        Err(e) => self.toast(format!("Import failed: {e}")),
+                    }
+                }
+            }
+            Pick::PatternDir => {
+                if let Some(dir) = paths.into_iter().next() {
+                    self.prefs.pattern_dir = Some(dir);
+                    self.prefs_dirty = true;
+                    self.reload_patterns();
+                }
+            }
+        }
+    }
+
+    /// Rereads the pattern library (built-ins, own, shared folder).
+    fn reload_patterns(&mut self) {
+        self.patterns = patterns::Library::load(self.prefs.pattern_dir.as_deref());
+        let n = self.patterns.line_types.len() + self.patterns.hatches.len();
+        if let Some(p) = self.patterns.problems.first() {
+            let more = self.patterns.problems.len() - 1;
+            self.toast(format!("{n} patterns; couldn't read {p}{}", if more > 0 { format!(" (and {more} more)") } else { String::new() }));
         }
     }
 
@@ -881,6 +928,59 @@ impl App {
     fn apply_style(&self, a: &mut Annot) {
         if let Some(f) = self.tool_fill().filter(|_| a.fillable()) {
             a.set_fill(f);
+        }
+        if a.takes_line_type() {
+            a.style.line = self.tool_line.get(&self.tool).cloned();
+        }
+        if a.hatchable() {
+            a.style.hatch = self.tool_hatch.get(&self.tool).cloned();
+        }
+    }
+
+    fn set_line_type(&mut self, lt: Option<Arc<LineType>>) {
+        if self.tool != Tool::Select {
+            match &lt {
+                Some(l) => self.tool_line.insert(self.tool, l.clone()),
+                None => self.tool_line.remove(&self.tool),
+            };
+        }
+        if self.annots.iter().any(|a| self.selected.contains(&a.id) && a.takes_line_type()) {
+            self.edit_selected(|a| {
+                if a.takes_line_type() {
+                    a.style.line = lt.clone();
+                }
+            });
+        }
+    }
+
+    /// The line type the toolbar shows: the lead selected markup's, else the tool's.
+    fn shown_line_type(&self) -> Option<Arc<LineType>> {
+        match self.selected.iter().rev().filter_map(|&id| self.find(id)).find(|a| a.takes_line_type()) {
+            Some(a) => a.style.line.clone(),
+            None => self.tool_line.get(&self.tool).cloned(),
+        }
+    }
+
+    fn set_hatch(&mut self, h: Option<HatchFill>) {
+        if self.tool != Tool::Select {
+            match &h {
+                Some(h) => self.tool_hatch.insert(self.tool, h.clone()),
+                None => self.tool_hatch.remove(&self.tool),
+            };
+        }
+        if self.annots.iter().any(|a| self.selected.contains(&a.id) && a.hatchable()) {
+            self.edit_selected(|a| {
+                if a.hatchable() {
+                    a.style.hatch = h.clone();
+                }
+            });
+        }
+    }
+
+    fn shown_hatch(&self) -> Option<HatchFill> {
+        match self.selected.iter().rev().filter_map(|&id| self.find(id)).find(|a| a.hatchable()) {
+            Some(a) => a.style.hatch.clone(),
+            None => self.tool_hatch.get(&self.tool).cloned(),
         }
     }
 
@@ -3800,6 +3900,28 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
     let min_w = if z < 0.3 { 0.7 } else { 1.0 };
     for prim in prims {
         match prim {
+            Prim::Stroke { pts, width, color, .. } if pts.len() == 2 && pts[0] == pts[1] => {
+                // A dot in a dotted line.
+                painter.circle_filled(to(pts[0]), (width * z / 2.0).max(min_w / 2.0), col(*color, 255));
+            }
+            Prim::Segments { segs, width, color } => {
+                let w = (width * z).max(0.6);
+                // A hatch too fine to make out on screen is drawn as a light tint instead.
+                let c = col(*color, if width * z < 0.25 { 110 } else { 255 });
+                let s = Stroke::new(w, c);
+                let view = painter.clip_rect();
+                for [a, b] in segs.iter() {
+                    let (a, b) = (to(*a), to(*b));
+                    if !view.intersects(Rect::from_two_pos(a, b).expand(w)) {
+                        continue;
+                    }
+                    if a == b {
+                        painter.rect_filled(Rect::from_center_size(a, Vec2::splat(w)), 0.0, c);
+                    } else {
+                        painter.line_segment([a, b], s);
+                    }
+                }
+            }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
                 let pts = map(pts);

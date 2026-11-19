@@ -5,8 +5,10 @@
 //! Every annotation is reduced to a list of `Prim`s; the screen painter and
 //! the PDF exporter both draw from those, so export matches the screen.
 
+use crate::patterns::{HatchFill, LineType};
 use egui::{pos2, vec2, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub type Rgb = [u8; 3];
 
@@ -36,6 +38,12 @@ pub struct Style {
     /// callouts keep their white box, text has no box.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fill: Option<Fill>,
+    /// Dashes or symbols along the outline; solid when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<Arc<LineType>>,
+    /// Hatch inside a closed shape, in the markup's colour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hatch: Option<HatchFill>,
 }
 
 impl Style {
@@ -84,6 +92,8 @@ pub enum Prim {
     Text { origin: Pos2, text: String, size: f32, color: Rgb },
     /// Library image stretched over `rect` (it keeps its aspect when resized).
     Image { rect: Rect, image: String },
+    /// Many separate segments of one width and colour (a hatch); a zero-length one is a dot.
+    Segments { segs: Arc<Vec<[Pos2; 2]>>, width: f32, color: Rgb },
 }
 
 pub const WHITE: Rgb = [255, 255, 255];
@@ -372,7 +382,7 @@ impl Annot {
                     best = best.min(polyline_dist(&rect_pts(*rect), true, p));
                     continue;
                 }
-                Prim::Text { .. } => continue,
+                Prim::Text { .. } | Prim::Segments { .. } => continue,
             };
             best = best.min(polyline_dist(pts, closed, p));
         }
@@ -405,11 +415,60 @@ impl Annot {
         self.prims().iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
             Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
-            Prim::Text { .. } | Prim::Image { .. } => false,
+            Prim::Text { .. } | Prim::Image { .. } | Prim::Segments { .. } => false,
         })
     }
 
     pub fn prims(&self) -> Vec<Prim> {
+        let mut out = self.shape_prims();
+        if let Some(lt) = self.style.line.as_deref().filter(|_| self.takes_line_type()) {
+            out = out
+                .into_iter()
+                .flat_map(|p| match p {
+                    Prim::Stroke { pts, closed, width, color } => {
+                        let mut v = Vec::new();
+                        crate::patterns::pattern_prims(&mut v, &pts, closed, lt, width, color);
+                        v
+                    }
+                    // A callout's box: its fill, then the outline in the pattern.
+                    Prim::Fill { pts, color, alpha, outline: Some((oc, ow)) } => {
+                        let mut v = vec![Prim::Fill { pts: pts.clone(), color, alpha, outline: None }];
+                        crate::patterns::pattern_prims(&mut v, &pts, true, lt, ow, oc);
+                        v
+                    }
+                    p => vec![p],
+                })
+                .collect();
+        }
+        out
+    }
+
+    /// Whether the outline can be dashed or patterned.
+    pub fn takes_line_type(&self) -> bool {
+        matches!(self.kind, Kind::Callout { .. } | Kind::Cloud { .. } | Kind::Rect { .. } | Kind::Arrow { .. } | Kind::Line { .. } | Kind::Pen { .. } | Kind::Poly { .. })
+    }
+
+    /// Whether the markup can be hatched: closed shapes.
+    pub fn hatchable(&self) -> bool {
+        match &self.kind {
+            Kind::Cloud { .. } | Kind::Rect { .. } => true,
+            Kind::Poly { closed, .. } => *closed,
+            Kind::Measure { area, .. } => *area,
+            _ => false,
+        }
+    }
+
+    /// The closed outline a fill or hatch goes inside.
+    fn outline(&self) -> Option<Vec<Pos2>> {
+        match &self.kind {
+            Kind::Cloud { rect } => Some(cloud_pts(*rect)),
+            Kind::Rect { rect } => Some(rect_pts(*rect)),
+            Kind::Poly { pts, closed: true } | Kind::Measure { pts, area: true, .. } if pts.len() >= 3 => Some(pts.clone()),
+            _ => None,
+        }
+    }
+
+    fn shape_prims(&self) -> Vec<Prim> {
         let c = self.color;
         let w = self.width;
         let mut out = Vec::new();
@@ -460,7 +519,9 @@ impl Annot {
             Kind::Measure { pts, area, value, size, .. } => {
                 if *area && pts.len() >= 3 {
                     let fill = self.style.fill.unwrap_or(Fill { color: c, alpha: AREA_TINT });
-                    out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
+                    out.push(Prim::Fill { pts: pts.clone(), color: fill.color, alpha: fill.alpha, outline: None });
+                    self.hatch_prims(&mut out, pts);
+                    out.push(Prim::Stroke { pts: pts.clone(), closed: true, width: w, color: c });
                 } else if pts.len() >= 2 {
                     out.push(Prim::Stroke { pts: pts.clone(), closed: false, width: w, color: c });
                     // Ticks square to the line at both ends, like a dimension.
@@ -516,20 +577,26 @@ impl Annot {
     /// The closed outline whose inside is filled, when the markup has a fill.
     /// (A callout's box always counts, through `text_box`.)
     fn filled_outline(&self) -> Option<Vec<Pos2>> {
-        if !self.style.fill.is_some_and(|f| f.alpha > 0) {
+        let hatched = self.style.hatch.is_some() && self.hatchable();
+        if !self.style.fill.is_some_and(|f| f.alpha > 0) && !hatched {
             return None;
         }
-        match &self.kind {
-            Kind::Cloud { rect } => Some(cloud_pts(*rect)),
-            Kind::Rect { rect } => Some(rect_pts(*rect)),
-            Kind::Poly { pts, closed: true } | Kind::Measure { pts, area: true, .. } if pts.len() >= 3 => Some(pts.clone()),
-            _ => None,
-        }
+        self.outline()
     }
 
+    /// Fill, then hatch, inside `pts` (the outline is drawn after, on top).
     fn fill_prims(&self, out: &mut Vec<Prim>, pts: Vec<Pos2>) {
         if let Some(f) = self.style.fill.filter(|f| f.alpha > 0) {
-            out.push(Prim::Fill { pts, color: f.color, alpha: f.alpha, outline: None });
+            out.push(Prim::Fill { pts: pts.clone(), color: f.color, alpha: f.alpha, outline: None });
+        }
+        self.hatch_prims(out, &pts);
+    }
+
+    fn hatch_prims(&self, out: &mut Vec<Prim>, pts: &[Pos2]) {
+        if let Some(h) = self.style.hatch.as_ref().filter(|_| self.hatchable()) {
+            for (width, segs) in crate::patterns::cached_hatch(pts, &h.pattern, h.scale).iter() {
+                out.push(Prim::Segments { segs: segs.clone(), width: *width, color: self.color });
+            }
         }
     }
 }

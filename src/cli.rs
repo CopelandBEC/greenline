@@ -29,6 +29,7 @@ const USAGE: &str = "greenline-cli: Greenline for agents and scripts (read `gree
   withdraw <pdf> <id | all>               take back a proposed batch
   export <pdf> [--out F.pdf] [--editable] [--proposals]
   ops                                     the op reference for apply
+  patterns                                line types and hatches ops can name
   mcp                                     serve these commands as MCP tools over standard input/output
 
 Pages count from 1. R is x0,y0,x1,y1 in page points (origin top-left, y down, 72 per inch).
@@ -146,6 +147,15 @@ pub fn run(args: Vec<String>) -> anyhow::Result<Value> {
         "ops" => {
             println!("{}", ops::REFERENCE);
             Ok(Value::Null)
+        }
+        "patterns" => {
+            let lib = ops::library();
+            let entry = |set: &str, name: &str| json!({ "name": name.trim(), "library": if set.is_empty() { "built-in" } else { set } });
+            Ok(json!({
+                "line_types": lib.line_types.iter().map(|(s, l)| entry(s, &l.name)).collect::<Vec<_>>(),
+                "hatches": lib.hatches.iter().map(|(s, h)| entry(s, &h.name)).collect::<Vec<_>>(),
+                "problems": lib.problems,
+            }))
         }
         "mcp" => {
             crate::mcp::serve();
