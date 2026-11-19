@@ -286,6 +286,8 @@ pub struct App {
     new_doc: Option<NewDoc>,
     /// Images being stored for placing: (stored name, file name, pixels) or an error, the drop target, the document then.
     pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
+    /// Images waiting to be placed after the one being placed now.
+    queued_pictures: std::collections::VecDeque<Place>,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -428,6 +430,7 @@ impl App {
             find: Find::default(),
             new_doc: None,
             pictures: mpsc::channel(),
+            queued_pictures: Default::default(),
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -741,9 +744,15 @@ impl App {
         // As if at 150 dpi, but within 60% of the page either way.
         let page = target.map_or(self.current_page(), |t| t.0).min(self.pages.len() - 1);
         let ps = self.pages[page];
-        let width = (px.x / 150.0 * 72.0).min(ps.x * 0.6).min(ps.y * 0.6 * aspect).max(24.0);
+        let width = (px.x / 150.0 * 72.0).max(24.0).min(ps.x * 0.6).min(ps.y * 0.6 * aspect);
+        let place = Place::Image { image, name, aspect, width };
+        // Several without a spot (dropped on the overview): placed one after another.
+        if target.is_none() && self.placing.is_some() {
+            self.queued_pictures.push_back(place);
+            return;
+        }
         self.set_tool(Tool::Select);
-        self.start_placing(Place::Image { image, name, aspect, width });
+        self.start_placing(place);
         if let Some((page, p)) = target {
             // Centred on the drop, kept on the sheet.
             let half = vec2(width, width / aspect) / 2.0;
@@ -1940,7 +1949,8 @@ impl App {
             // An open find bar goes first: its highlights are what's on top.
             self.close_find();
         } else if self.placing.take().is_some() {
-            self.toast("Placing cancelled".into());
+            let more = std::mem::take(&mut self.queued_pictures).len();
+            self.toast(if more > 0 { format!("Placing cancelled (and {more} more)") } else { "Placing cancelled".into() });
         } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
             self.set_tool(Tool::Select);
         } else if !self.selected.is_empty() {
@@ -2985,6 +2995,9 @@ impl App {
         // Ready to nudge it into the box.
         self.tool = Tool::Select;
         self.selected = vec![id];
+        if let Some(next) = self.queued_pictures.pop_front() {
+            self.start_placing(next);
+        }
     }
 
     fn remember_width(&mut self, image: &str, width: f32) {
@@ -3071,6 +3084,11 @@ impl App {
             .iter()
             .filter_map(|a| if let Kind::Image { image, .. } = &a.kind { Some(image) } else { None })
             .chain(self.library.entries.iter().map(|e| &e.image))
+            // The image being placed, so its preview shows it.
+            .chain(match &self.placing {
+                Some(Place::Image { image, .. }) => Some(image),
+                _ => None,
+            })
             .filter(|n| !self.textures.contains_key(*n) && !self.tex_failed.contains(*n))
             .cloned()
             .collect();
@@ -5346,6 +5364,18 @@ mod tests {
         assert!(rect.height() <= 800.0 * 0.6 + 0.01, "{rect:?}");
         assert!(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)).contains_rect(*rect), "{rect:?}");
         assert!((rect.width() / rect.height() - 0.25).abs() < 1e-3);
+        // Two without a spot: placed one after the other.
+        app.picture_ready(Ok(("e1.png".into(), "One".into(), vec2(100.0, 100.0))), None, app.generation);
+        app.picture_ready(Ok(("e2.png".into(), "Two".into(), vec2(100.0, 100.0))), None, app.generation);
+        assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "One"));
+        app.click(pos2(200.0, 200.0), false, PLAIN);
+        assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "Two"));
+        app.click(pos2(300.0, 300.0), false, PLAIN);
+        assert!(app.placing.is_none());
+        // A very narrow, tall one still fits.
+        app.picture_ready(Ok(("f.png".into(), "Tall".into(), vec2(60.0, 2400.0))), Some((0, pos2(300.0, 400.0))), app.generation);
+        let Kind::Image { rect, .. } = &app.annots.last().unwrap().kind else { panic!() };
+        assert!(rect.height() <= 480.01, "{rect:?}");
         // A late one for a document no longer shown is let go.
         let n = app.annots.len();
         app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), app.generation + 1);
