@@ -666,6 +666,9 @@ impl App {
         self.editing = None;
         self.drag = Drag::None;
         self.placing = None;
+        // Images on their way to being placed belong to the document they were dropped on.
+        self.queued_pictures.clear();
+        self.picture_epoch += 1;
         self.building = None;
         self.scale_win.target = None;
         self.scale_win.calib = None;
