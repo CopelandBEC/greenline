@@ -27,7 +27,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `W` / `F` / `Z` | Fit width / fit page / zoom to the selected markups — or click the zoom % in the status bar for fit, actual size and presets |
 | `Ctrl+F` | Find text in the document: matches are highlighted on the sheets; `Enter` / `F3` next, `Shift` for previous, `Esc` closes |
 | Tabs | Opening another PDF opens it in a new tab (the strip appears once two are open); `Ctrl+Tab` / `Ctrl+Shift+Tab` switch, `Ctrl+W` or middle-click closes; each keeps its own markups, view and undo |
-| `Ctrl+N` | New blank document: Letter to ARCH E or A4–A1, portrait or landscape, any number of pages, saved where you choose |
+| `Ctrl+N` | New blank document: Letter to ARCH E or A4–A1, portrait or landscape, up to 200 pages, saved where you choose |
 | Drop an image | A PNG or JPEG dropped on a sheet is placed there as a markup, full colour (tool menu ▸ **Insert image…** too); resize it by its corners |
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
@@ -53,9 +53,19 @@ An agent with a shell (Claude Code, Codex) uses the command line directly and do
 
 ## Build and release
 
-CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together.
+CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together. A tag with a pre-release part (`v2.0.0-rc.1`) publishes as a GitHub pre-release; Windows file versions drop that part (`2.0.0`).
 
 After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo install --locked --features cli cargo-about`) to regenerate `THIRD-PARTY-LICENSES.html`, which the installer ships alongside our licences, PDFium's and Montserrat's.
+
+## Roadmap
+
+**2.0** is in release candidates: polylines and polygons, fills, line types and hatches (Bluebeam `.blx`/`.bhx`), text search, bold/italic/underline, blank documents, images as markups, and tabs.
+
+Planned for **2.1**:
+
+- **Split screen**: two documents (or two places in one) side by side, building on tabs.
+- **Per-word formatting**: bold, italic and underline on words within a note, not just the whole note.
+- **Smaller files**: reduce a PDF's size (downsample and recompress scanned images), and embed placed photos compactly on export.
 
 ## Contributing
 
