@@ -850,7 +850,11 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
-                Resp::Created(Ok(path)) => self.open(path),
+                Resp::Created(Ok(path)) => match sidecar::retire(&dunce::canonicalize(&path).unwrap_or(path.clone())) {
+                    Ok(true) => self.open(path),
+                    Ok(false) => self.toast("A document at that path is open in another Greenline window: close it there, then open the new one".into()),
+                    Err(e) => self.toast(format!("Created, but old markups for that path couldn't be set aside ({e}); not opening it")),
+                },
                 Resp::Created(Err(e)) => self.toast(format!("Could not create the document: {e}")),
                 Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
                     self.find.more |= more;

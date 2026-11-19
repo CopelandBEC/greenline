@@ -132,6 +132,22 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
     }
 }
 
+/// A new blank PDF was written at `pdf`: markups (and proposals) saved for a
+/// document that used to be there no longer apply, so they're renamed aside
+/// (`<file>.replaced-<unix time>`, recoverable) rather than loaded onto it.
+/// `false` if that document is open in another Greenline window.
+pub fn retire(pdf: &Path) -> anyhow::Result<bool> {
+    let Some(_lock) = lock(pdf)? else { return Ok(false) };
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    for f in [file_for(pdf), crate::proposals::file_for(pdf)] {
+        if f.exists() {
+            let stem = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            std::fs::rename(&f, f.with_file_name(format!("{stem}.replaced-{stamp}")))?;
+        }
+    }
+    Ok(true)
+}
+
 /// Writes the markups file `f` for `pdf`.
 pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale], accepted: &[String]) -> anyhow::Result<()> {
     if let Some(d) = f.parent() {
