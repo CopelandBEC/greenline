@@ -28,6 +28,8 @@ pub struct Keep {
 
 pub enum Req {
     Open { generation: u64, path: PathBuf },
+    /// A tab closed: let its document go.
+    Close { generation: u64 },
     /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
     Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
@@ -118,7 +120,8 @@ fn run(
     keep: Arc<Mutex<Keep>>,
     ctx: egui::Context,
 ) {
-    let mut doc: Option<(u64, PdfDocument)> = None;
+    // One open document per tab, by the generation it was opened as.
+    let mut docs: HashMap<u64, PdfDocument> = HashMap::new();
     let mut queue: VecDeque<Req> = VecDeque::new();
     // Thumbnails and a search take turns.
     let mut thumb_turn = false;
@@ -135,45 +138,39 @@ fn run(
         let Some(req) = next_request(&mut queue, &keep, &mut thumb_turn) else { continue };
         let resp = match req {
             Req::Open { generation, path } => {
-                doc = None;
                 match pdfium.load_pdf_from_file(&path, None) {
                     Ok(d) => {
                         let pages = d.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
-                        doc = Some((generation, d));
+                        docs.insert(generation, d);
                         Resp::Opened { generation, pages }
                     }
                     Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
                 }
             }
             Req::Render { generation, page, scale, origin, size, layer } => {
-                let Some((g, d)) = &doc else { continue };
-                if *g != generation {
-                    continue;
-                }
+                let Some(d) = docs.get(&generation) else { continue };
                 match render_region(d, page, scale, origin, size) {
                     Ok(image) => Resp::Rendered { generation, page, scale, origin, layer, image },
                     Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
                 }
             }
             Req::PageText { generation, page } => {
-                let Some((g, d)) = &doc else { continue };
-                if *g != generation {
-                    continue;
-                }
+                let Some(d) = docs.get(&generation) else { continue };
                 let text = d.pages().get(page as PdfPageIndex).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
                 Resp::PageText { generation, page, text }
             }
             Req::Search { generation, id, mut pages, query } => {
-                let Some((g, d)) = &doc else { continue };
-                if *g != generation {
-                    continue;
-                }
+                let Some(d) = docs.get(&generation) else { continue };
                 let Some(page) = pages.pop_front() else { continue };
                 let (hits, more) = d.pages().get(page as PdfPageIndex).ok().and_then(|p| crate::pdf::search_page(&p, &query).ok()).unwrap_or_default();
                 if !pages.is_empty() {
                     queue.push_back(Req::Search { generation, id, pages, query });
                 }
                 Resp::Found { generation, id, page, hits, more }
+            }
+            Req::Close { generation } => {
+                docs.remove(&generation);
+                continue;
             }
             Req::Create { path, size, pages } => Resp::Created(create_blank(pdfium, &path, size, pages).map(|_| path).map_err(|e| e.to_string())),
             Req::Export { src, out, annots, mode, author } => Resp::Exported(

@@ -161,6 +161,46 @@ struct Mods {
 /// A stored image (stored name, file name, pixels) or why not, where it was dropped, and the placing epoch it began in.
 type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
 
+/// A document in a background tab: everything that belongs to it, parked while
+/// another tab is shown. Its rendered pages are dropped (re-rendered on return);
+/// the worker keeps the PDF open under `generation`.
+struct Parked {
+    path: Option<PathBuf>,
+    generation: u64,
+    pages: Vec<Vec2>,
+    page_y: Vec<f32>,
+    doc_w: f32,
+    doc_h: f32,
+    zoom: f32,
+    offset: Vec2,
+    props: Proposals,
+    props_path: Option<PathBuf>,
+    markups_file: Option<PathBuf>,
+    accepted: Vec<String>,
+    props_mtime: Option<std::time::SystemTime>,
+    overview_cursor: usize,
+    annots: Vec<Annot>,
+    scales: Vec<Scale>,
+    scale_found: HashMap<usize, Vec<(String, f64)>>,
+    scale_asked: HashSet<usize>,
+    find: Find,
+    find_from: usize,
+    next_id: u64,
+    undo: Vec<(Vec<Annot>, Vec<Scale>)>,
+    redo: Vec<(Vec<Annot>, Vec<Scale>)>,
+    dirty: bool,
+    selected: Vec<u64>,
+    lock: Option<std::fs::File>,
+    read_only: bool,
+    read_only_why: String,
+    failed: HashSet<usize>,
+}
+
+/// An open document's place in the tab strip; the shown tab's state is in `App`.
+struct Tab {
+    parked: Option<Box<Parked>>,
+}
+
 /// Page sizes offered for a new document: name and portrait size in points.
 const PAGE_SIZES: [(&str, Vec2); 9] = [
     ("Letter  8.5 × 11 in", Vec2::new(612.0, 792.0)),
@@ -293,6 +333,13 @@ pub struct App {
     queued_pictures: std::collections::VecDeque<Place>,
     /// Bumped when placing is cancelled, so images still being stored are let go.
     picture_epoch: u64,
+    /// Open documents in tab order; `tabs[cur_tab]` is the one shown (its state is in `self`).
+    tabs: Vec<Tab>,
+    cur_tab: usize,
+    /// The window title needs updating (tab switched or closed).
+    title_dirty: bool,
+    /// The latest document generation handed out.
+    last_generation: u64,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -438,6 +485,10 @@ impl App {
             pictures: mpsc::channel(),
             queued_pictures: Default::default(),
             picture_epoch: 0,
+            tabs: vec![Tab { parked: None }],
+            cur_tab: 0,
+            title_dirty: false,
+            last_generation: 0,
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -486,6 +537,222 @@ impl App {
     // -----------------------------------------------------------------------
     // Document
 
+    /// Moves the shown document's state out of `self`, leaving it empty.
+    fn park(&mut self) -> Box<Parked> {
+        self.commit_edit();
+        self.save_sidecar();
+        let p = Parked {
+            path: std::mem::take(&mut self.path),
+            generation: self.generation,
+            pages: std::mem::take(&mut self.pages),
+            page_y: std::mem::take(&mut self.page_y),
+            doc_w: self.doc_w,
+            doc_h: self.doc_h,
+            zoom: self.zoom,
+            offset: self.offset,
+            props: std::mem::take(&mut self.props),
+            props_path: std::mem::take(&mut self.props_path),
+            markups_file: std::mem::take(&mut self.markups_file),
+            accepted: std::mem::take(&mut self.accepted),
+            props_mtime: std::mem::take(&mut self.props_mtime),
+            overview_cursor: self.overview_cursor,
+            annots: std::mem::take(&mut self.annots),
+            scales: std::mem::take(&mut self.scales),
+            scale_found: std::mem::take(&mut self.scale_win.found),
+            scale_asked: std::mem::take(&mut self.scale_win.asked),
+            find: std::mem::take(&mut self.find),
+            find_from: self.find_from,
+            next_id: self.next_id,
+            undo: std::mem::take(&mut self.undo),
+            redo: std::mem::take(&mut self.redo),
+            dirty: self.dirty,
+            selected: std::mem::take(&mut self.selected),
+            lock: std::mem::take(&mut self.lock),
+            read_only: self.read_only,
+            read_only_why: std::mem::take(&mut self.read_only_why),
+            failed: std::mem::take(&mut self.failed),
+        };
+        self.dirty = false;
+        self.read_only = false;
+        self.next_id = 1;
+        self.drop_view_state();
+        Box::new(p)
+    }
+
+    /// Makes a parked document the shown one.
+    fn unpark(&mut self, p: Box<Parked>) {
+        let p = *p;
+        self.drop_view_state();
+        self.path = p.path;
+        self.generation = p.generation;
+        self.pages = p.pages;
+        self.page_y = p.page_y;
+        self.doc_w = p.doc_w;
+        self.doc_h = p.doc_h;
+        self.zoom = p.zoom;
+        self.offset = p.offset;
+        self.props = p.props;
+        self.props_path = p.props_path;
+        self.markups_file = p.markups_file;
+        self.accepted = p.accepted;
+        self.props_mtime = p.props_mtime;
+        self.overview_cursor = p.overview_cursor;
+        self.annots = p.annots;
+        self.scales = p.scales;
+        self.scale_win.found = p.scale_found;
+        self.scale_win.asked = p.scale_asked;
+        self.find = p.find;
+        self.find_from = p.find_from;
+        self.next_id = p.next_id;
+        self.undo = p.undo;
+        self.redo = p.redo;
+        self.dirty = p.dirty;
+        self.selected = p.selected;
+        self.lock = p.lock;
+        self.read_only = p.read_only;
+        self.read_only_why = p.read_only_why;
+        self.failed = p.failed;
+        // Find results are for this document's search; let the worker know which one is wanted.
+        if let Some(w) = &self.worker {
+            w.keep.lock().unwrap().search = self.find.id;
+        }
+    }
+
+    /// Clears what's tied to the shown document's view: rendered pages, gestures in progress.
+    fn drop_view_state(&mut self) {
+        self.base.clear();
+        self.patch.clear();
+        self.req_base.clear();
+        self.req_patch.clear();
+        self.thumbs.clear();
+        self.req_thumb.clear();
+        self.thumbs_wanted.clear();
+        self.overview = false;
+        self.sidebar_synced = None;
+        self.editing = None;
+        self.drag = Drag::None;
+        self.placing = None;
+        self.building = None;
+        self.scale_win.target = None;
+        self.scale_win.calib = None;
+        self.props_hover = None;
+        self.props_checked = f64::NEG_INFINITY;
+        self.last_nudge = (0.0, Vec::new());
+        self.fit_pending = false;
+        self.save_retry_at = 0.0;
+    }
+
+    /// Shows tab `i`.
+    fn switch_tab(&mut self, i: usize) {
+        if i == self.cur_tab || i >= self.tabs.len() {
+            return;
+        }
+        let parked = self.park();
+        self.tabs[self.cur_tab].parked = Some(parked);
+        self.cur_tab = i;
+        if let Some(p) = self.tabs[i].parked.take() {
+            self.unpark(p);
+        }
+        self.set_title();
+    }
+
+    /// Closes tab `i`, letting its document go. The shown one is saved first,
+    /// and stays open if that fails.
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if i == self.cur_tab {
+            self.commit_edit();
+            self.save_sidecar();
+            if self.dirty && !self.read_only {
+                self.toast("Autosave failed; keeping this tab open so markups aren't lost".into());
+                return;
+            }
+            let p = self.park();
+            if let Some(w) = &self.worker {
+                w.send(Req::Close { generation: p.generation });
+            }
+            drop(p);
+            self.tabs.remove(i);
+            if self.tabs.is_empty() {
+                self.tabs.push(Tab { parked: None });
+                self.cur_tab = 0;
+                self.last_generation += 1;
+                self.generation = self.last_generation;
+                self.status = String::from("Ctrl+O to open a PDF (or drop one here)");
+                self.status_until = f64::INFINITY;
+            } else {
+                self.cur_tab = i.min(self.tabs.len() - 1);
+                if let Some(p) = self.tabs[self.cur_tab].parked.take() {
+                    self.unpark(p);
+                }
+            }
+            self.set_title();
+        } else {
+            // Parked: it was saved when parked; a failed save is retried once more here.
+            let tab = self.tabs.remove(i);
+            if i < self.cur_tab {
+                self.cur_tab -= 1;
+            }
+            if let (Some(p), Some(w)) = (tab.parked, &self.worker) {
+                if p.dirty && !p.read_only {
+                    // Bring it back to save it properly, then close it as the shown tab.
+                    self.tabs.insert(i, Tab { parked: Some(p) });
+                    if i <= self.cur_tab {
+                        self.cur_tab += 1;
+                    }
+                    self.switch_tab(i);
+                    self.close_tab(i);
+                    return;
+                }
+                w.send(Req::Close { generation: p.generation });
+            }
+        }
+    }
+
+    /// The window title follows the shown tab (set on the next frame, which has the context).
+    fn set_title(&mut self) {
+        self.title_dirty = true;
+    }
+
+    /// A tab's label: its file name.
+    fn tab_name(&self, i: usize) -> String {
+        let path = if i == self.cur_tab { self.path.as_ref() } else { self.tabs[i].parked.as_ref().and_then(|p| p.path.as_ref()) };
+        path.and_then(|p| p.file_name()).map_or_else(|| "New tab".into(), |f| f.to_string_lossy().into_owned())
+    }
+
+    /// The tab strip, shown once two or more documents are open.
+    fn tab_strip(&mut self, ui: &mut Ui) {
+        let mut switch = None;
+        let mut close = None;
+        egui::ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for i in 0..self.tabs.len() {
+                    let name = self.tab_name(i);
+                    let short: String = if name.chars().count() > 28 { format!("{}…", name.chars().take(27).collect::<String>()) } else { name.clone() };
+                    let on = i == self.cur_tab;
+                    let r = ui.add(egui::Button::selectable(on, short)).on_hover_text(&name);
+                    if r.clicked() {
+                        switch = Some(i);
+                    }
+                    if r.middle_clicked() {
+                        close = Some(i);
+                    }
+                    if ui.add(egui::Button::new(egui::RichText::new("×").weak()).frame(false)).on_hover_text("Close (Ctrl+W)").clicked() {
+                        close = Some(i);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        });
+        if let Some(i) = close {
+            self.close_tab(i);
+        } else if let Some(i) = switch {
+            self.switch_tab(i);
+        }
+    }
+
     fn open(&mut self, path: PathBuf) {
         self.open_with(path, None);
     }
@@ -496,6 +763,21 @@ impl App {
             return;
         }
         let path = dunce::canonicalize(&path).unwrap_or(path);
+        // Already open: show its tab.
+        if self.path.as_ref() == Some(&path) {
+            return;
+        }
+        if let Some(i) = self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.path.as_ref() == Some(&path))) {
+            self.switch_tab(i);
+            return;
+        }
+        // Open beside what's shown, in a new tab.
+        if self.path.is_some() {
+            let parked = self.park();
+            self.tabs[self.cur_tab].parked = Some(parked);
+            self.tabs.insert(self.cur_tab + 1, Tab { parked: None });
+            self.cur_tab += 1;
+        }
         self.commit_edit();
         self.save_sidecar();
         if self.dirty && !self.read_only {
@@ -503,7 +785,9 @@ impl App {
             return;
         }
         let w = self.worker.as_ref().unwrap();
-        self.generation += 1;
+        // Unique across tabs: the worker keeps each tab's document under its generation.
+        self.last_generation += 1;
+        self.generation = self.last_generation;
         w.send(Req::Open { generation: self.generation, path: path.clone() });
         self.pages.clear();
         self.base.clear();
@@ -1789,6 +2073,14 @@ impl App {
             }
             if pressed(Key::N) {
                 self.new_doc.get_or_insert_with(NewDoc::default);
+            }
+            if pressed(Key::W) && self.path.is_some() {
+                self.close_tab(self.cur_tab);
+            }
+            let n = self.tabs.len();
+            if n > 1 && (pressed(Key::Tab) || pressed(Key::PageDown) || pressed(Key::PageUp)) {
+                let back = (pressed(Key::Tab) && shift) || pressed(Key::PageUp);
+                self.switch_tab(if back { (self.cur_tab + n - 1) % n } else { (self.cur_tab + 1) % n });
             }
             if pressed(Key::E) {
                 let alt = ctx.input(|i| i.modifiers.alt);
@@ -4306,6 +4598,7 @@ impl App {
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
+                    ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab"),
                     ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
                     ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
@@ -4396,6 +4689,13 @@ impl eframe::App for App {
         measure::relabel(&mut self.annots, &self.scales, self.prefs.units);
         self.relabel_proposals();
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        if self.tabs.len() > 1 {
+            egui::Panel::top("tabs").show(ui, |ui| self.tab_strip(ui));
+        }
+        if std::mem::take(&mut self.title_dirty) {
+            let title = if self.path.is_some() { format!("{} — Greenline", self.file_name()) } else { "Greenline".into() };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, now));
         let has_doc = !self.pages.is_empty();
         let sheets = crate::theme::sheets(ui.visuals());
@@ -4479,6 +4779,13 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.commit_edit();
         self.save_sidecar();
+        // Background tabs were saved when parked; one whose save failed then gets another go.
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].parked.as_ref().is_some_and(|p| p.dirty && !p.read_only) {
+                self.switch_tab(i);
+                self.save_sidecar();
+            }
+        }
     }
 }
 
@@ -5428,6 +5735,46 @@ mod tests {
         app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), started);
         assert_eq!(app.annots.len(), n);
         assert!(app.placing.is_none());
+    }
+
+    #[test]
+    fn tabs_keep_each_documents_markups_view_and_undo() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        let a = rect(&mut app, 100.0, 100.0);
+        app.snapshot();
+        app.zoom = 2.0;
+        app.selected = vec![a];
+        // A second document opens in a tab of its own.
+        let parked = app.park();
+        assert!(app.annots.is_empty() && app.path.is_none() && app.selected.is_empty());
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.zoom = 0.5;
+        rect(&mut app, 300.0, 300.0);
+        rect(&mut app, 400.0, 300.0);
+        assert_eq!(app.tab_name(0), "a.pdf");
+        assert_eq!(app.tab_name(1), "b.pdf");
+        // Back to the first: its markups, zoom, selection and undo come back.
+        app.switch_tab(0);
+        assert_eq!(app.annots.len(), 1);
+        assert_eq!((app.zoom, app.selected.clone()), (2.0, vec![a]));
+        assert_eq!(app.undo.len(), 1);
+        app.switch_tab(1);
+        assert_eq!(app.annots.len(), 2);
+        assert_eq!(app.zoom, 0.5);
+        // Closing the shown tab shows its neighbour.
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.path, Some(PathBuf::from("/a.pdf")));
+        assert_eq!(app.annots.len(), 1);
+        // And closing the last leaves an empty window.
+        app.close_tab(0);
+        assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1);
     }
 
     #[test]
