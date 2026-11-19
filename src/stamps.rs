@@ -82,15 +82,8 @@ impl Library {
     /// Copies `src` into the image store and lists it. Returns the entry's
     /// index and whether a white background was made transparent.
     pub fn import(&mut self, src: &Path, kind: Use) -> anyhow::Result<(usize, bool)> {
-        let p = prepare(&std::fs::read(src)?)?;
-        let image = format!("{:016x}.{}", crate::sidecar::fnv(&p.bytes), p.ext);
-        let dest = images_dir().join(&image);
-        if !dest.exists() {
-            std::fs::create_dir_all(images_dir())?;
-            let tmp = dest.with_extension(format!("{}.{}.tmp", p.ext, std::process::id()));
-            std::fs::write(&tmp, &p.bytes)?;
-            std::fs::rename(tmp, &dest)?;
-        }
+        let p = prepare(&std::fs::read(src)?, true)?;
+        let image = store(&p)?;
         if let Some(i) = self.entries.iter().position(|e| e.image == image && e.kind == kind) {
             return Ok((i, p.knocked_out));
         }
@@ -100,6 +93,37 @@ impl Library {
         self.save()?;
         Ok((self.entries.len() - 1, p.knocked_out))
     }
+}
+
+/// Writes a prepared image into the store (once) and returns its stored name.
+fn store(p: &Prepared) -> anyhow::Result<String> {
+    let image = format!("{:016x}.{}", crate::sidecar::fnv(&p.bytes), p.ext);
+    let dest = images_dir().join(&image);
+    if !dest.exists() {
+        std::fs::create_dir_all(images_dir())?;
+        // Unique per import: several may store the same image at once (threads).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dest.with_extension(format!("{}.{}-{seq}.tmp", p.ext, std::process::id()));
+        std::fs::write(&tmp, &p.bytes)?;
+        std::fs::rename(tmp, &dest)?;
+    }
+    Ok(image)
+}
+
+/// A photo or sketch placed as a markup: stored as it is (no background knocked
+/// out, size capped like stamps), not added to the stamp list. Returns its
+/// stored name, the file's name, and its size in pixels.
+pub fn store_picture(src: &Path) -> anyhow::Result<(String, String, Vec2)> {
+    let p = prepare(&std::fs::read(src)?, false)?;
+    let image = store(&p)?;
+    let name = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Image".into());
+    Ok((image, name, vec2(p.w as f32, p.h as f32)))
+}
+
+/// Whether `p` looks like an image Greenline can place (by extension).
+pub fn is_picture(p: &Path) -> bool {
+    p.extension().is_some_and(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "png" | "jpg" | "jpeg"))
 }
 
 struct Prepared {
@@ -113,22 +137,27 @@ struct Prepared {
 /// Decodes an imported file and caps its size. A scan with no transparency gets
 /// its paper knocked out so title-block lines show through, like a wet stamp.
 /// Untouched files are kept byte for byte; changed ones are re-encoded as PNG.
-fn prepare(bytes: &[u8]) -> anyhow::Result<Prepared> {
+fn prepare(bytes: &[u8], knock_out: bool) -> anyhow::Result<Prepared> {
     let format = image::guess_format(bytes)?;
     let ext = match format {
         image::ImageFormat::Png => "png",
         image::ImageFormat::Jpeg => "jpg",
         _ => anyhow::bail!("only PNG and JPEG images are supported"),
     };
-    let mut img = image::load_from_memory_with_format(bytes, format)?.to_rgba8();
-    let mut changed = false;
+    // Upright as the camera meant it (phone photos are often stored on their side).
+    let mut decoder = image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_decoder()?;
+    let orientation = image::ImageDecoder::orientation(&mut decoder).unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut dynamic = image::DynamicImage::from_decoder(decoder)?;
+    let mut changed = orientation != image::metadata::Orientation::NoTransforms;
+    dynamic.apply_orientation(orientation);
+    let mut img = dynamic.to_rgba8();
     if img.width().max(img.height()) > MAX_PX {
         let k = MAX_PX as f32 / img.width().max(img.height()) as f32;
         let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
         img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3);
         changed = true;
     }
-    let opaque = img.pixels().all(|p| p[3] == 255);
+    let opaque = knock_out && img.pixels().all(|p| p[3] == 255);
     if opaque {
         knock_out_white(&mut img);
         changed = true;
@@ -138,6 +167,12 @@ fn prepare(bytes: &[u8]) -> anyhow::Result<Prepared> {
         return Ok(Prepared { bytes: bytes.to_vec(), ext, w, h, knocked_out: false });
     }
     let mut out = std::io::Cursor::new(Vec::new());
+    if ext == "jpg" && !opaque {
+        // A photo shrunk to the cap stays a JPEG: as PNG it would be several times the size.
+        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&rgb)?;
+        return Ok(Prepared { bytes: out.into_inner(), ext: "jpg", w, h, knocked_out: false });
+    }
     img.write_to(&mut out, image::ImageFormat::Png)?;
     Ok(Prepared { bytes: out.into_inner(), ext: "png", w, h, knocked_out: opaque })
 }
@@ -239,16 +274,23 @@ mod tests {
         let mut bytes = std::io::Cursor::new(Vec::new());
         png.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
         let bytes = bytes.into_inner();
-        let p = prepare(&bytes).unwrap();
+        let p = prepare(&bytes, true).unwrap();
         assert_eq!((p.ext, p.w, p.h, p.knocked_out), ("png", 10, 5, false));
         assert_eq!(p.bytes, bytes, "kept byte for byte");
 
         let jpg = image::RgbImage::from_pixel(3000, 1000, image::Rgb([250, 250, 250]));
         let mut bytes = std::io::Cursor::new(Vec::new());
         jpg.write_to(&mut bytes, image::ImageFormat::Jpeg).unwrap();
-        let p = prepare(&bytes.into_inner()).unwrap();
+        let p = prepare(&bytes.into_inner(), true).unwrap();
         assert_eq!((p.ext, p.w, p.h, p.knocked_out), ("png", 2400, 800, true));
-        assert!(prepare(b"GIF89a....").is_err());
+        assert!(prepare(b"GIF89a....", true).is_err());
+        // A photo keeps its paper and stays a JPEG, only shrunk to the cap.
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        jpg.write_to(&mut bytes, image::ImageFormat::Jpeg).unwrap();
+        let p = prepare(&bytes.into_inner(), false).unwrap();
+        assert_eq!((p.ext, p.w, p.h, p.knocked_out), ("jpg", 2400, 800, false));
+        let back = image::load_from_memory(&p.bytes).unwrap().to_rgba8();
+        assert_eq!(back.get_pixel(5, 5)[3], 255, "white stays opaque");
     }
 
     #[test]

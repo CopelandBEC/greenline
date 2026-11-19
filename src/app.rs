@@ -44,6 +44,10 @@ enum Pick {
     Images(stamps::Use),
     /// Bluebeam line type / hatch files to import.
     Patterns,
+    /// Where to save a new blank document: page size (points) and count.
+    NewDoc(Vec2, usize),
+    /// A photo or sketch to place as a markup.
+    Picture,
     /// The shared pattern library folder.
     PatternDir,
 }
@@ -154,6 +158,35 @@ struct Mods {
     shift: bool,
 }
 
+/// A stored image (stored name, file name, pixels) or why not, where it was dropped, and the placing epoch it began in.
+type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
+
+/// Page sizes offered for a new document: name and portrait size in points.
+const PAGE_SIZES: [(&str, Vec2); 9] = [
+    ("Letter  8.5 × 11 in", Vec2::new(612.0, 792.0)),
+    ("Legal  8.5 × 14 in", Vec2::new(612.0, 1008.0)),
+    ("Tabloid  11 × 17 in", Vec2::new(792.0, 1224.0)),
+    ("ARCH C  18 × 24 in", Vec2::new(1296.0, 1728.0)),
+    ("ARCH D  24 × 36 in", Vec2::new(1728.0, 2592.0)),
+    ("ARCH E  36 × 48 in", Vec2::new(2592.0, 3456.0)),
+    ("A4  210 × 297 mm", Vec2::new(595.3, 841.9)),
+    ("A3  297 × 420 mm", Vec2::new(841.9, 1190.6)),
+    ("A1  594 × 841 mm", Vec2::new(1683.8, 2383.9)),
+];
+
+/// The New document window's choices.
+struct NewDoc {
+    size: usize,
+    landscape: bool,
+    pages: usize,
+}
+
+impl Default for NewDoc {
+    fn default() -> Self {
+        Self { size: 0, landscape: false, pages: 1 }
+    }
+}
+
 /// The find bar (Ctrl+F) and its results.
 #[derive(Default)]
 struct Find {
@@ -250,6 +283,16 @@ pub struct App {
     building: Option<(usize, Vec<Pos2>)>,
     scale_win: ScaleWin,
     find: Find,
+    /// The New document window, while open.
+    new_doc: Option<NewDoc>,
+    /// A blank PDF being written: its path and the markups lock held for it.
+    creating: Option<(PathBuf, std::fs::File)>,
+    /// Images being stored for placing: (stored name, file name, pixels) or an error, the drop target, the document then.
+    pictures: (mpsc::Sender<PictureDone>, mpsc::Receiver<PictureDone>),
+    /// Images waiting to be placed after the one being placed now.
+    queued_pictures: std::collections::VecDeque<Place>,
+    /// Bumped when placing is cancelled, so images still being stored are let go.
+    picture_epoch: u64,
     /// Page in view when the search started: the first match shown is at or after it.
     find_from: usize,
     /// Shift held over the canvas (squares a measurement's next point).
@@ -390,6 +433,11 @@ impl App {
             building: None,
             scale_win: ScaleWin::default(),
             find: Find::default(),
+            new_doc: None,
+            creating: None,
+            pictures: mpsc::channel(),
+            queued_pictures: Default::default(),
+            picture_epoch: 0,
             find_from: 0,
             shift: false,
             next_id: 1,
@@ -439,6 +487,11 @@ impl App {
     // Document
 
     fn open(&mut self, path: PathBuf) {
+        self.open_with(path, None);
+    }
+
+    /// Opens `path`, with its markups lock already held when `lock` is given.
+    fn open_with(&mut self, path: PathBuf, lock: Option<std::fs::File>) {
         if self.worker.is_none() {
             return;
         }
@@ -469,6 +522,8 @@ impl App {
         self.editing = None;
         self.drag = Drag::None;
         self.placing = None;
+        self.queued_pictures.clear();
+        self.picture_epoch += 1;
         self.annots = Vec::new();
         self.scales = Vec::new();
         self.accepted = Vec::new();
@@ -481,7 +536,7 @@ impl App {
         self.lock = None;
         self.read_only = false;
         let mut why = None;
-        match sidecar::lock(&path) {
+        match lock.map_or_else(|| sidecar::lock(&path), |l| Ok(Some(l))) {
             Ok(Some(l)) => self.lock = Some(l),
             Ok(None) => why = Some("open in another Greenline window".to_string()),
             Err(e) => why = Some(format!("could not lock markups file ({e})")),
@@ -582,6 +637,14 @@ impl App {
             }
             Pick::Images(_) => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
             Pick::Patterns => d.add_filter("Bluebeam line types and hatches", &["blx", "bhx"]),
+            Pick::Picture => d.add_filter("PNG or JPEG image", &["png", "jpg", "jpeg"]),
+            Pick::NewDoc(..) => {
+                let d = d.add_filter("PDF", &["pdf"]).set_file_name("Untitled.pdf");
+                match self.path.as_ref().and_then(|p| p.parent()) {
+                    Some(dir) => d.set_directory(dir),
+                    None => d,
+                }
+            }
             Pick::PatternDir => d,
         };
         let (tx, rx) = mpsc::channel();
@@ -591,6 +654,8 @@ impl App {
                 Pick::Open => d.pick_file().into_iter().collect(),
                 Pick::Export(..) => d.save_file().into_iter().collect(),
                 Pick::Images(_) | Pick::Patterns => d.pick_files().unwrap_or_default(),
+                Pick::Picture => d.pick_file().into_iter().collect(),
+                Pick::NewDoc(..) => d.save_file().into_iter().collect(),
                 Pick::PatternDir => d.pick_folder().into_iter().collect(),
             };
             tx.send((pick, paths)).ok();
@@ -635,6 +700,27 @@ impl App {
                     }
                 }
             }
+            Pick::NewDoc(size, pages) => {
+                if let Some(chosen) = paths.into_iter().next() {
+                    // The dialog may leave off the extension; a name it didn't confirm mustn't replace a file.
+                    let has_ext = chosen.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+                    let path = if has_ext { chosen } else { chosen.with_extension("pdf") };
+                    let real = path.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(path.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| path.clone());
+                    if self.path.as_ref().is_some_and(|p| *p == real || dunce::canonicalize(&path).is_ok_and(|o| o == *p)) {
+                        self.toast("Refusing to overwrite the open PDF: choose another name".into());
+                    } else if path.exists() || sidecar::file_for(&real).exists() || proposals::file_for(&real).exists() {
+                        // New makes a new file: never one over a document (or its saved markups).
+                        self.toast(format!("{} already exists or has saved markups: New needs a new name", path.display()));
+                    } else {
+                        self.create_blank(path, real, size, pages);
+                    }
+                }
+            }
+            Pick::Picture => {
+                if let Some(p) = paths.into_iter().next() {
+                    self.place_picture(&p, None);
+                }
+            }
             Pick::PatternDir => {
                 if let Some(dir) = paths.into_iter().next() {
                     self.prefs.pattern_dir = Some(dir);
@@ -642,6 +728,72 @@ impl App {
                     self.reload_patterns();
                 }
             }
+        }
+    }
+
+    /// Stores a photo or sketch and places it: at `at` (screen) when dropped on
+    /// a sheet, otherwise with the next click (or drag to size).
+    /// Writes a new blank PDF at `path` (`real`: its canonical form; nothing is
+    /// there yet). The path's markups lock is taken first and held until it opens.
+    fn create_blank(&mut self, path: PathBuf, real: PathBuf, size: Vec2, pages: usize) {
+        if self.creating.is_some() || self.worker.is_none() {
+            return;
+        }
+        let lock = match sidecar::lock(&real) {
+            Ok(Some(l)) => l,
+            Ok(None) => return self.toast("That path is open in another Greenline window: choose another name".into()),
+            Err(e) => return self.toast(format!("Could not lock that path's markups: {e}")),
+        };
+        self.creating = Some((real, lock));
+        if let Some(w) = &self.worker {
+            w.send(Req::Create { path, size, pages });
+        }
+    }
+
+    /// The image is decoded and stored off the UI thread (a big photo takes a moment).
+    fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
+        // Where it was dropped, fixed now: the view may move before it's ready.
+        let target = at.filter(|_| !self.overview).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
+        // Placing starts in Select now; changing tool or Esc before it's ready cancels it.
+        if self.tool != Tool::Select {
+            self.set_tool(Tool::Select);
+        }
+        let (tx, src) = (self.pictures.0.clone(), src.to_path_buf());
+        let epoch = self.picture_epoch;
+        std::thread::spawn(move || {
+            tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, epoch)).ok();
+        });
+        self.toast("Adding the image…".into());
+    }
+
+    /// An image stored by `place_picture`: placed where it was dropped, or
+    /// ready to place with the next click.
+    fn picture_ready(&mut self, stored: Result<(String, String, Vec2), String>, target: Option<(usize, Pos2)>, epoch: u64) {
+        // Cancelled since (Esc, another tool, another document): let it go.
+        if epoch != self.picture_epoch || self.pages.is_empty() {
+            return;
+        }
+        let (image, name, px) = match stored {
+            Ok(r) => r,
+            Err(e) => return self.toast(format!("Could not add the image: {e}")),
+        };
+        let aspect = px.x / px.y.max(1.0);
+        // As if at 150 dpi, but within 60% of the page either way.
+        let page = target.map_or(self.current_page(), |t| t.0).min(self.pages.len() - 1);
+        let ps = self.pages[page];
+        let width = (px.x / 150.0 * 72.0).max(24.0).min(ps.x * 0.6).min(ps.y * 0.6 * aspect);
+        let place = Place::Image { image, name, aspect, width };
+        // Several without a spot (dropped on the overview): placed one after another.
+        if target.is_none() && self.placing.is_some() {
+            self.queued_pictures.push_back(place);
+            return;
+        }
+        self.start_placing(place);
+        if let Some((page, p)) = target {
+            // Centred on the drop, kept on the sheet.
+            let half = vec2(width, width / aspect) / 2.0;
+            let p = pos2(p.x.clamp(half.x, (ps.x - half.x).max(half.x)), p.y.clamp(half.y, (ps.y - half.y).max(half.y)));
+            self.place(page, p, p);
         }
     }
 
@@ -724,6 +876,14 @@ impl App {
                     self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
                 }
                 Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::Created(Ok(path)) => {
+                    let lock = self.creating.take().map(|c| c.1);
+                    self.open_with(path, lock);
+                }
+                Resp::Created(Err(e)) => {
+                    self.creating = None;
+                    self.toast(format!("Could not create the document: {e}"));
+                }
                 Resp::Found { generation, id, page, hits, more } if generation == self.generation && id == self.find.id => {
                     self.find.more |= more;
                     self.on_found(page, hits);
@@ -898,6 +1058,50 @@ impl App {
         self.find.pending = n;
         let pages = (0..n).map(|k| (self.find_from + k) % n).collect();
         w.send(Req::Search { generation: self.generation, id: self.find.id, pages, query: q });
+    }
+
+    /// The New document window: page size, orientation and count, then where to save it.
+    fn new_doc_window(&mut self, ctx: &egui::Context) {
+        let Some(nd) = &mut self.new_doc else { return };
+        let mut open = true;
+        let mut create = None;
+        let mut cancel = false;
+        egui::Window::new("New document").open(&mut open).resizable(false).collapsible(false).anchor(Align2::CENTER_TOP, vec2(0.0, 80.0)).show(ctx, |ui| {
+            egui::Grid::new("newdoc").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Page size");
+                egui::ComboBox::from_id_salt("newsize").width(180.0).selected_text(PAGE_SIZES[nd.size].0).show_ui(ui, |ui| {
+                    for (i, (name, _)) in PAGE_SIZES.iter().enumerate() {
+                        ui.selectable_value(&mut nd.size, i, *name);
+                    }
+                });
+                ui.end_row();
+                ui.label("Orientation");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut nd.landscape, false, "Portrait");
+                    ui.selectable_value(&mut nd.landscape, true, "Landscape");
+                });
+                ui.end_row();
+                ui.label("Pages");
+                ui.add(egui::DragValue::new(&mut nd.pages).range(1..=200));
+                ui.end_row();
+            });
+            ui.weak("Then drop in images (or Insert image) and mark up as usual.");
+            ui.horizontal(|ui| {
+                if ui.button("Create…").on_hover_text("Choose where to save it").clicked() {
+                    let s = PAGE_SIZES[nd.size].1;
+                    create = Some((if nd.landscape { vec2(s.y, s.x) } else { s }, nd.pages));
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if let Some((size, pages)) = create {
+            self.ask = Some(Pick::NewDoc(size, pages));
+            self.new_doc = None;
+        } else if !open || cancel {
+            self.new_doc = None;
+        }
     }
 
     /// The find bar, top right of the drawing: text, match count, previous/next.
@@ -1463,6 +1667,8 @@ impl App {
             self.toast(format!("Unfinished {what} dropped: its outline crossed itself"));
         }
         self.placing = None;
+        self.queued_pictures.clear();
+        self.picture_epoch += 1;
         self.tool = t;
         if t != Tool::Select {
             self.selected.clear();
@@ -1580,6 +1786,9 @@ impl App {
         if cmd {
             if pressed(Key::O) {
                 self.ask = Some(Pick::Open);
+            }
+            if pressed(Key::N) {
+                self.new_doc.get_or_insert_with(NewDoc::default);
             }
             if pressed(Key::E) {
                 let alt = ctx.input(|i| i.modifiers.alt);
@@ -1784,7 +1993,9 @@ impl App {
             // An open find bar goes first: its highlights are what's on top.
             self.close_find();
         } else if self.placing.take().is_some() {
-            self.toast("Placing cancelled".into());
+            self.picture_epoch += 1;
+            let more = std::mem::take(&mut self.queued_pictures).len();
+            self.toast(if more > 0 { format!("Placing cancelled (and {more} more)") } else { "Placing cancelled".into() });
         } else if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) {
             self.set_tool(Tool::Select);
         } else if !self.selected.is_empty() {
@@ -2829,6 +3040,9 @@ impl App {
         // Ready to nudge it into the box.
         self.tool = Tool::Select;
         self.selected = vec![id];
+        if let Some(next) = self.queued_pictures.pop_front() {
+            self.start_placing(next);
+        }
     }
 
     fn remember_width(&mut self, image: &str, width: f32) {
@@ -2915,6 +3129,11 @@ impl App {
             .iter()
             .filter_map(|a| if let Kind::Image { image, .. } = &a.kind { Some(image) } else { None })
             .chain(self.library.entries.iter().map(|e| &e.image))
+            // The image being placed, so its preview shows it.
+            .chain(match &self.placing {
+                Some(Place::Image { image, .. }) => Some(image),
+                _ => None,
+            })
             .filter(|n| !self.textures.contains_key(*n) && !self.tex_failed.contains(*n))
             .cloned()
             .collect();
@@ -3208,6 +3427,9 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
+            if ui.button("New").on_hover_text("A blank document to mark up (Ctrl+N)").clicked() {
+                self.new_doc.get_or_insert_with(NewDoc::default);
+            }
             if ui.button("Open").on_hover_text("Ctrl+O").clicked() {
                 self.ask = Some(Pick::Open);
             }
@@ -3279,6 +3501,10 @@ impl App {
                     }
                 }
                 ui.separator();
+                if ui.add_enabled(!self.pages.is_empty(), egui::Button::new("Insert image…")).on_hover_text("A photo or sketch as a markup (or drop a PNG/JPEG on a sheet)").clicked() {
+                    self.ask = Some(Pick::Picture);
+                    ui.close();
+                }
                 if ui.selectable_label(self.scale_win.open, "Scale   (U)").on_hover_text("Set the drawing scale for measuring").clicked() {
                     self.scale_win.open = !self.scale_win.open;
                     ui.close();
@@ -4080,6 +4306,8 @@ impl App {
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
+                    ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
+                    ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
                     ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
@@ -4146,9 +4374,22 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.poll_worker(&ctx);
         self.poll_dialog();
+        while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
+            self.picture_ready(stored, target, generation);
+        }
 
-        if let Some(p) = ctx.input(|i| i.raw.dropped_files.iter().next().map(|f| f.path().to_path_buf())) {
-            self.open(p);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() {
+            let at = ctx.input(|i| i.pointer.hover_pos());
+            for p in dropped {
+                // An image dropped on a sheet is placed there; a PDF opens.
+                if stamps::is_picture(&p) && !self.pages.is_empty() {
+                    self.place_picture(&p, at);
+                } else {
+                    self.open(p);
+                    break;
+                }
+            }
         }
 
         // Measurements read from the scales as they are now (cheap: measurements only).
@@ -4209,6 +4450,7 @@ impl eframe::App for App {
         self.scale_window(&ctx);
         self.goto_overlay(&ctx);
         self.find_bar(&ctx);
+        self.new_doc_window(&ctx);
         self.help(&ctx);
         self.request_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
@@ -5154,6 +5396,38 @@ mod tests {
         app.toggle_format(0);
         assert!(!app.find(t).unwrap().style.bold);
         assert_eq!(app.find(t).unwrap().text_box().unwrap(), before);
+    }
+
+    #[test]
+    fn a_dropped_picture_fits_the_sheet_and_stays_on_it() {
+        let mut app = app();
+        // A tall image dropped near the bottom-right corner.
+        app.picture_ready(Ok(("ab.png".into(), "Photo".into(), vec2(600.0, 2400.0))), Some((0, pos2(590.0, 790.0))), app.picture_epoch);
+        let a = app.annots.last().unwrap();
+        let Kind::Image { rect, name, .. } = &a.kind else { panic!() };
+        assert_eq!(name, "Photo");
+        assert!(rect.height() <= 800.0 * 0.6 + 0.01, "{rect:?}");
+        assert!(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0)).contains_rect(*rect), "{rect:?}");
+        assert!((rect.width() / rect.height() - 0.25).abs() < 1e-3);
+        // Two without a spot: placed one after the other.
+        app.picture_ready(Ok(("e1.png".into(), "One".into(), vec2(100.0, 100.0))), None, app.picture_epoch);
+        app.picture_ready(Ok(("e2.png".into(), "Two".into(), vec2(100.0, 100.0))), None, app.picture_epoch);
+        assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "One"));
+        app.click(pos2(200.0, 200.0), false, PLAIN);
+        assert!(matches!(&app.placing, Some(Place::Image { name, .. }) if name == "Two"));
+        app.click(pos2(300.0, 300.0), false, PLAIN);
+        assert!(app.placing.is_none());
+        // A very narrow, tall one still fits.
+        app.picture_ready(Ok(("f.png".into(), "Tall".into(), vec2(60.0, 2400.0))), Some((0, pos2(300.0, 400.0))), app.picture_epoch);
+        let Kind::Image { rect, .. } = &app.annots.last().unwrap().kind else { panic!() };
+        assert!(rect.height() <= 480.01, "{rect:?}");
+        // One still being stored when placing was cancelled is let go.
+        let n = app.annots.len();
+        let started = app.picture_epoch;
+        app.set_tool(Tool::Rect);
+        app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), started);
+        assert_eq!(app.annots.len(), n);
+        assert!(app.placing.is_none());
     }
 
     #[test]
