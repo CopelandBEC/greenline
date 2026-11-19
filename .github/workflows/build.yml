@@ -46,7 +46,11 @@ jobs:
       - name: Version
         id: ver
         shell: bash
-        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          # Windows file versions are numbers only (2.0.0-rc.1 -> 2.0.0).
+          echo "num=${v%%-*}" >> "$GITHUB_OUTPUT"
       - name: Installer
         shell: pwsh
         run: |
@@ -54,7 +58,7 @@ jobs:
             choco install innosetup -y --no-progress
             $env:Path += ";${env:ProgramFiles(x86)}\Inno Setup 6"
           }
-          iscc /DAppVersion=${{ steps.ver.outputs.version }} installer\greenline.iss
+          iscc /DAppVersion=${{ steps.ver.outputs.version }} /DAppNumVersion=${{ steps.ver.outputs.num }} installer\greenline.iss
       - uses: actions/upload-artifact@v7
         with:
           name: Greenline-${{ steps.ver.outputs.version }}-windows
@@ -79,6 +83,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" artifact/dist/*.exe \
+          # A tag with a pre-release part (v2.0.0-rc.1) publishes as a pre-release.
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" artifact/dist/*.exe $pre \
             --title "Greenline $GITHUB_REF_NAME" \
             --notes-file docs/release-notes.md

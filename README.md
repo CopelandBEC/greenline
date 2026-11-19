@@ -53,9 +53,19 @@ An agent with a shell (Claude Code, Codex) uses the command line directly and do
 
 ## Build and release
 
-CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together.
+CI (`.github/workflows/build.yml`) tests on Linux and Windows, builds `greenline.exe`, and packages the Inno Setup installer (`installer/greenline.iss`) as a workflow artifact. Pushing a `v*` tag also publishes a GitHub release with the installer, using `docs/release-notes.md`. Bump `version` in `Cargo.toml`, `greenline.rc` and the installer default together. A tag with a pre-release part (`v2.0.0-rc.1`) publishes as a GitHub pre-release; Windows file versions drop that part (`2.0.0`).
 
 After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo install --locked --features cli cargo-about`) to regenerate `THIRD-PARTY-LICENSES.html`, which the installer ships alongside our licences, PDFium's and Montserrat's.
+
+## Roadmap
+
+**2.0** is in release candidates: polylines and polygons, fills, line types and hatches (Bluebeam `.blx`/`.bhx`), text search, bold/italic/underline, blank documents, images as markups, and tabs.
+
+Planned for **2.1**:
+
+- **Split screen**: two documents (or two places in one) side by side, building on tabs.
+- **Per-word formatting**: bold, italic and underline on words within a note, not just the whole note.
+- **Smaller files**: reduce a PDF's size (downsample and recompress scanned images), and embed placed photos compactly on export.
 
 ## Contributing
 
