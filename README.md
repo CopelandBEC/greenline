@@ -62,11 +62,12 @@ After changing dependencies, run `scripts/third-party-licenses.sh` (needs `cargo
 
 **2.0** is in release candidates: polylines and polygons, fills, line types and hatches (Bluebeam `.blx`/`.bhx`), text search, bold/italic/underline, blank documents, images as markups, and tabs.
 
-Planned for **2.1**:
+**2.1** (in development) brings:
 
 - **Split screen**: two documents (or two places in one) side by side, building on tabs.
 - **Per-word formatting**: bold, italic and underline on words within a note, not just the whole note.
-- **Smaller files**: reduce a PDF's size (downsample and recompress scanned images), and embed placed photos compactly on export.
+- **Smaller files**: smaller copies of scanned sets (downsampled, recompressed images), and placed photos embedded compactly on export.
+- **Speed**: faster opening, rendering, panning when zoomed in, tab switching and painting of busy sheets, with exports run alongside.
 
 ## Contributing
 
