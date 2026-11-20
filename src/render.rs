@@ -336,10 +336,10 @@ pub fn render_page_region(p: &PdfPage, scale: f32, origin: [i32; 2], size: [usiz
 /// the pixels need no unpremultiplying: each is taken as it is, fully opaque.
 fn opaque_image(raw: &[u8], size: [usize; 2]) -> egui::ColorImage {
     let [w, h] = size;
-    let stride = if h == 0 { 0 } else { raw.len() / h };
+    let stride = raw.len().checked_div(h).unwrap_or(0);
     let mut pixels = Vec::with_capacity(w * h);
     for row in raw.chunks_exact(stride.max(1)).take(h) {
-        pixels.extend(row[..w * 4].chunks_exact(4).map(|c| egui::Color32::from_rgba_premultiplied(c[0], c[1], c[2], 255)));
+        pixels.extend(row[..w * 4].as_chunks::<4>().0.iter().map(|c| egui::Color32::from_rgba_premultiplied(c[0], c[1], c[2], 255)));
     }
     egui::ColorImage::new(size, pixels)
 }
@@ -441,7 +441,7 @@ fn shrink_image(image: &egui::ColorImage, size: [usize; 2]) -> egui::ColorImage 
             for x in 0..w {
                 let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
                 let (mut mr, mut mg, mut mb) = (255u8, 255u8, 255u8);
-                for p in row[cols[x] * 4..cols[x + 1] * 4].chunks_exact(4) {
+                for p in row[cols[x] * 4..cols[x + 1] * 4].as_chunks::<4>().0 {
                     r += p[0] as u32;
                     g += p[1] as u32;
                     b += p[2] as u32;

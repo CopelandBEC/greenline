@@ -167,6 +167,9 @@ struct Mods {
     shift: bool,
 }
 
+/// A library image decoded for a texture (or why not), by stored name.
+type Decoded = (String, Result<egui::ColorImage, String>);
+
 /// A stored image (stored name, file name, pixels) or why not, where it was dropped, and the placing epoch it began in.
 type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
 
@@ -476,7 +479,7 @@ pub struct App {
     /// The image decoder thread's queue (started when first needed).
     decoder: Option<mpsc::Sender<String>>,
     /// Images decoded for textures, by stored name.
-    decoding: (mpsc::Sender<(String, Result<egui::ColorImage, String>)>, mpsc::Receiver<(String, Result<egui::ColorImage, String>)>),
+    decoding: (mpsc::Sender<Decoded>, mpsc::Receiver<Decoded>),
     /// Wakes the window when background work finishes (none in tests).
     repaint: Option<egui::Context>,
     width: f32,
@@ -6202,7 +6205,7 @@ mod tests {
         assert!(after.intersection(&before).count() * 10 >= before.len() * 7, "{} of {} kept", after.intersection(&before).count(), before.len());
         // A whole-page render sharp enough needs no tiles.
         app.set_zoom(0.3, app.canvas.center());
-        assert!(app.wanted_tiles(0.3, &app.visible_pages()).iter().all(|t| app.base.get(&t.0.0).is_none()));
+        assert!(app.wanted_tiles(0.3, &app.visible_pages()).iter().all(|t| !app.base.contains_key(&t.0.0)));
     }
 
     #[test]

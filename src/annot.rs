@@ -489,9 +489,7 @@ impl Annot {
             let mut c = c.borrow_mut();
             let hit = c[0].get(&key).cloned().or_else(|| c[1].remove(&key));
             if let Some(g) = &hit {
-                if !c[0].contains_key(&key) {
-                    c[0].insert(key, g.clone());
-                }
+                c[0].entry(key).or_insert_with(|| g.clone());
             }
             hit
         }) {
