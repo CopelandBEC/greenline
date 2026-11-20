@@ -23,8 +23,7 @@ const SEL: Color32 = Color32::from_rgb(0, 150, 255);
 const PROPOSED: Color32 = Color32::from_rgb(235, 120, 0);
 /// Search matches.
 const FOUND: Color32 = Color32::from_rgb(255, 190, 0);
-/// Thumbnail render size (physical px on the long side) and cache cap.
-const THUMB_PX: f32 = 420.0;
+/// Thumbnails kept at most.
 const MAX_THUMBS: usize = 400;
 const SCROLL_SPEED: f32 = 1.8;
 /// Scroll acceleration: after SCROLL_ACCEL_DELAY s of continuous scrolling in one
@@ -1604,15 +1603,14 @@ impl App {
             let mut keep = w.keep.lock().unwrap();
             keep.base = want.iter().copied().collect();
             keep.thumbs = thumbs_wanted.iter().copied().collect();
+            keep.thumbs_missing = thumbs_wanted.iter().copied().filter(|i| !self.thumbs.contains_key(i)).collect();
         }
         self.req_thumb.retain(|k| thumbs_wanted.contains(k));
         for &i in &thumbs_wanted {
             if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
                 continue;
             }
-            let s = self.pages[i];
-            let scale = THUMB_PX / s.x.max(s.y);
-            let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
+            let (scale, size) = crate::render::thumb_size(self.pages[i]);
             w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
             self.req_thumb.insert(i);
         }
@@ -1631,7 +1629,9 @@ impl App {
         for &i in &want {
             let s = self.pages[i];
             let cap = MAX_BASE_PX / s.x.max(s.y);
-            let bucket = 2f32.powf(need.log2().ceil()).max(0.125);
+            // Half-octave steps: at most 1.41x the pixels needed across (2x in all),
+            // where whole octaves rendered up to 4x as many as the screen shows.
+            let bucket = 2f32.powf((need.log2() * 2.0).ceil() / 2.0).max(0.125);
             let scale = bucket.min(cap);
             if self.failed.contains(&i) {
                 continue;
@@ -3582,6 +3582,9 @@ impl App {
             let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
             let base_scale = self.base.get(&i).map(|t| t.scale).unwrap_or(0.0);
             if let Some(t) = self.base.get(&i) {
+                painter.image(t.tex.id(), sr, uv, Color32::WHITE);
+            } else if let Some(t) = self.thumbs.get(&i) {
+                // Its thumbnail, blown up, until the page itself is rendered.
                 painter.image(t.tex.id(), sr, uv, Color32::WHITE);
             }
             if let Some(t) = self.patch.get(&i).filter(|t| t.scale > base_scale) {
