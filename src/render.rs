@@ -1090,6 +1090,20 @@ pub(crate) mod tests {
         let page = doc.pages().get(0).unwrap();
         let fonts: Vec<String> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| t.font().name())).collect();
         assert!(fonts.iter().any(|f| f.contains("Bold")) && fonts.iter().any(|f| f.contains("Oblique")), "{fonts:?}");
+        drop(page);
+        drop(doc);
+        // One word bold: that word in Helvetica-Bold, the rest plain.
+        let mut w = annot(0, Kind::Text { pos: pos2(40.0, 40.0), box_w: 300.0, text: "Seal the sill".into(), size: 14.0 });
+        let mut f = vec![crate::annot::Fmt::default(); 13];
+        f[5..8].iter_mut().for_each(|x| x.bold = true);
+        w.style.set_fmts(&f);
+        export(pdfium, &src, &out, &[w], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let runs: Vec<(String, String)> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| (t.text(), t.font().name()))).collect();
+        assert!(runs.iter().any(|(t, f)| t.trim() == "the" && f.contains("Bold")), "{runs:?}");
+        assert!(runs.iter().any(|(t, f)| t.contains("Seal") && !f.contains("Bold")), "{runs:?}");
+        assert!(page.text().unwrap().all().contains("Seal the sill"), "reads as one line: {:?}", page.text().unwrap().all());
         std::fs::remove_dir_all(&dir).ok();
     }
 

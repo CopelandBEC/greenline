@@ -413,6 +413,10 @@ pub struct App {
     tool_hatch: HashMap<Tool, HatchFill>,
     /// Bold, italic, underline for new notes.
     text_format: [bool; 3],
+    /// The characters selected in the note being typed (the cursor, when equal).
+    edit_sel: Option<std::ops::Range<usize>>,
+    /// Formatting for what's typed next at the cursor (B / I / U with nothing selected).
+    typing: Option<annot::Fmt>,
     /// Line types and hatches to pick from.
     patterns: patterns::Library,
     /// The library being read in the background.
@@ -572,6 +576,8 @@ impl App {
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
             text_format: [false; 3],
+            edit_sel: None,
+            typing: None,
             patterns: patterns::Library::builtins(),
             patterns_rx: None,
             decoder: None,
@@ -1912,7 +1918,20 @@ impl App {
     /// The bold / italic / underline the toolbar shows: the note being typed or
     /// the lead selected one, else what new notes get.
     fn shown_format(&self) -> [bool; 3] {
-        let note = self.editing.or_else(|| self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. }))));
+        if let Some(a) = self.editing.and_then(|id| self.find(id)) {
+            let fmts = a.style.fmts(text_of(a).chars().count());
+            return match self.edit_sel.clone() {
+                // Words selected: what all of them have.
+                Some(r) if r.start < r.end && r.end <= fmts.len() => [0, 1, 2].map(|w| fmts[r.clone()].iter().all(|f| f.get(w))),
+                // Otherwise what typing would give.
+                r => {
+                    let at = r.map_or(fmts.len(), |r| r.start);
+                    let f = self.typing.unwrap_or_else(|| if at > 0 { fmts.get(at - 1).copied().unwrap_or(a.style.whole()) } else { fmts.first().copied().unwrap_or(a.style.whole()) });
+                    [f.bold, f.italic, f.underline]
+                }
+            };
+        }
+        let note = self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. })));
         match note.and_then(|id| self.find(id)) {
             Some(a) => [a.style.bold, a.style.italic, a.style.underline],
             None => self.text_format,
@@ -1923,30 +1942,58 @@ impl App {
     /// selected or edited ones, as the toolbar shows it.
     fn toggle_format(&mut self, which: usize) {
         let on = !self.shown_format()[which];
+        if let Some(id) = self.editing {
+            // While typing: the words selected, or else what's typed next. The
+            // edit (begun with its own undo step) takes the change with it.
+            let sel = self.edit_sel.clone();
+            let typing = self.typing;
+            if let Some(a) = self.find_mut(id) {
+                let mut fmts = a.style.fmts(text_of(a).chars().count());
+                match sel {
+                    Some(r) if r.start < r.end && r.end <= fmts.len() => {
+                        fmts[r].iter_mut().for_each(|f| f.set(which, on));
+                        a.style.set_fmts(&fmts);
+                        self.changed();
+                    }
+                    r => {
+                        let at = r.map_or(fmts.len(), |r| r.start);
+                        let mut f = typing.unwrap_or_else(|| if at > 0 { fmts[at - 1] } else { fmts.first().copied().unwrap_or(a.style.whole()) });
+                        f.set(which, on);
+                        if fmts.is_empty() {
+                            // Nothing typed yet: the note's own flags.
+                            a.style.set_fmts(&[f]);
+                        }
+                        self.typing = Some(f);
+                    }
+                }
+            }
+            // A click on B / I / U mustn't end the typing.
+            self.edit_needs_focus = true;
+            return;
+        }
         self.text_format[which] = on;
-        let ids: Vec<u64> = match self.editing {
-            Some(id) => vec![id],
-            None => self.selected.clone(),
-        };
+        let ids = self.selected.clone();
         let notes = |a: &Annot| ids.contains(&a.id) && matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. });
         if self.annots.iter().any(notes) {
-            // While typing, the edit (begun with its own undo step) takes the change with it.
-            if self.editing.is_none() {
-                self.snapshot();
-            }
+            self.snapshot();
             for a in self.annots.iter_mut().filter(|a| notes(a)) {
-                [&mut a.style.bold, &mut a.style.italic, &mut a.style.underline][which].clone_from(&on);
+                // The whole note, keeping each word's other formatting.
+                let mut fmts = a.style.fmts(a.text().chars().count());
+                if fmts.is_empty() {
+                    let mut f = a.style.whole();
+                    f.set(which, on);
+                    a.style.set_fmts(&[f]);
+                } else {
+                    fmts.iter_mut().for_each(|f| f.set(which, on));
+                    a.style.set_fmts(&fmts);
+                }
                 // Bold text is wider: refit the box from the width it wraps at.
-                if which == 0 && self.editing != Some(a.id) {
+                if which == 0 {
                     a.widen_for_edit();
                     a.fit_box_w();
                 }
             }
             self.changed();
-        }
-        // A click on B / I / U mustn't end the typing.
-        if self.editing.is_some() {
-            self.edit_needs_focus = true;
         }
     }
 
@@ -2026,6 +2073,8 @@ impl App {
         if let Some(a) = self.find_mut(id) {
             a.widen_for_edit();
         }
+        self.edit_sel = None;
+        self.typing = None;
         self.editing = Some(id);
         self.edit_needs_focus = true;
         self.selected = vec![id];
@@ -3819,7 +3868,11 @@ impl App {
                     continue;
                 }
                 if Some(a.id) == self.editing {
-                    let prims: Vec<Prim> = g.prims.iter().filter(|p| !matches!(p, Prim::Text { .. })).cloned().collect();
+                    // The editor draws the text and its underlines.
+                    let mut plain = a.clone();
+                    plain.style.underline = false;
+                    plain.style.runs.iter_mut().for_each(|r| r.fmt.underline = false);
+                    let prims: Vec<Prim> = plain.geom().prims.iter().filter(|p| !matches!(p, Prim::Text { .. })).cloned().collect();
                     if let Kind::Text { .. } = a.kind {
                         let r = a.text_box().unwrap();
                         let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max));
@@ -4007,16 +4060,28 @@ impl App {
         let pad = annot::pad(size);
         let pos = self.page_to_screen(page, r.min + vec2(pad, pad));
         let width = (r.width() - 2.0 * pad) * z;
-        let font = FontId::new((size * z * k.0).max(6.0), helv_styled(a.style.bold, a.style.italic));
+        let fs = (size * z * k.0).max(6.0);
         let mut text = text_of(a).to_string();
+        // The note as it was, for carrying each word's formatting through the edit.
+        let (old_text, whole) = (text.clone(), a.style.whole());
+        let old_fmts = a.style.fmts(old_text.chars().count());
+        let typing = self.typing;
         let needs_focus = std::mem::take(&mut self.edit_needs_focus);
         for (i, k) in [Key::B, Key::I, Key::U].into_iter().enumerate() {
             if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::COMMAND, k)) {
                 self.toggle_format(i);
             }
         }
-        
-        let resp = egui::Area::new(egui::Id::new("greenline-edit"))
+        // Formatting may have just changed (B / I / U): lay out with it.
+        let fmts_now = self.find(id).map(|a| a.style.fmts(old_text.chars().count())).unwrap_or(old_fmts);
+        let typing = self.typing.or(typing);
+        let ink = Color32::from_rgb(color[0], color[1], color[2]);
+        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+            let t = buf.as_str();
+            let f = annot::carry_fmts(&old_text, &fmts_now, t, typing, whole);
+            ui.painter().layout_job(note_job(t, &f, fs, ink, wrap))
+        };
+        let out = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -4024,28 +4089,39 @@ impl App {
                 let w = width.max(20.0);
                 ui.set_min_width(w);
                 ui.set_max_width(w);
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(("greenline-edit", self.generation, id)))
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(width.max(20.0))
-                        .desired_rows(1)
-                        .font(font)
-                        .text_color(Color32::from_rgb(color[0], color[1], color[2])),
-                )
+                egui::TextEdit::multiline(&mut text)
+                    .id(egui::Id::new(("greenline-edit", self.generation, id)))
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(width.max(20.0))
+                    .desired_rows(1)
+                    .layouter(&mut layouter)
+                    .show(ui)
             })
             .inner;
+        let resp = out.response.response.clone();
         if needs_focus {
             resp.request_focus();
         }
-        if let Some(a) = self.find_mut(id) {
-            if let Some(t) = a.text_mut() {
-                if *t != text {
+        let sel = out.cursor_range.map(|c| c.as_sorted_char_range()).map(|r| r.start.0..r.end.0);
+        if text != old_text {
+            let fmts = annot::carry_fmts(&old_text, &fmts_now, &text, typing, whole);
+            if let Some(a) = self.find_mut(id) {
+                if let Some(t) = a.text_mut() {
                     *t = text;
-                    self.dirty = true;
                 }
+                if !fmts.is_empty() {
+                    a.style.set_fmts(&fmts);
+                }
+                self.dirty = true;
             }
+        } else if sel.is_some() && self.edit_sel.is_some() && sel != self.edit_sel {
+            // The cursor moved without typing: what's typed next takes its formatting from there.
+            self.typing = None;
+        }
+        // No cursor while a click on B / I / U has the focus for a moment: keep the last.
+        if sel.is_some() {
+            self.edit_sel = sel;
         }
         let done = ctx.input(|i| i.key_pressed(Key::Escape) || (i.modifiers.command && i.key_pressed(Key::Enter)));
         if done || (!needs_focus && resp.lost_focus()) {
@@ -4936,7 +5012,7 @@ impl App {
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("Ctrl+B / I / U", "Bold / italic / underline the note being typed or the selected notes (also the B I U buttons)"),
+                    ("Ctrl+B / I / U", "Bold / italic / underline: while typing, the words selected (or what you type next); otherwise the selected notes (also the B I U buttons)"),
                     ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill, opacity and hatch"),
                     ("Line sample beside the width", "Line type: dashed, dotted, or one from the pattern library (set its folder below)"),
                     ("[ ]", "Line width   ·   { } text size"),
@@ -5491,6 +5567,27 @@ fn text_of(a: &Annot) -> &str {
         Kind::Callout { text, .. } | Kind::Text { text, .. } => text,
         _ => "",
     }
+}
+
+/// A note's text for the editor, each stretch in its own face and underlined where it is.
+fn note_job(text: &str, fmts: &[annot::Fmt], size: f32, color: Color32, wrap: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    while start < chars.len() {
+        let f = fmts.get(start).copied().unwrap_or_default();
+        let end = (start..chars.len()).find(|&j| fmts.get(j).copied().unwrap_or_default() != f).unwrap_or(chars.len());
+        let (b0, b1) = (chars[start].0, chars.get(end).map_or(text.len(), |c| c.0));
+        let underline = if f.underline { Stroke::new((size * 0.06).max(1.0), color) } else { Stroke::NONE };
+        job.append(&text[b0..b1], 0.0, egui::TextFormat { font_id: FontId::new(size, helv_styled(f.bold, f.italic)), color, underline, ..Default::default() });
+        start = end;
+    }
+    if text.is_empty() {
+        // An empty note still needs a line's height for the cursor.
+        job.append("", 0.0, egui::TextFormat { font_id: FontId::new(size, helv()), color, ..Default::default() });
+    }
+    job
 }
 
 fn helv() -> FontFamily {
@@ -6096,6 +6193,36 @@ mod tests {
         assert!(app.find(t).unwrap().style.italic);
         assert_eq!(app.undo.len(), steps);
         assert!(app.edit_needs_focus);
+    }
+
+    /// While typing, B / I / U format the words selected, or else what's typed
+    /// next; the toolbar shows the selection's formatting. A whole note toggled
+    /// keeps its words' other formatting.
+    #[test]
+    fn bold_on_the_words_selected_while_typing() {
+        let mut app = app();
+        let t = app.add(0, Kind::Text { pos: pos2(100.0, 100.0), box_w: 300.0, text: "Seal the sill".into(), size: 12.0 });
+        app.start_edit(t);
+        app.edit_sel = Some(5..8);
+        app.toggle_format(0);
+        let fmts = app.find(t).unwrap().style.fmts(13);
+        assert!(fmts[5..8].iter().all(|f| f.bold) && !fmts[4].bold && !fmts[8].bold);
+        assert_eq!(app.shown_format(), [true, false, false]);
+        app.edit_sel = Some(4..9);
+        assert_eq!(app.shown_format(), [false, false, false], "not all of it bold");
+        // Nothing selected: for what's typed next.
+        app.edit_sel = Some(13..13);
+        app.toggle_format(1);
+        assert_eq!(app.typing, Some(annot::Fmt { italic: true, ..Default::default() }));
+        assert_eq!(app.shown_format(), [false, true, false]);
+        assert!(app.find(t).unwrap().style.fmts(13).iter().all(|f| !f.italic), "nothing typed yet");
+        app.commit_edit();
+        // The whole note underlined: the bold word stays bold.
+        app.selected = vec![t];
+        app.toggle_format(2);
+        let fmts = app.find(t).unwrap().style.fmts(13);
+        assert!(fmts.iter().all(|f| f.underline) && fmts[5].bold && !fmts[0].bold);
+        assert_eq!(app.shown_format(), [false, false, true]);
     }
 
     #[test]
