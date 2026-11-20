@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
-/// What a render is for: the whole page, a sharp patch of the visible area, or a thumbnail.
+/// What a render is for: the whole page, a sharp tile of the view zoomed in, or a thumbnail.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Layer {
     Base,
@@ -25,6 +25,8 @@ pub struct Keep {
     /// Of those, the ones the viewer has no thumbnail for yet: a whole-page
     /// render of one is shrunk into its thumbnail.
     pub thumbs_missing: HashSet<usize>,
+    /// Sharp tiles over the view (page, top-left pixel); others queued are dropped.
+    pub tiles: HashSet<(usize, [i32; 2])>,
     /// The search still wanted; page searches for older ones are dropped.
     pub search: u64,
 }
@@ -225,33 +227,35 @@ fn run(
     }
 }
 
-/// Open/Export first, then the newest patch, then base renders the viewer still
+/// Open/Export first, then wanted tiles, then base renders the viewer still
 /// wants, then wanted thumbnails and the current search page by page, in turn.
 fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut bool) -> Option<Req> {
     if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. } | Req::Search { .. })) {
         return queue.remove(i);
     }
-    // Drop renders superseded by a newer request for the same page and layer.
+    // Drop renders superseded by a newer request for the same page, layer and tile.
     let mut seen = HashSet::new();
     let mut kept = VecDeque::new();
     while let Some(r) = queue.pop_back() {
-        if let Req::Render { page, layer, .. } = &r {
-            if !seen.insert((*page, *layer)) {
+        if let Req::Render { page, layer, origin, .. } = &r {
+            if !seen.insert((*page, *layer, *origin)) {
                 continue;
             }
         }
         kept.push_front(r);
     }
     *queue = kept;
-    if let Some(i) = queue.iter().rposition(|r| matches!(r, Req::Render { layer: Layer::Patch, .. })) {
-        return queue.remove(i);
-    }
     let keep = keep.lock().unwrap();
     queue.retain(|r| match r {
         Req::Render { page, layer: Layer::Base, .. } => keep.base.contains(page),
         Req::Render { page, layer: Layer::Thumb, .. } => keep.thumbs.contains(page),
+        Req::Render { page, layer: Layer::Patch, origin, .. } => keep.tiles.contains(&(*page, *origin)),
         _ => true,
     });
+    // Tiles in the order asked for: the viewer asks for the middle of the view first.
+    if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Patch, .. })) {
+        return queue.remove(i);
+    }
     if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Base, .. })) {
         return queue.remove(i);
     }
@@ -1209,6 +1213,34 @@ mod bench {
     use super::tests::{test_pdfium, PDFIUM_TESTS};
     use super::*;
     use std::time::Instant;
+
+    /// Rendering a 1900x1000 view at 4 px/pt as one region against tiles of a few sizes.
+    #[test]
+    #[ignore]
+    fn bench_tiles() {
+        let src = PathBuf::from(std::env::var("GREENLINE_SAMPLE").unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let doc = test_pdfium().load_pdf_from_file(&src, None).unwrap();
+        for pi in [0usize, 10] {
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            let scale = 4.0;
+            let view = [3000i32, 2000, 1900, 1000];
+            let t = Instant::now();
+            render_page_region(&p, scale, [view[0], view[1]], [view[2] as usize, view[3] as usize]).unwrap();
+            eprintln!("page {pi}: one region {:?}", t.elapsed());
+            for ts in [256i32, 512, 768, 1024] {
+                let t = Instant::now();
+                let mut n = 0;
+                for ty in view[1] / ts..=(view[1] + view[3]) / ts {
+                    for tx in view[0] / ts..=(view[0] + view[2]) / ts {
+                        render_page_region(&p, scale, [tx * ts, ty * ts], [ts as usize, ts as usize]).unwrap();
+                        n += 1;
+                    }
+                }
+                eprintln!("  {ts}px tiles: {n} in {:?}", t.elapsed());
+            }
+        }
+    }
 
     /// GREENLINE_SAMPLE=/path/to.pdf cargo test --release bench_ -- --ignored --nocapture
     #[test]

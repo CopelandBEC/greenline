@@ -105,6 +105,16 @@ struct PageTex {
     size: [usize; 2],
 }
 
+/// A tile of a page rendered at its own scale: the page, the tile's top-left
+/// (pixels at that scale) and the scale's bits.
+type TileKey = (usize, [i32; 2], u32);
+
+/// Tile size, in physical pixels.
+const TILE_PX: i32 = 512;
+
+/// Tiles kept at most (about 1 MB each).
+const MAX_TILES: usize = 160;
+
 #[derive(Clone, Copy, Debug)]
 enum Handle {
     /// Rect corner; holds the fixed opposite corner.
@@ -205,7 +215,7 @@ struct Parked {
 /// A parked tab's rendered pages and thumbnails.
 struct ParkedTex {
     base: HashMap<usize, PageTex>,
-    patch: HashMap<usize, PageTex>,
+    patch: HashMap<TileKey, PageTex>,
     thumbs: HashMap<usize, PageTex>,
 }
 
@@ -304,15 +314,18 @@ pub struct App {
     offset: Vec2,
     canvas: Rect,
     fit_pending: bool,
+    /// When the zoom last changed: tiles wait for it to settle (panning doesn't make them wait).
     last_view_change: f64,
     /// (streak start time, last scroll time, direction) for scroll acceleration.
     scroll_streak: (f64, f64, f32),
     view_key: (f32, Vec2),
 
     base: HashMap<usize, PageTex>,
-    patch: HashMap<usize, PageTex>,
+    /// Sharp tiles over the view when zoomed in past the whole-page render.
+    patch: HashMap<TileKey, PageTex>,
     req_base: HashMap<usize, f32>,
-    req_patch: HashMap<usize, (f32, [i32; 2], [usize; 2])>,
+    /// Tiles asked for, at the scale asked for.
+    req_patch: HashMap<TileKey, f32>,
     thumbs: HashMap<usize, PageTex>,
     req_thumb: HashSet<usize>,
     /// Thumbnails drawn this frame (sidebar or overview); requested after layout.
@@ -1322,8 +1335,11 @@ impl App {
                     let t = PageTex { tex, scale, origin, size };
                     match layer {
                         Layer::Patch => {
-                            self.req_patch.remove(&page);
-                            self.patch.insert(page, t);
+                            let key = (page, origin, scale.to_bits());
+                            if self.req_patch.get(&key) == Some(&scale) {
+                                self.req_patch.remove(&key);
+                            }
+                            self.patch.insert(key, t);
                         }
                         Layer::Base => {
                             self.req_base.remove(&page);
@@ -1337,7 +1353,10 @@ impl App {
                 }
                 Resp::RenderFailed { generation, page, layer, error } if generation == self.generation => {
                     match layer {
-                        Layer::Patch => self.req_patch.remove(&page).is_some(),
+                        Layer::Patch => {
+                            self.req_patch.retain(|k, _| k.0 != page);
+                            true
+                        }
                         Layer::Base => self.req_base.remove(&page).is_some(),
                         Layer::Thumb => self.req_thumb.remove(&page),
                     };
@@ -1711,10 +1730,8 @@ impl App {
         if !self.overview {
             self.base.retain(|k, _| keep_tex.contains(k));
         }
-        self.patch.retain(|k, _| vis.contains(k));
         // The worker drops requests for pages that left `keep`; forget them so they are re-sent.
         self.req_base.retain(|k, _| want.contains(k));
-        self.req_patch.retain(|k, _| vis.contains(k));
 
         for &i in &want {
             let s = self.pages[i];
@@ -1734,41 +1751,87 @@ impl App {
             }
         }
 
-        // Sharp patch of the visible region once the view settles.
-        if self.overview {
-            return;
+        self.request_tiles(ctx, now, need, &vis);
+    }
+
+    /// Sharp tiles over the view (and a ring round it) where the whole-page
+    /// render is coarser than the screen, nearest the middle first. Panning
+    /// keeps the tiles already made and asks only for new ones as they come
+    /// into view; a new zoom waits until zooming pauses, the old tiles shown
+    /// until the new ones cover the view.
+    fn request_tiles(&mut self, ctx: &egui::Context, now: f64, need: f32, vis: &[usize]) {
+        let bits = need.to_bits();
+        let zooming = now - self.last_view_change < 0.12;
+        let wanted = self.wanted_tiles(need, vis);
+        let Some(w) = &self.worker else { return };
+        let keys: HashSet<TileKey> = wanted.iter().map(|t| t.0).collect();
+        w.keep.lock().unwrap().tiles = keys.iter().map(|k| (k.0, k.1)).collect();
+        // Forget requests the worker will drop, so they're asked for again if wanted later.
+        self.req_patch.retain(|k, _| keys.contains(k));
+        // Tiles at another scale stay only while those at this one don't yet cover the view.
+        let covered = wanted.iter().filter(|t| t.3).all(|t| self.patch.contains_key(&t.0));
+        let shown: HashSet<usize> = vis.iter().copied().collect();
+        self.patch.retain(|k, _| if k.2 == bits { keys.contains(k) } else { !covered && shown.contains(&k.0) });
+        if self.patch.len() > MAX_TILES {
+            let mut old: Vec<TileKey> = self.patch.keys().filter(|k| k.2 != bits || !keys.contains(k)).copied().collect();
+            old.truncate(self.patch.len() - MAX_TILES);
+            for k in old {
+                self.patch.remove(&k);
+            }
         }
-        if now - self.last_view_change < 0.12 {
+        if zooming {
             ctx.request_repaint_after(std::time::Duration::from_millis(130));
             return;
         }
+        for (key, size, _, _) in wanted {
+            if !self.patch.contains_key(&key) && !self.req_patch.contains_key(&key) {
+                w.send(Req::Render { generation: self.generation, page: key.0, scale: need, origin: key.1, size, layer: Layer::Patch });
+                self.req_patch.insert(key, need);
+            }
+        }
+    }
+
+    /// Tiles to show the view at `need` px/pt on pages `vis`, nearest the middle
+    /// first: each one's key, pixel size, distance from the view's middle, and
+    /// whether it's in view (the rest are a ring round it, for panning into).
+    /// None where a page's whole-page render is already sharp enough.
+    fn wanted_tiles(&self, need: f32, vis: &[usize]) -> Vec<(TileKey, [usize; 2], f32, bool)> {
+        let bits = need.to_bits();
         let view = Rect::from_min_size(self.offset.to_pos2(), self.canvas.size() / self.zoom);
-        for &i in &vis {
+        let ring = TILE_PX as f32 / need;
+        let mut wanted: Vec<(TileKey, [usize; 2], f32, bool)> = Vec::new();
+        if self.overview {
+            return wanted;
+        }
+        for &i in vis {
             let base_scale = self.base.get(&i).map(|t| t.scale).unwrap_or(0.0);
             if base_scale >= need * 0.98 || self.failed.contains(&i) {
-                self.patch.remove(&i);
                 continue;
             }
             let pr = self.page_doc_rect(i);
-            let local = view.intersect(pr).translate(-pr.min.to_vec2());
+            let local = view.expand(ring).intersect(pr).translate(-pr.min.to_vec2());
             if local.width() <= 0.0 || local.height() <= 0.0 {
                 continue;
             }
             let full = [(pr.width() * need).round() as i32, (pr.height() * need).round() as i32];
-            let x0 = ((local.min.x * need).floor() as i32).clamp(0, full[0]);
-            let y0 = ((local.min.y * need).floor() as i32).clamp(0, full[1]);
-            let x1 = ((local.max.x * need).ceil() as i32).clamp(0, full[0]);
-            let y1 = ((local.max.y * need).ceil() as i32).clamp(0, full[1]);
-            if x1 <= x0 || y1 <= y0 {
-                continue;
-            }
-            let key = (need, [x0, y0], [(x1 - x0) as usize, (y1 - y0) as usize]);
-            let have = self.patch.get(&i).map(|t| (t.scale, t.origin, t.size));
-            if have != Some(key) && self.req_patch.get(&i) != Some(&key) {
-                w.send(Req::Render { generation: self.generation, page: i, scale: need, origin: key.1, size: key.2, layer: Layer::Patch });
-                self.req_patch.insert(i, key);
+            let t = TILE_PX as f32;
+            let (x0, y0) = ((local.min.x * need / t).floor() as i32, (local.min.y * need / t).floor() as i32);
+            let (x1, y1) = ((local.max.x * need / t).ceil() as i32, (local.max.y * need / t).ceil() as i32);
+            for ty in y0.max(0)..y1 {
+                for tx in x0.max(0)..x1 {
+                    let origin = [tx * TILE_PX, ty * TILE_PX];
+                    let size = [(full[0] - origin[0]).min(TILE_PX), (full[1] - origin[1]).min(TILE_PX)];
+                    if size[0] <= 0 || size[1] <= 0 {
+                        continue;
+                    }
+                    let doc = Rect::from_min_size(pr.min + vec2(origin[0] as f32, origin[1] as f32) / need, vec2(size[0] as f32, size[1] as f32) / need);
+                    let dist = (doc.center() - view.center()).length();
+                    wanted.push(((i, origin, bits), [size[0] as usize, size[1] as usize], dist, doc.intersects(view)));
+                }
             }
         }
+        wanted.sort_by(|a, b| a.2.total_cmp(&b.2));
+        wanted
     }
 
     // -----------------------------------------------------------------------
@@ -3662,6 +3725,7 @@ impl App {
     }
 
     fn paint(&mut self, ui: &mut Ui) {
+        let ppp = ui.ctx().pixels_per_point();
         let painter = ui.painter_at(self.canvas);
         painter.rect_filled(self.canvas, 0.0, crate::theme::canvas(ui.visuals()));
         let k = self.text_metrics(&painter);
@@ -3679,10 +3743,16 @@ impl App {
                 // Its thumbnail, blown up, until the page itself is rendered.
                 painter.image(t.tex.id(), sr, uv, Color32::WHITE);
             }
-            if let Some(t) = self.patch.get(&i).filter(|t| t.scale > base_scale) {
+            // Tiles over it, any left at an old zoom first and the current ones on top.
+            let mut tiles: Vec<&PageTex> = self.patch.iter().filter(|(k, t)| k.0 == i && t.scale > base_scale).map(|(_, t)| t).collect();
+            tiles.sort_by(|a, b| (a.scale == self.zoom * ppp).cmp(&(b.scale == self.zoom * ppp)).then(a.scale.total_cmp(&b.scale)));
+            for t in tiles {
                 let min = pr.min + vec2(t.origin[0] as f32, t.origin[1] as f32) / t.scale;
                 let max = min + vec2(t.size[0] as f32, t.size[1] as f32) / t.scale;
-                painter.image(t.tex.id(), Rect::from_min_max(self.to_screen(min), self.to_screen(max)), uv, Color32::WHITE);
+                let r = Rect::from_min_max(self.to_screen(min), self.to_screen(max));
+                if r.intersects(self.canvas) {
+                    painter.image(t.tex.id(), r, uv, Color32::WHITE);
+                }
             }
 
             let pp = painter.with_clip_rect(sr.intersect(self.canvas));
@@ -4965,10 +5035,10 @@ impl eframe::App for App {
             self.shortcuts(&ctx);
             self.canvas_input(ui, &resp);
             self.clamp_offset();
-            if (self.zoom, self.offset) != self.view_key {
-                self.view_key = (self.zoom, self.offset);
+            if self.zoom != self.view_key.0 {
                 self.last_view_change = now;
             }
+            self.view_key = (self.zoom, self.offset);
             self.paint(ui);
             if self.pages.is_empty() {
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), ui.visuals().text_color());
@@ -5599,6 +5669,35 @@ mod tests {
         app.nudge(vec2(1.0, 0.0), 21.5);
         app.undo();
         assert_eq!(app.find(a).unwrap().bounds().min, pos2(99.0, 98.0), "a pause starts a new step");
+    }
+
+    /// Zoomed in past the whole-page render, tiles cover the view (nearest the
+    /// middle first) and a ring round it; a small pan keeps nearly all of them.
+    #[test]
+    fn tiles_cover_the_view_and_survive_a_pan() {
+        let mut app = busy_app();
+        app.set_zoom(4.0, app.canvas.center());
+        let need = app.zoom;
+        let vis = app.visible_pages();
+        let tiles = app.wanted_tiles(need, &vis);
+        assert!(!tiles.is_empty() && tiles[0].3, "the middle first");
+        assert!(tiles.windows(2).all(|w| w[0].2 <= w[1].2));
+        // Every point of the view is under a tile that's in view.
+        let pr = app.page_doc_rect(vis[0]);
+        let view = Rect::from_min_size(app.offset.to_pos2(), app.canvas.size() / app.zoom).intersect(pr);
+        for (fx, fy) in [(0.01, 0.01), (0.5, 0.5), (0.99, 0.99), (0.99, 0.01)] {
+            let p = view.min + view.size() * vec2(fx, fy) - pr.min.to_vec2();
+            let px = [(p.x * need) as i32, (p.y * need) as i32];
+            assert!(tiles.iter().any(|((pg, o, _), s, _, inside)| *inside && *pg == vis[0] && (o[0]..o[0] + s[0] as i32).contains(&px[0]) && (o[1]..o[1] + s[1] as i32).contains(&px[1])), "{fx},{fy}");
+        }
+        assert!(tiles.iter().any(|t| !t.3), "a ring round the view");
+        let before: HashSet<TileKey> = tiles.iter().map(|t| t.0).collect();
+        app.offset += vec2(40.0, 25.0);
+        let after: HashSet<TileKey> = app.wanted_tiles(need, &app.visible_pages()).iter().map(|t| t.0).collect();
+        assert!(after.intersection(&before).count() * 10 >= before.len() * 7, "{} of {} kept", after.intersection(&before).count(), before.len());
+        // A whole-page render sharp enough needs no tiles.
+        app.set_zoom(0.3, app.canvas.center());
+        assert!(app.wanted_tiles(0.3, &app.visible_pages()).iter().all(|t| app.base.get(&t.0.0).is_none()));
     }
 
     #[test]
