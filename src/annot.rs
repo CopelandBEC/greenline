@@ -953,11 +953,23 @@ fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb, s
 /// Formatting carried through an edit of a note from `old` (formatted `fmts`)
 /// to `new`: characters kept keep theirs, and typed ones take `typed`, or else
 /// the formatting of the character before them (at the start, of the first).
-pub fn carry_fmts(old: &str, fmts: &[Fmt], new: &str, typed: Option<Fmt>, whole: Fmt) -> Vec<Fmt> {
+/// `cursor` (a character index into `new`, where the cursor ended up) places
+/// the edit: typing, deleting and pasting all leave the cursor where the
+/// change ends, which tells repeated text apart ("go go" losing its first
+/// "go " keeps the second's formatting). The edit is the smallest change
+/// from `old` to `new`, keeping what's the same at both ends; the cursor only
+/// picks between equally small ones, so a cursor elsewhere (put back by an
+/// undo, say) can't make the change look bigger than it is.
+pub fn carry_fmts(old: &str, fmts: &[Fmt], new: &str, typed: Option<Fmt>, whole: Fmt, cursor: Option<usize>) -> Vec<Fmt> {
     let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
     let fmt = |i: usize| fmts.get(i).copied().unwrap_or(whole);
-    let p = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
-    let s = o[p..].iter().rev().zip(n[p..].iter().rev()).take_while(|(a, b)| a == b).count();
+    let same = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let inferred = (same, o[same..].iter().rev().zip(n[same..].iter().rev()).take_while(|(a, b)| a == b).count());
+    let at_cursor = cursor.filter(|&c| c <= n.len() && n.len() - c <= o.len() && o[o.len() - (n.len() - c)..] == n[c..]).map(|c| {
+        let s = n.len() - c;
+        (same.min(c).min(o.len() - s), s)
+    });
+    let (p, s) = at_cursor.filter(|&(p, s)| p + s == inferred.0 + inferred.1).unwrap_or(inferred);
     let at = typed.unwrap_or_else(|| if p > 0 { fmt(p - 1) } else { fmt(0) });
     let mut out: Vec<Fmt> = (0..p).map(fmt).collect();
     out.extend(std::iter::repeat_n(at, n.len() - p - s));
@@ -1435,14 +1447,27 @@ mod tests {
         let p = Fmt::default();
         let f = [p, p, b, b, p];
         // Typed inside the bold word: bold. At the start: as the first. Deleted: gone.
-        assert_eq!(carry_fmts("ab12c", &f, "ab1x2c", None, p), [p, p, b, b, b, p]);
-        assert_eq!(carry_fmts("ab12c", &f, "zab12c", None, p), [p, p, p, b, b, p]);
-        assert_eq!(carry_fmts("ab12c", &f, "abc", None, p), [p, p, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "ab1x2c", None, p, None), [p, p, b, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "zab12c", None, p, None), [p, p, p, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "abc", None, p, None), [p, p, p]);
         // Typing with B turned on at the cursor.
-        assert_eq!(carry_fmts("ab12c", &f, "abYY12c", Some(b), p), [p, p, b, b, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "abYY12c", Some(b), p, None), [p, p, b, b, b, b, p]);
         // Replacing a selection takes the formatting before it.
-        assert_eq!(carry_fmts("ab12c", &f, "aQc", None, p), [p, p, p]);
-        assert_eq!(carry_fmts("", &[], "new", None, b), [b, b, b]);
+        assert_eq!(carry_fmts("ab12c", &f, "aQc", None, p, None), [p, p, p]);
+        assert_eq!(carry_fmts("", &[], "new", None, b, None), [b, b, b]);
+        // Repeated text: where the cursor ends up says which copy changed.
+        let g = [p, p, p, b, b];
+        assert_eq!(carry_fmts("go go", &g, "go", None, p, Some(0)), [b, b], "the first \"go \" deleted");
+        assert_eq!(carry_fmts("go go", &g, "go", None, p, Some(2)), [p, p], "the last \" go\" deleted");
+        assert_eq!(carry_fmts("go go", &g, "go go go", None, p, Some(6)), [p, p, p, p, p, p, b, b], "\"go \" typed at the start of the second");
+        assert_eq!(carry_fmts("go go", &g, "go gogo", None, p, Some(7)), [p, p, p, b, b, b, b], "\"go\" typed at the end");
+        assert_eq!(carry_fmts("go go", &g, "go o", None, p, Some(3)), [p, p, p, b], "forward delete: the cursor stays");
+        // A cursor away from the change (put back by an undo): "X" taken out of
+        // "aXbc", the bold after it kept.
+        assert_eq!(carry_fmts("aXbc", &[p, p, b, b], "abc", None, p, Some(3)), [p, b, b]);
+        // A cursor that can't be where the edit ended: as without one.
+        assert_eq!(carry_fmts("ab12c", &f, "ab1x2c", None, p, Some(0)), [p, p, b, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "abc", None, p, Some(9)), [p, p, p]);
     }
 
     #[test]

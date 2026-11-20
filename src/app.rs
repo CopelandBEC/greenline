@@ -1478,7 +1478,8 @@ impl App {
     /// The image is decoded and stored off the UI thread (a big photo takes a moment).
     fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
         // Where it was dropped, fixed now: the view may move before it's ready.
-        let target = at.filter(|_| !self.overview).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
+        // Only on the pane's own sheets: a page reaching past it (zoomed in, split) isn't hit.
+        let target = at.filter(|s| !self.overview && self.canvas.contains(*s)).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
         // Placing starts in Select now; changing tool or Esc before it's ready cancels it.
         if self.tool != Tool::Select {
             self.set_tool(Tool::Select);
@@ -2191,6 +2192,9 @@ impl App {
                 // Scale suggestions asked for but not back are asked again when it's shown.
                 let found = &p.scale_found;
                 p.scale_asked.retain(|pg| found.contains_key(pg));
+                // Its thumbnails on their way are dropped (the sidebar shows the other
+                // document now): asked for again when it's the active one.
+                p.req_thumb.clear();
                 self.tabs[self.cur_tab].parked = Some(p);
                 self.cur_tab = k;
                 self.set_title();
@@ -2210,6 +2214,16 @@ impl App {
         self.other = Some(pane);
         self.active_left = !self.active_left;
         self.sidebar_synced = None;
+    }
+
+    /// Split screen: makes the pane under `pos` the active one, for something
+    /// dropped there (an image is placed on that pane's document).
+    fn activate_pane_at(&mut self, pos: Pos2) {
+        // Its view (with the place it was last drawn) is with its document when that's another.
+        let other = self.with_other(|o| o.canvas).is_some_and(|r| r.contains(pos));
+        if other && !self.canvas.contains(pos) && !self.overview {
+            self.activate_other();
+        }
     }
 
     /// Draws split screen's other pane into `r`, and keeps its view in bounds.
@@ -4565,7 +4579,9 @@ impl App {
         let ink = Color32::from_rgb(color[0], color[1], color[2]);
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
             let t = buf.as_str();
-            let f = annot::carry_fmts(&old_text, &fmts_now, t, typing, whole);
+            // The cursor isn't known until the edit is shown: a frame laid out
+            // by inference at most, then by what's stored.
+            let f = annot::carry_fmts(&old_text, &fmts_now, t, typing, whole, None);
             ui.painter().layout_job(note_job(t, &f, fs, ink, wrap))
         };
         let out = egui::Area::new(egui::Id::new("greenline-edit"))
@@ -4592,7 +4608,8 @@ impl App {
         }
         let sel = out.cursor_range.map(|c| c.as_sorted_char_range()).map(|r| r.start.0..r.end.0);
         if text != old_text {
-            let fmts = annot::carry_fmts(&old_text, &fmts_now, &text, typing, whole);
+            let cursor = out.cursor_range.map(|c| c.primary.index.0);
+            let fmts = annot::carry_fmts(&old_text, &fmts_now, &text, typing, whole, cursor);
             if let Some(a) = self.find_mut(id) {
                 if let Some(t) = a.text_mut() {
                     *t = text;
@@ -5606,6 +5623,9 @@ impl eframe::App for App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
             let at = ctx.input(|i| i.pointer.hover_pos());
+            if let Some(pos) = at {
+                self.activate_pane_at(pos);
+            }
             for p in dropped {
                 // An image dropped on a sheet is placed there; each PDF opens in a tab.
                 if stamps::is_picture(&p) && !self.pages.is_empty() {
@@ -6957,8 +6977,12 @@ mod tests {
         // Renders for a's view reach it in the other pane.
         app.route_render(&ctx, ga, va, 0, 2.0, [0, 0], Layer::Base, img());
         assert_eq!(app.with_other(|o| o.base.get(&0).map(|t| t.scale)), Some(Some(2.0)));
-        // Clicking a's tab makes its pane the active one; b goes to the other.
+        // Clicking a's tab makes its pane the active one; b goes to the other,
+        // its thumbnails on their way forgotten (the worker drops them) so
+        // they're asked for again when it's back.
+        app.req_thumb.insert(0);
         app.switch_tab(0);
+        assert_eq!(app.with_other(|o| o.req_thumb.len()), Some(0));
         assert_eq!((app.cur_tab, app.path.clone(), app.annots.len()), (0, Some(PathBuf::from("/a.pdf")), 1));
         assert!(app.find(a).is_some());
         assert_eq!(app.other.as_ref().unwrap().doc, Some(2));
@@ -6970,6 +6994,55 @@ mod tests {
         assert_eq!(app.with_other(|o| o.annots.len()), Some(1));
         app.toggle_split();
         assert!(app.other.is_none() && app.active_left);
+    }
+
+    /// An image dropped on split screen goes to the pane it was dropped on,
+    /// and lands on a sheet only where that pane shows it.
+    #[test]
+    fn images_dropped_go_to_the_pane_under_them() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.pages = vec![vec2(2000.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.toggle_split();
+        let (left, right) = (Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 800.0)), Rect::from_min_max(pos2(402.0, 0.0), pos2(800.0, 800.0)));
+        app.canvas = left;
+        app.other.as_mut().unwrap().view.canvas = right;
+        let vb = app.other.as_ref().unwrap().view.id;
+        // On the active pane: stays.
+        app.activate_pane_at(pos2(100.0, 100.0));
+        assert!(app.active_left);
+        // On the other: it becomes the active one.
+        app.activate_pane_at(pos2(500.0, 100.0));
+        assert!(!app.active_left);
+        assert_eq!(app.view_id, vb);
+        // A wide sheet reaches past its pane: dropped beyond the pane, it's not placed on it.
+        app.canvas = left;
+        let target = |app: &mut App, at: Pos2| {
+            app.place_picture(std::path::Path::new("/nowhere/missing.png"), Some(at));
+            app.pictures.1.recv_timeout(std::time::Duration::from_secs(5)).unwrap().1
+        };
+        assert!(target(&mut app, pos2(100.0, 100.0)).is_some());
+        assert!(target(&mut app, pos2(600.0, 100.0)).is_none());
+        // Two documents: b here on the left, a in the other pane on the right.
+        app.activate_other();
+        assert!(app.active_left);
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.canvas = left;
+        app.with_other(|o| o.canvas = right);
+        app.activate_pane_at(pos2(100.0, 100.0));
+        assert_eq!(app.path, Some(PathBuf::from("/b.pdf")));
+        app.activate_pane_at(pos2(500.0, 100.0));
+        assert_eq!((app.path.clone(), app.active_left), (Some(PathBuf::from("/a.pdf")), false), "dropped on a: a is the active one");
     }
 
     #[test]

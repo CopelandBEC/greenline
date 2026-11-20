@@ -887,6 +887,12 @@ fn recompress_plan(doc: &PdfDocument, obj: &PdfPageObject, m: PdfMatrix, dpi: f3
     if wpt < 1.0 || hpt < 1.0 {
         return None;
     }
+    // The new image is a new object: the old one's graphics state doesn't come
+    // with it. A blend mode, opacity or soft mask would be lost, so those stay;
+    // so do clipped ones, unless the clip leaves the image whole.
+    if obj.has_transparency() || !clip_leaves_whole(obj, m) {
+        return None;
+    }
     // Pixels per inch as placed; the finer direction is brought down to `dpi`.
     let placed = (w as f32 / (wpt / 72.0)).min(h as f32 / (hpt / 72.0));
     let k = (dpi / placed).min(1.0);
@@ -910,6 +916,56 @@ fn recompress_plan(doc: &PdfDocument, obj: &PdfPageObject, m: PdfMatrix, dpi: f3
     }
     let n = uses.get(&data_key(&raw_data)).copied().unwrap_or(1).max(1);
     (jpeg.len() * n * 5 < raw_data.len() * 4).then_some((jpeg, m))
+}
+
+/// Whether an object's clip, if it has one, leaves an image placed by `m`
+/// whole: no paths (PDFium drops a rectangle that takes in all it clips), or
+/// each a rectangle around the image. One that can't be read counts as cutting.
+fn clip_leaves_whole(obj: &PdfPageObject, m: PdfMatrix) -> bool {
+    let Some(clip) = obj.get_clip_path() else { return true };
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(u, v)| (m.a() * u + m.c() * v + m.e(), m.b() * u + m.d() * v + m.f()));
+    let fold = |f: fn(f32, f32) -> f32, i: usize| corners.iter().map(|c| if i == 0 { c.0 } else { c.1 }).reduce(f).unwrap_or(0.0);
+    let image = [fold(f32::min, 0), fold(f32::min, 1), fold(f32::max, 0), fold(f32::max, 1)];
+    (0..clip.len()).all(|i| {
+            let Ok(path) = clip.get(i) else { return false };
+            let mut points = Vec::new();
+            for j in 0..path.len() {
+                match path.get(j) {
+                    Ok(seg) if matches!(seg.segment_type(), PdfPathSegmentType::MoveTo | PdfPathSegmentType::LineTo) => points.push((seg.x().value, seg.y().value)),
+                    _ => return false,
+                }
+            }
+            rect_around(&points, image)
+        })
+}
+
+/// Whether a closed outline through `points` is a rectangle (upright, all
+/// four corners) taking in `[x0, y0, x1, y1]`, give or take half a point.
+fn rect_around(points: &[(f32, f32)], b: [f32; 4]) -> bool {
+    const E: f32 = 0.01;
+    let near = |p: (f32, f32), q: (f32, f32)| (p.0 - q.0).abs() < E && (p.1 - q.1).abs() < E;
+    let mut corners: Vec<(f32, f32)> = Vec::new();
+    for &p in points {
+        if !corners.last().is_some_and(|&q| near(p, q)) {
+            corners.push(p);
+        }
+    }
+    if corners.len() > 1 && near(corners[0], corners[corners.len() - 1]) {
+        corners.pop();
+    }
+    if corners.len() != 4 {
+        return false;
+    }
+    // Each side upright, and no corner twice: around the rectangle once.
+    let upright = (0..4).all(|i| {
+        let (p, q) = (corners[i], corners[(i + 1) % 4]);
+        (p.0 - q.0).abs() < E || (p.1 - q.1).abs() < E
+    });
+    let distinct = (0..4).all(|i| (i + 1..4).all(|j| !near(corners[i], corners[j])));
+    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, z), p| (a.min(p.0), z.max(p.0)));
+    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, z), p| (a.min(p.1), z.max(p.1)));
+    let on_box = corners.iter().all(|p| ((p.0 - x0).abs() < E || (p.0 - x1).abs() < E) && ((p.1 - y0).abs() < E || (p.1 - y1).abs() < E));
+    upright && distinct && on_box && x0 <= b[0] + 0.5 && y0 <= b[1] + 0.5 && x1 >= b[2] - 0.5 && y1 >= b[3] - 0.5
 }
 
 /// A small render of a page, to compare before and after.
@@ -1011,6 +1067,7 @@ pub fn shrink(pdfium: &Pdfium, src: &Path, out: &Path, dpi: f32) -> anyhow::Resu
         // Never bigger: with nothing gained, the copy is the original, byte for byte.
         if recompressed == 0 || std::fs::metadata(&tmp)?.len() >= before {
             std::fs::copy(src, &tmp)?;
+            kept += recompressed;
             recompressed = 0;
             looks.clear();
         }
@@ -1263,6 +1320,80 @@ pub(crate) mod tests {
         assert_eq!(r.recompressed, 0);
         assert_eq!(std::fs::read(&again).unwrap(), std::fs::read(&out).unwrap(), "never bigger: the original as it was");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Images whose look depends on more than their pixels and placement are
+    /// left as they are: a clip that cuts them, or a blend mode. A clip that
+    /// only takes in the whole image (CAD's viewports) doesn't stop it.
+    #[test]
+    fn smaller_copies_keep_clipped_and_blended_images() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test11-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("clipped.pdf"), dir.join("clipped_smaller.pdf"));
+        // A 400 dpi grey scan, stored as a fine JPEG (one of its own on each page).
+        let scan = |mut seed: u32| {
+            let img = image::GrayImage::from_fn(2400, 3000, |x, y| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                image::Luma([200 + ((x / 40 + y / 40) % 2) as u8 * 40 + (seed >> 29) as u8])
+            });
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&img).unwrap();
+            jpeg
+        };
+        // Three pages showing one: clipped to a box around it, clipped short, multiplied.
+        let place = "q 432 0 0 540 90 126 cm /Im0 Do Q";
+        let contents = [format!("q 80 116 452 560 re W n {place} Q"), format!("q 90 126 200 200 re W n {place} Q"), format!("q /GS0 gs {place} Q")];
+        let mut objs: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_vec()];
+        for (i, c) in contents.iter().enumerate() {
+            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 {} 0 R >> /ExtGState << /GS0 12 0 R >> >> /Contents {} 0 R >>", 9 + i, 4 + 2 * i).into_bytes());
+            objs.push([format!("<< /Length {} >>\nstream\n", c.len()).into_bytes(), c.clone().into_bytes(), b"\nendstream".to_vec()].concat());
+        }
+        for seed in 1..=3 {
+            let jpeg = scan(seed);
+            objs.push([format!("<< /Type /XObject /Subtype /Image /Width 2400 /Height 3000 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n", jpeg.len()).into_bytes(), jpeg, b"\nendstream".to_vec()].concat());
+        }
+        objs.push(b"<< /Type /ExtGState /BM /Multiply >>".to_vec());
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            pdf.extend(o);
+            pdf.extend(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).into_bytes());
+        for o in offsets {
+            pdf.extend(format!("{o:010} 00000 n \n").into_bytes());
+        }
+        pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).into_bytes());
+        std::fs::write(&src, pdf).unwrap();
+
+        let r = shrink(pdfium, &src, &out, SHRINK_DPI).unwrap();
+        assert_eq!((r.recompressed, r.kept), (1, 2), "{r:?}");
+        assert!(r.check_pages.is_empty(), "{r:?}");
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let widths: Vec<u32> = doc.pages().iter().map(|p| p.objects().iter().find_map(|o| o.as_image_object().map(|i| i.width().unwrap() as u32)).unwrap()).collect();
+        assert_eq!(widths, [1200, 2400, 2400]);
+        // The clip short still cuts: white beyond it.
+        let img = render_region(&doc, 1, 1.0, [0, 0], [612, 792]).unwrap();
+        assert_eq!(img.pixels[(792 - 500) * 612 + 400], egui::Color32::WHITE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rectangles_around_images() {
+        let b = [10.0, 10.0, 20.0, 20.0];
+        let sq = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)];
+        assert!(rect_around(&sq, b));
+        assert!(rect_around(&[sq[0], sq[1], sq[2], sq[3], sq[0]], b), "closed back to the start");
+        assert!(!rect_around(&sq, [10.0, 10.0, 40.0, 20.0]), "cuts it");
+        assert!(!rect_around(&[sq[0], sq[2], sq[1], sq[3]], b), "a bow tie");
+        assert!(!rect_around(&[sq[0], sq[1], sq[0], sq[3]], b), "folded back on itself");
+        assert!(!rect_around(&[(0.0, 0.0), (30.0, 0.0), (30.0, 30.0)], b), "a triangle");
+        assert!(!rect_around(&[(15.0, 0.0), (30.0, 15.0), (15.0, 30.0), (0.0, 15.0)], b), "a diamond");
     }
 
     /// An L-shaped area exports filled inside the L only, with its value text,
