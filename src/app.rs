@@ -167,6 +167,23 @@ struct Mods {
     shift: bool,
 }
 
+/// Long jobs greenline-cli does for the app, in a process of its own.
+#[derive(Clone, Copy, Debug)]
+enum CliJob {
+    Export,
+    Shrink,
+}
+
+/// A greenline-cli job's answer: its JSON, or what it said went wrong.
+type CliDone = (CliJob, Result<serde_json::Value, String>);
+
+/// greenline-cli beside this program (it's installed with it), if it's there.
+fn cli_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.with_file_name(if cfg!(windows) { "greenline-cli.exe" } else { "greenline-cli" });
+    p.is_file().then_some(p)
+}
+
 /// A library image decoded for a texture (or why not), by stored name.
 type Decoded = (String, Result<egui::ColorImage, String>);
 
@@ -482,6 +499,8 @@ pub struct App {
     decoding: (mpsc::Sender<Decoded>, mpsc::Receiver<Decoded>),
     /// Wakes the window when background work finishes (none in tests).
     repaint: Option<egui::Context>,
+    /// Answers from greenline-cli jobs (`run_cli`).
+    cli_done: (mpsc::Sender<CliDone>, mpsc::Receiver<CliDone>),
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -647,6 +666,7 @@ impl App {
             decoder: None,
             decoding: mpsc::channel(),
             repaint: None,
+            cli_done: mpsc::channel(),
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -1182,20 +1202,124 @@ impl App {
         if !self.may_write(&out) {
             return;
         }
-        if let Some(w) = &self.worker {
-            w.send(Req::Shrink { src, out, dpi: crate::render::SHRINK_DPI });
+        // A big scanned set takes a while: in a process of its own if we can.
+        let dpi = crate::render::SHRINK_DPI;
+        if self.run_cli(CliJob::Shrink, vec!["shrink".into(), src.clone().into(), "--out".into(), out.clone().into(), "--dpi".into(), dpi.to_string().into()]) {
+            self.status = "Making a smaller copy… (carry on meanwhile)".into();
+            self.status_until = f64::INFINITY;
+        } else if let Some(w) = &self.worker {
+            w.send(Req::Shrink { src, out, dpi });
             self.status = "Making a smaller copy…".into();
             self.status_until = f64::INFINITY;
         }
+    }
+
+    /// Saves the markups now (even if they look saved: a background save may
+    /// have failed unreported), and says whether their file is up to date.
+    fn markups_saved(&mut self) -> bool {
+        if self.read_only || self.markups_file.is_none() {
+            return false;
+        }
+        self.dirty = true;
+        self.save_sidecar();
+        !self.dirty
+    }
+
+    /// Runs greenline-cli (beside this program) with `args` on a thread of its
+    /// own, its answer coming back through `cli_done`. False if it isn't there.
+    fn run_cli(&mut self, job: CliJob, args: Vec<std::ffi::OsString>) -> bool {
+        let Some(cli) = cli_path() else { return false };
+        let (tx, ctx) = (self.cli_done.0.clone(), self.repaint.clone());
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new(cli);
+            cmd.args(args).stdin(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                // A console program: no window flashing up.
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            let result = match cmd.output() {
+                Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout).map_err(|e| e.to_string()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().trim_start_matches("error: ").to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send((job, result));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        true
+    }
+
+    /// Answers from greenline-cli jobs.
+    fn poll_cli(&mut self) {
+        while let Ok((job, result)) = self.cli_done.1.try_recv() {
+            match (job, result) {
+                (CliJob::Export, Ok(v)) => {
+                    let file = PathBuf::from(v["file"].as_str().unwrap_or_default());
+                    self.exported(Ok((file, v["characters_without_font"].as_u64().unwrap_or(0) as usize)));
+                }
+                (CliJob::Export, Err(e)) => self.exported(Err(e)),
+                (CliJob::Shrink, Ok(v)) => {
+                    let n = |k: &str| v[k].as_u64().unwrap_or(0);
+                    let check_pages = v["check_pages"].as_array().map(|a| a.iter().filter_map(|p| p.as_u64().map(|p| p as usize)).collect()).unwrap_or_default();
+                    let r = crate::render::Shrunk { before: n("bytes_before"), after: n("bytes_after"), recompressed: n("images_recompressed") as usize, kept: n("images_kept") as usize, check_pages };
+                    self.shrunk(Ok((PathBuf::from(v["file"].as_str().unwrap_or_default()), r)));
+                }
+                (CliJob::Shrink, Err(e)) => self.shrunk(Err(e)),
+            }
+        }
+    }
+
+    fn exported(&mut self, r: Result<(PathBuf, usize), String>) {
+        self.toast(match r {
+            Ok((p, 0)) => format!("Exported → {}", p.display()),
+            Ok((p, missing)) => format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()),
+            Err(e) => format!("Export failed: {e}"),
+        });
+    }
+
+    fn shrunk(&mut self, r: Result<(PathBuf, crate::render::Shrunk), String>) {
+        let (p, r) = match r {
+            Ok(x) => x,
+            Err(e) => return self.toast(format!("Smaller copy failed: {e}")),
+        };
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let check = if r.check_pages.is_empty() {
+            String::new()
+        } else {
+            format!("; check page{} {}", if r.check_pages.len() == 1 { "" } else { "s" }, r.check_pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+        };
+        self.toast(if r.recompressed == 0 {
+            format!("Nothing to make smaller: no big scans or photos ({})", p.display())
+        } else {
+            format!("Smaller copy → {}: {:.1} MB → {:.1} MB ({} images){check}", p.display(), mb(r.before), mb(r.after), r.recompressed)
+        });
     }
 
     fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
         if !self.may_write(&out) {
             return;
         }
+        let Some(src) = self.path.clone() else { return };
+        let author = if self.prefs.author.trim().is_empty() { default_author() } else { self.prefs.author.trim().to_string() };
+        // In a process of its own, so the sheets keep rendering meanwhile; it reads the
+        // markups from their file, so they're saved first.
+        if self.markups_saved() {
+            let units = if self.prefs.units == Units::Metric { "metric" } else { "imperial" };
+            let mut args: Vec<std::ffi::OsString> = vec!["export".into(), src.into(), "--out".into(), out.clone().into(), "--author".into(), author.clone().into(), "--units".into(), units.into()];
+            if mode == ExportMode::Editable {
+                args.push("--editable".into());
+            }
+            if self.run_cli(CliJob::Export, args) {
+                self.status = "Exporting… (carry on meanwhile)".into();
+                self.status_until = f64::INFINITY;
+                return;
+            }
+        }
         let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
-        let author = if self.prefs.author.trim().is_empty() { default_author() } else { self.prefs.author.trim().to_string() };
         w.send(Req::Export { src: src.clone(), out, annots, mode, author });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
@@ -1520,29 +1644,12 @@ impl App {
                         });
                     }
                 }
-                Resp::Exported(Ok((p, 0))) => self.toast(format!("Exported → {}", p.display())),
-                Resp::Exported(Ok((p, missing))) => {
-                    self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
-                }
-                Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::Exported(r) => self.exported(r),
                 Resp::Created(Ok(path)) => {
                     let lock = self.creating.take().map(|c| c.1);
                     self.open_with(path, lock);
                 }
-                Resp::Shrunk(Ok((p, r))) => {
-                    let mb = |b: u64| b as f64 / 1_048_576.0;
-                    let check = if r.check_pages.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; check page{} {}", if r.check_pages.len() == 1 { "" } else { "s" }, r.check_pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
-                    };
-                    self.toast(if r.recompressed == 0 {
-                        format!("Nothing to make smaller: no big scans or photos ({})", p.display())
-                    } else {
-                        format!("Smaller copy → {}: {:.1} MB → {:.1} MB ({} images){check}", p.display(), mb(r.before), mb(r.after), r.recompressed)
-                    });
-                }
-                Resp::Shrunk(Err(e)) => self.toast(format!("Smaller copy failed: {e}")),
+                Resp::Shrunk(r) => self.shrunk(r),
                 Resp::Created(Err(e)) => {
                     self.creating = None;
                     self.toast(format!("Could not create the document: {e}"));
@@ -5435,6 +5542,7 @@ impl eframe::App for App {
         self.poll_worker(&ctx);
         self.poll_dialog();
         self.poll_patterns();
+        self.poll_cli();
         while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
             self.picture_ready(stored, target, generation);
         }
@@ -7100,6 +7208,28 @@ mod tests {
         assert_eq!(sidecar::load_file(&file).unwrap().annots.len(), 23);
         app.poll_saves();
         assert!(!app.dirty, "an older background result doesn't undo the newer save");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Long jobs handed to greenline-cli: the markups are saved first (or the
+    /// job stays in the app), and its answers read as the worker's would be.
+    #[test]
+    fn jobs_for_the_command_line_save_first_and_report_back() {
+        let (mut app, dir) = reviewing("cli");
+        rect(&mut app, 10.0, 10.0);
+        assert!(app.markups_saved());
+        assert_eq!(sidecar::load_file(&dir.join("doc.json")).unwrap().annots.len(), 1, "on disk for the command line to read");
+        app.read_only = true;
+        assert!(!app.markups_saved(), "not saving: the app exports what it has");
+        app.cli_done.0.send((CliJob::Export, Ok(serde_json::json!({"file": "/x/doc_markup.pdf", "markups": 1, "characters_without_font": 0})))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("Exported → /x/doc_markup.pdf"), "{}", app.status);
+        app.cli_done.0.send((CliJob::Shrink, Ok(serde_json::json!({"file": "/x/doc_smaller.pdf", "bytes_before": 10_485_760, "bytes_after": 2_097_152, "images_recompressed": 3, "images_kept": 1, "check_pages": [2]})))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("10.0 MB → 2.0 MB (3 images); check page 2"), "{}", app.status);
+        app.cli_done.0.send((CliJob::Export, Err("disk full".into()))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("Export failed: disk full"), "{}", app.status);
         std::fs::remove_dir_all(&dir).ok();
     }
 
