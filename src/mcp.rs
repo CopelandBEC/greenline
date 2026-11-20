@@ -107,6 +107,11 @@ const TOOLS: &[Tool] = &[
         doc: "Write a PDF with the markups (flattened, or editable comments).",
         params: &[PDF, p("out", Ty::Str, false, "Output PDF (default: beside the original)"), p("editable", Ty::Bool, false, "Markups as movable comments"), PROPOSALS],
     },
+    Tool {
+        name: "shrink",
+        doc: "Write a smaller copy of the PDF: big colour and grey images (scans, photos) brought down to dpi and recompressed. The original is never changed; check_pages lists pages that look different afterwards.",
+        params: &[PDF, p("out", Ty::Str, false, "Output PDF (default: <name>_smaller.pdf beside the original)"), p("dpi", Ty::Num, false, "Resolution images are brought down to (default 200)")],
+    },
 ];
 
 fn schema(t: &Tool) -> Value {

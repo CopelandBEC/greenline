@@ -33,7 +33,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `I` | Stamps: seal and signature images (PNG/JPEG) and the date; place them, then copy the set to the same spot on other sheets |
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
-| `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original; **Export → Measurements (CSV)** lists every measurement's length, area, width and height for a takeoff |
+| `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original (placed photos go in as compact JPEGs); **Export → Measurements (CSV)** lists every measurement's length, area, width and height for a takeoff; **Export → Smaller copy** writes `<name>_smaller.pdf` with big scans and photos brought down to 200 dpi and recompressed, and names any page worth a second look |
 | `F1` | All shortcuts, your name for exported comments, and light/dark appearance |
 
 Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` on Linux; an old Redline folder is moved there on first launch); the source PDF is never modified. Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.

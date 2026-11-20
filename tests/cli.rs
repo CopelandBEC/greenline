@@ -153,6 +153,12 @@ fn an_agent_takes_off_a_window_for_review() {
     assert!(env.fails(&["measurements", pdf, "--csv", pdf]).contains("refusing to overwrite"));
     assert!(env.fails(&["render", pdf, "--page", "1", "--out", pdf]).contains("refusing to overwrite"));
     assert!(env.fails(&["export", pdf, "--out", "sheet.pdf"]).contains("refusing to overwrite"), "relative to the working folder");
+    // A smaller copy of a vector sheet: nothing to recompress, but still a copy, beside it.
+    let s = env.run(&["shrink", pdf]);
+    assert_eq!(s["images_recompressed"], 0);
+    assert!(env.dir.join("sheet_smaller.pdf").exists() && s["check_pages"].as_array().unwrap().is_empty());
+    assert!(env.fails(&["shrink", pdf, "--out", pdf]).contains("refusing to overwrite"));
+    assert!(env.fails(&["shrink", pdf, "--dpi", "5"]).contains("50 to 1200"));
     // A hard link to the source is replaced, not written through.
     let before = std::fs::read(&env.pdf).unwrap();
     let link = env.dir.join("linked.csv");

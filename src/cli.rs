@@ -28,6 +28,7 @@ const USAGE: &str = "greenline-cli: Greenline for agents and scripts (read `gree
   proposals <pdf>                         batches waiting for review
   withdraw <pdf> <id | all>               take back a proposed batch
   export <pdf> [--out F.pdf] [--editable] [--proposals]
+  shrink <pdf> [--out F.pdf] [--dpi 200]  a smaller copy: big scans and photos brought down and recompressed
   ops                                     the op reference for apply
   patterns                                line types and hatches ops can name
   mcp                                     serve these commands as MCP tools over standard input/output
@@ -111,7 +112,7 @@ pub fn main(args: Vec<String>) -> i32 {
 }
 
 /// The commands that work on a PDF, which `run_with` takes.
-pub const FILE_COMMANDS: &[&str] = &["info", "text", "paths", "snap", "render", "list", "measurements", "apply", "proposals", "withdraw", "export"];
+pub const FILE_COMMANDS: &[&str] = &["info", "text", "paths", "snap", "render", "list", "measurements", "apply", "proposals", "withdraw", "export", "shrink"];
 
 /// Runs a file command from arguments already parsed (the MCP server): the
 /// command, the PDF, an optional id (withdraw), flags by name (switches with
@@ -164,7 +165,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<Value> {
             crate::mcp::serve();
             Ok(Value::Null)
         }
-        "info" | "text" | "paths" | "snap" | "render" | "list" | "measurements" | "apply" | "proposals" | "withdraw" | "export" => {
+        "info" | "text" | "paths" | "snap" | "render" | "list" | "measurements" | "apply" | "proposals" | "withdraw" | "export" | "shrink" => {
             let file = a.pos.get(1).ok_or_else(|| anyhow::anyhow!("{cmd} needs a PDF path"))?;
             let doc = Doc::open(Path::new(file))?;
             command(&cmd, &a, &doc, pdf::pdfium()?)
@@ -579,6 +580,17 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             let images = render::load_images(&annots)?;
             let missing = render::export(pdfium, &doc.path, &out, &annots, &images, mode, &author)?;
             Ok(json!({ "file": out, "markups": annots.len(), "characters_without_font": missing }))
+        }
+        "shrink" => {
+            let stem = doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+            let out = a.get("out").map(PathBuf::from).unwrap_or_else(|| doc.path.with_file_name(format!("{stem}_smaller.pdf")));
+            not_source(&out, &doc.path)?;
+            let dpi = a.num("dpi").map_err(anyhow::Error::msg)?.unwrap_or(render::SHRINK_DPI);
+            if !(50.0..=1200.0).contains(&dpi) {
+                anyhow::bail!("--dpi must be 50 to 1200");
+            }
+            let r = render::shrink(pdfium, &doc.path, &out, dpi)?;
+            Ok(json!({ "file": out, "bytes_before": r.before, "bytes_after": r.after, "images_recompressed": r.recompressed, "images_kept": r.kept, "check_pages": r.check_pages }))
         }
         _ => unreachable!(),
     }

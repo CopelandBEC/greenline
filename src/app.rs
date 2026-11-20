@@ -1153,20 +1153,44 @@ impl App {
         }
     }
 
-    fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
-        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
+    /// Whether `out` may be written: not the original PDF, nor one open in another tab (says why not).
+    fn may_write(&mut self, out: &std::path::Path) -> bool {
+        let Some(src) = &self.path else { return false };
         // Compare real paths so a symlinked folder can't alias the original.
-        let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
-        if real_out == *src || dunce::canonicalize(&out).is_ok_and(|o| o == *src) {
+        let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.to_path_buf());
+        if real_out == *src || dunce::canonicalize(out).is_ok_and(|o| o == *src) {
             self.toast("Refusing to overwrite the original PDF".into());
-            return;
+            return false;
         }
-        // Nor a PDF open in another tab.
-        let open_elsewhere = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter_map(|p| p.path.as_ref()).any(|p| *p == real_out || dunce::canonicalize(&out).is_ok_and(|o| o == *p));
+        let open_elsewhere = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter_map(|p| p.path.as_ref()).any(|p| *p == real_out || dunce::canonicalize(out).is_ok_and(|o| o == *p));
         if open_elsewhere {
-            self.toast("That PDF is open in another tab: export to another name".into());
+            self.toast("That PDF is open in another tab: write it under another name".into());
+            return false;
+        }
+        true
+    }
+
+    /// Writes `<name>_smaller.pdf` beside the original: its big scans and photos
+    /// brought down and recompressed (markups aren't part of it; export them as usual).
+    fn smaller_copy(&mut self) {
+        let Some(src) = self.path.clone() else { return };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let out = src.with_file_name(format!("{stem}_smaller.pdf"));
+        if !self.may_write(&out) {
             return;
         }
+        if let Some(w) = &self.worker {
+            w.send(Req::Shrink { src, out, dpi: crate::render::SHRINK_DPI });
+            self.status = "Making a smaller copy…".into();
+            self.status_until = f64::INFINITY;
+        }
+    }
+
+    fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
+        if !self.may_write(&out) {
+            return;
+        }
+        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
         let author = if self.prefs.author.trim().is_empty() { default_author() } else { self.prefs.author.trim().to_string() };
         w.send(Req::Export { src: src.clone(), out, annots, mode, author });
@@ -1502,6 +1526,20 @@ impl App {
                     let lock = self.creating.take().map(|c| c.1);
                     self.open_with(path, lock);
                 }
+                Resp::Shrunk(Ok((p, r))) => {
+                    let mb = |b: u64| b as f64 / 1_048_576.0;
+                    let check = if r.check_pages.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; check page{} {}", if r.check_pages.len() == 1 { "" } else { "s" }, r.check_pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+                    };
+                    self.toast(if r.recompressed == 0 {
+                        format!("Nothing to make smaller: no big scans or photos ({})", p.display())
+                    } else {
+                        format!("Smaller copy → {}: {:.1} MB → {:.1} MB ({} images){check}", p.display(), mb(r.before), mb(r.after), r.recompressed)
+                    });
+                }
+                Resp::Shrunk(Err(e)) => self.toast(format!("Smaller copy failed: {e}")),
                 Resp::Created(Err(e)) => {
                     self.creating = None;
                     self.toast(format!("Could not create the document: {e}"));
@@ -4437,6 +4475,11 @@ impl App {
                     }
                     if ui.button("Measurements (CSV)").on_hover_text("<name>_measurements.csv: page, name, length, area, width, height").clicked() {
                         self.export_measurements();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Smaller copy (PDF)").on_hover_text("<name>_smaller.pdf: big scans and photos brought down to 200 dpi and recompressed; the original stays as it is").clicked() {
+                        self.smaller_copy();
                         ui.close();
                     }
                 });
