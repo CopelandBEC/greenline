@@ -1983,7 +1983,14 @@ impl App {
         // The worker drops requests for pages that left `keep`; forget them so they are re-sent.
         self.req_base.retain(|k, _| want.contains(k));
 
+        // While zooming, a page already rendered keeps that render (scaled) until
+        // zooming pauses: each half-octave passed would otherwise queue a whole-page
+        // render, stale before it's done, ahead of the one wanted at the end.
+        let zooming = now - self.last_view_change < 0.12;
         for &i in &want {
+            if zooming && self.base.contains_key(&i) {
+                continue;
+            }
             let s = self.pages[i];
             let cap = MAX_BASE_PX / s.x.max(s.y);
             // Half-octave steps: at most 1.41x the pixels needed across (2x in all),
@@ -6206,6 +6213,27 @@ mod tests {
         // A whole-page render sharp enough needs no tiles.
         app.set_zoom(0.3, app.canvas.center());
         assert!(app.wanted_tiles(0.3, &app.visible_pages()).iter().all(|t| !app.base.contains_key(&t.0.0)));
+    }
+
+    /// While zooming, a page already rendered waits for zooming to pause before
+    /// it's rendered again at the new scale; one not yet rendered doesn't wait.
+    #[test]
+    fn whole_page_renders_wait_for_zooming_to_pause() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.pages = vec![vec2(600.0, 800.0); 2];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.zoom = 0.5;
+        app.base.insert(0, PageTex { tex: ctx.load_texture("t", egui::ColorImage::filled([4, 4], Color32::WHITE), TextureOptions::LINEAR), scale: 0.5, origin: [0, 0], size: [4, 4] });
+        app.set_zoom(1.0, app.canvas.center());
+        app.last_view_change = 10.0;
+        let bases = |w: &Wanted| w.reqs.iter().filter_map(|r| if let Req::Render { page, layer: Layer::Base, .. } = r { Some(*page) } else { None }).collect::<Vec<_>>();
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 10.05, &mut w, false);
+        assert_eq!(bases(&w), [1], "page 0 keeps its render for now; page 1 has none");
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 10.5, &mut w, false);
+        assert_eq!(bases(&w), [0], "zooming paused: page 0 at the new scale");
     }
 
     #[test]
