@@ -8,6 +8,9 @@
 use crate::patterns::{HatchFill, LineType};
 use egui::{pos2, vec2, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub type Rgb = [u8; 3];
@@ -109,6 +112,18 @@ pub enum Prim {
     /// of `tint` (the outline, with an opacity for the ink) instead.
     Segments { segs: Arc<Vec<[Pos2; 2]>>, offset: Vec2, width: f32, color: Rgb, tile: f32, tint: Option<(Arc<Vec<Pos2>>, u8)> },
 }
+
+/// A markup's prims and bounds, worked out once per look and position (`Annot::geom`).
+pub struct Geom {
+    pub prims: Vec<Prim>,
+    pub bounds: Rect,
+    /// The patterns it was made with, kept alive so their addresses (part of
+    /// the cache key) can't be reused by different ones.
+    _pins: (Option<Arc<LineType>>, Option<Arc<crate::patterns::Hatch>>),
+}
+
+/// Markups remembered per generation of the geometry cache.
+const GEOM_GENERATION: usize = 4096;
 
 pub const WHITE: Rgb = [255, 255, 255];
 
@@ -345,7 +360,117 @@ impl Annot {
         }
     }
 
+    /// Everything the markup draws, with the box round it, remembered by content
+    /// (see `Geom`): painting, hit-testing and lists ask every frame.
+    pub fn geom(&self) -> Rc<Geom> {
+        thread_local! {
+            static CACHE: RefCell<[HashMap<u64, Rc<Geom>>; 2]> = RefCell::new([HashMap::new(), HashMap::new()]);
+        }
+        let key = self.fingerprint();
+        if let Some(g) = CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            let hit = c[0].get(&key).cloned().or_else(|| c[1].remove(&key));
+            if let Some(g) = &hit {
+                if !c[0].contains_key(&key) {
+                    c[0].insert(key, g.clone());
+                }
+            }
+            hit
+        }) {
+            return g;
+        }
+        let g = Rc::new(Geom {
+            prims: self.prims(),
+            bounds: self.bounds_uncached(),
+            _pins: (self.style.line.clone(), self.style.hatch.as_ref().map(|h| h.pattern.clone())),
+        });
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            // Two generations: the one filling up, and the last, whose entries
+            // move back over when used. Whatever went unused for a whole
+            // generation is let go.
+            if c[0].len() >= GEOM_GENERATION {
+                c[1] = std::mem::take(&mut c[0]);
+            }
+            c[0].insert(key, g.clone());
+        });
+        g
+    }
+
+    /// A hash of everything `prims` and `bounds` depend on. Patterns count by
+    /// identity: a `Geom` holds on to the ones it was made with, so a pattern
+    /// it saw can't be freed and another put in its place.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let f = |h: &mut std::collections::hash_map::DefaultHasher, v: f32| h.write_u32(v.to_bits());
+        let p = |h: &mut std::collections::hash_map::DefaultHasher, q: Pos2| {
+            f(h, q.x);
+            f(h, q.y);
+        };
+        let r = |h: &mut std::collections::hash_map::DefaultHasher, r: Rect| {
+            p(h, r.min);
+            p(h, r.max);
+        };
+        let pts = |h: &mut std::collections::hash_map::DefaultHasher, v: &[Pos2]| {
+            h.write_usize(v.len());
+            v.iter().for_each(|q| p(h, *q));
+        };
+        self.color.hash(&mut h);
+        f(&mut h, self.width);
+        std::mem::discriminant(&self.kind).hash(&mut h);
+        match &self.kind {
+            Kind::Callout { anchor, pos, box_w, text, size, leaders } => {
+                p(&mut h, *anchor);
+                p(&mut h, *pos);
+                f(&mut h, *box_w);
+                text.hash(&mut h);
+                f(&mut h, *size);
+                pts(&mut h, leaders);
+            }
+            Kind::Text { pos, box_w, text, size } => {
+                p(&mut h, *pos);
+                f(&mut h, *box_w);
+                text.hash(&mut h);
+                f(&mut h, *size);
+            }
+            Kind::Cloud { rect } | Kind::Rect { rect } | Kind::Highlight { rect } => r(&mut h, *rect),
+            Kind::Arrow { a, b } | Kind::Line { a, b } => {
+                p(&mut h, *a);
+                p(&mut h, *b);
+            }
+            Kind::Pen { pts: v } => pts(&mut h, v),
+            Kind::Poly { pts: v, closed } => {
+                pts(&mut h, v);
+                closed.hash(&mut h);
+            }
+            Kind::Image { rect, image, name } => {
+                r(&mut h, *rect);
+                image.hash(&mut h);
+                name.hash(&mut h);
+            }
+            Kind::Measure { pts: v, area, name, value, size } => {
+                pts(&mut h, v);
+                area.hash(&mut h);
+                name.hash(&mut h);
+                value.hash(&mut h);
+                f(&mut h, *size);
+            }
+        }
+        let s = &self.style;
+        s.fill.map(|x| (x.color, x.alpha)).hash(&mut h);
+        s.line.as_ref().map(Arc::as_ptr).hash(&mut h);
+        s.hatch.as_ref().map(|x| Arc::as_ptr(&x.pattern)).hash(&mut h);
+        s.hatch.as_ref().map(|x| x.scale.to_bits()).hash(&mut h);
+        (s.bold, s.italic, s.underline).hash(&mut h);
+        h.finish()
+    }
+
     pub fn bounds(&self) -> Rect {
+        self.geom().bounds
+    }
+
+    fn bounds_uncached(&self) -> Rect {
         let b = self.shape_bounds();
         match self.style.line.as_deref().filter(|_| self.takes_line_type()) {
             Some(lt) => b.expand(lt.reach(self.width)),
@@ -435,8 +560,8 @@ impl Annot {
             }
         }
         let mut best = f32::INFINITY;
-        for prim in self.prims() {
-            let (pts, closed) = match &prim {
+        for prim in self.geom().prims.iter() {
+            let (pts, closed) = match prim {
                 Prim::Stroke { pts, closed, .. } => (pts, *closed),
                 Prim::Fill { pts, .. } => (pts, true),
                 Prim::Image { rect, .. } => {
@@ -473,7 +598,7 @@ impl Annot {
             }
         }
         let r = r.expand(self.width / 2.0);
-        self.prims().iter().any(|prim| match prim {
+        self.geom().prims.iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
             Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
             Prim::Text { .. } | Prim::Image { .. } | Prim::Segments { .. } => false,
@@ -1044,6 +1169,30 @@ mod tests {
         // Old files without the flags read as plain.
         let s: Style = serde_json::from_str("{}").unwrap();
         assert!(!s.bold && !s.italic && !s.underline && s.is_plain());
+    }
+
+    /// The cached geometry follows every change to a markup: text, position,
+    /// style, and a pattern swapped for another of the same name.
+    #[test]
+    fn cached_geometry_follows_changes() {
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Text { pos: pos2(0.0, 0.0), box_w: 120.0, text: "Short".into(), size: 12.0 } };
+        let texts = |a: &Annot| a.geom().prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.clone()) } else { None }).collect::<Vec<_>>();
+        assert_eq!(texts(&a), ["Short"]);
+        let h1 = a.bounds().height();
+        *a.text_mut().unwrap() = "Seal the head flashing to the jamb at every opening".into();
+        assert!(texts(&a).len() > 1 && a.bounds().height() > h1, "new text, taller box");
+        a.translate(vec2(10.0, 0.0));
+        assert_eq!(a.bounds().min.x, 10.0);
+        a.style.bold = true;
+        assert!(a.geom().prims.iter().any(|p| matches!(p, Prim::Text { bold: true, .. })));
+        a.color = [255, 0, 0];
+        assert!(a.geom().prims.iter().all(|p| !matches!(p, Prim::Text { color, .. } if *color != [255, 0, 0])));
+        let mut l = Annot { kind: Kind::Line { a: pos2(0.0, 100.0), b: pos2(200.0, 100.0) }, ..a.clone() };
+        let tall = |h: f32| Arc::new(crate::patterns::LineType { name: "same".into(), scale_with_width: false, lines: vec![crate::patterns::LinePattern { offset: 0.0, comps: vec![crate::patterns::Comp::Symbol { left: 5.0, right: 5.0, stretch: 1.0, fill: false, paths: vec![vec![pos2(0.0, -h), pos2(0.0, h)]] }] }] });
+        l.style.line = Some(tall(10.0));
+        let short = l.bounds();
+        l.style.line = Some(tall(30.0));
+        assert!(l.bounds().height() > short.height() + 30.0, "{short:?} {:?}", l.bounds());
     }
 
     #[test]

@@ -403,6 +403,9 @@ pub struct App {
     textures: HashMap<String, TextureHandle>,
     tex_failed: HashSet<String>,
     placing: Option<Place>,
+    /// Markup list rows as last laid out: by markup id, the note and width they
+    /// were laid out for, and their height.
+    list_heights: HashMap<u64, ((u64, &'static str), f32)>,
     /// Pointer over the canvas, for the placement preview.
     hover: Option<Pos2>,
     date_text: String,
@@ -538,6 +541,7 @@ impl App {
             textures: HashMap::new(),
             tex_failed: HashSet::new(),
             placing: None,
+            list_heights: HashMap::new(),
             hover: None,
             copy_all: true,
             copy_pages: String::new(),
@@ -1857,7 +1861,8 @@ impl App {
 
     fn hit(&self, page: usize, p: Pos2) -> Option<u64> {
         let tol = HIT_PX / self.zoom;
-        let mut hits = self.annots.iter().rev().filter(|a| a.page == page && a.distance(p) <= tol);
+        // The box round a markup first: only the few near the pointer are measured.
+        let mut hits = self.annots.iter().rev().filter(|a| a.page == page && a.bounds().expand(tol).contains(p) && a.distance(p) <= tol);
         // Prefer a selected one, then topmost.
         hits.clone().find(|a| self.selected.contains(&a.id)).or_else(|| hits.next()).map(|a| a.id)
     }
@@ -3586,17 +3591,26 @@ impl App {
             }
 
             let pp = painter.with_clip_rect(sr.intersect(self.canvas));
+            // The part of the page on screen (page points), with room for strokes
+            // drawn wider than their width when zoomed far out: markups wholly
+            // outside it aren't drawn at all.
+            let shown = Rect::from_min_max(self.screen_to_page(i, self.canvas.min), self.screen_to_page(i, self.canvas.max)).expand(4.0 / self.zoom);
             for a in self.annots.iter().filter(|a| a.page == i) {
-                let mut prims = a.prims();
+                let g = a.geom();
+                if !g.bounds.intersects(shown) {
+                    continue;
+                }
                 if Some(a.id) == self.editing {
-                    prims.retain(|p| !matches!(p, Prim::Text { .. }));
+                    let prims: Vec<Prim> = g.prims.iter().filter(|p| !matches!(p, Prim::Text { .. })).cloned().collect();
                     if let Kind::Text { .. } = a.kind {
                         let r = a.text_box().unwrap();
                         let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max));
                         pp.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
                     }
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0, &self.textures);
+                    continue;
                 }
-                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0, &self.textures);
+                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &g.prims, k, 1.0, &self.textures);
             }
             // Live preview.
             match &self.drag {
@@ -3628,7 +3642,7 @@ impl App {
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
                     let hot = self.props_hover.as_ref().is_some_and(|(bid, id)| *bid == b.id && *id == a.id);
                     pp.rect_filled(r, 0.0, PROPOSED.gamma_multiply(if hot { 0.14 } else { 0.08 }));
-                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.geom().prims, k, 0.85, &self.textures);
                     let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
                     pp.extend(Shape::dashed_line(&pts, Stroke::new(if hot { 2.5 } else { 1.2 }, PROPOSED), 5.0, 3.0));
                 }
@@ -4255,7 +4269,7 @@ impl App {
         let k = self.text_k.unwrap_or((1.0, 0.8));
         let clip = painter.with_clip_rect(r);
         for a in self.annots.iter().filter(|a| a.page == i) {
-            paint_prims(&clip, r.min, z, &a.prims(), k, 1.0, &self.textures);
+            paint_prims(&clip, r.min, z, &a.geom().prims, k, 1.0, &self.textures);
         }
         if current {
             painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, crate::theme::accent(ui.visuals())), egui::StrokeKind::Outside);
@@ -4591,9 +4605,14 @@ impl App {
         });
         ui.separator();
         let mut order: Vec<&Annot> = self.annots.iter().collect();
-        order.sort_by_key(|a| page_order(a));
-        let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a).to_string())).collect();
+        order.sort_by_cached_key(|a| page_order(a));
+        let items: Vec<(u64, usize, Rgb, &'static str, &str)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a))).collect();
         let mut clicked = None;
+        let mut heights = std::mem::take(&mut self.list_heights);
+        // Rows of deleted markups linger harmlessly (ids aren't reused); now and then let them go.
+        if heights.len() > 2 * self.annots.len() + 100 {
+            heights.clear();
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut last_page = None;
             for (id, page, color, kind, text) in &items {
@@ -4604,16 +4623,27 @@ impl App {
                 }
                 // Custom row: swatch + note wrapped to the panel width (max 4 lines).
                 let note = text.trim();
+                let width = ui.available_width();
+                // A row scrolled out of sight takes the height it had when last laid
+                // out, without laying out its text again.
+                let key = (sidecar::fnv(note.as_bytes()) ^ width.to_bits() as u64, *kind);
+                if let Some(&(k, h)) = heights.get(id) {
+                    let probe = Rect::from_min_size(ui.cursor().min, vec2(width, h));
+                    if k == key && !ui.is_rect_visible(probe) {
+                        ui.allocate_exact_size(vec2(width, h), Sense::hover());
+                        continue;
+                    }
+                }
                 let (label, colour) = if note.is_empty() {
                     (kind.to_string(), ui.visuals().weak_text_color())
                 } else {
                     (note.replace('\n', " "), ui.visuals().text_color())
                 };
-                let width = ui.available_width();
                 let mut job = egui::text::LayoutJob::simple(label, FontId::proportional(13.0), colour, (width - 26.0).max(40.0));
                 job.wrap.max_rows = 4;
                 job.wrap.overflow_character = Some('…');
                 let galley = ui.painter().layout_job(job);
+                heights.insert(*id, (key, galley.size().y + 6.0));
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y + 6.0), Sense::click());
                 let selected = self.selected.contains(id);
                 if selected || resp.hovered() {
@@ -4635,6 +4665,7 @@ impl App {
                 ui.weak("No markups yet.");
             }
         });
+        self.list_heights = heights;
         if let Some(id) = clicked {
             if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
                 self.commit_edit();
@@ -4987,6 +5018,29 @@ fn square(from: Pos2, p: Pos2) -> Pos2 {
     if d.x.abs() >= d.y.abs() { pos2(p.x, from.y) } else { pos2(from.x, p.y) }
 }
 
+/// Drops points of a screen polyline closer than half a pixel to the last one
+/// kept (a cloud's or pen stroke's when zoomed out): fewer to tessellate, and
+/// no visible change. The ends always stay.
+fn thin(pts: Vec<Pos2>) -> Vec<Pos2> {
+    if pts.len() <= 3 {
+        return pts;
+    }
+    let last = pts[pts.len() - 1];
+    let mut out = Vec::with_capacity(pts.len());
+    for p in pts {
+        if out.last().is_none_or(|q: &Pos2| (p - *q).length_sq() >= 0.25) {
+            out.push(p);
+        }
+    }
+    if out.last() != Some(&last) {
+        if out.len() > 1 && (last - out[out.len() - 1]).length_sq() < 0.25 {
+            out.pop();
+        }
+        out.push(last);
+    }
+    out
+}
+
 /// Paints prims for a page whose top-left is at `origin` on screen, drawn at
 /// `z` screen points per PDF point. `k` is the text calibration from `text_metrics`.
 fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32, f32), alpha_mul: f32, images: &HashMap<String, TextureHandle>) {
@@ -5041,7 +5095,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
-                let pts = map(pts);
+                let pts = thin(map(pts));
                 if *closed {
                     painter.add(Shape::closed_line(pts, s));
                 } else {
@@ -6247,4 +6301,92 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A busy review sheet: about 400 markups of every kind on an ARCH D page.
+    fn busy_app() -> App {
+        let mut app = App::with(None, String::new(), sidecar::Prefs::default());
+        app.pages = vec![vec2(2592.0, 1728.0); 3];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0));
+        app.fit_width();
+        let dashed = Arc::new(patterns::builtin_line_types()[0].clone());
+        let hatch = HatchFill { pattern: Arc::new(patterns::builtin_hatches()[0].clone()), scale: 1.0 };
+        for i in 0..400usize {
+            let (x, y) = (40.0 + (i % 20) as f32 * 125.0, 40.0 + (i / 20) as f32 * 80.0);
+            let r = Rect::from_min_size(pos2(x, y), vec2(100.0, 60.0));
+            let kind = match i % 8 {
+                0 => Kind::Callout { anchor: pos2(x + 110.0, y + 70.0), pos: pos2(x, y), box_w: 100.0, text: "Confirm flashing lap at sill and jamb, typ.".into(), size: 10.0, leaders: vec![] },
+                1 => Kind::Cloud { rect: r },
+                2 => Kind::Rect { rect: r },
+                3 => Kind::Poly { pts: vec![pos2(x, y), pos2(x + 100.0, y), pos2(x + 100.0, y + 60.0), pos2(x + 50.0, y + 30.0), pos2(x, y + 60.0)], closed: true },
+                4 => Kind::Measure { pts: vec![pos2(x, y), pos2(x + 100.0, y + 40.0)], area: false, name: String::new(), value: String::new(), size: 10.0 },
+                5 => Kind::Pen { pts: (0..120).map(|k| pos2(x + k as f32 * 0.8, y + 30.0 + (k as f32 * 0.3).sin() * 20.0)).collect() },
+                6 => Kind::Text { pos: pos2(x, y), box_w: 110.0, text: "Provide backer rod and sealant at all control joints".into(), size: 10.0 },
+                _ => Kind::Arrow { a: pos2(x, y), b: pos2(x + 90.0, y + 50.0) },
+            };
+            let id = app.add(0, kind);
+            let a = app.find_mut(id).unwrap();
+            match i % 8 {
+                1 if i % 16 == 1 => a.style.fill = Some(Fill { color: [228, 0, 0], alpha: 60 }),
+                2 => a.style.line = Some(dashed.clone()),
+                3 => a.style.hatch = Some(hatch.clone()),
+                _ => {}
+            }
+        }
+        app.scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
+        app.show_markups = true;
+        app
+    }
+
+    /// cargo test --release --lib bench_frames -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_frames() {
+        let mut app = busy_app();
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let frames = 60;
+        let (mut ui_t, mut tess_t, mut prims) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0usize);
+        let mut parts = [std::time::Duration::ZERO; 5];
+        for f in 0..frames {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1900.0, 1000.0))), ..Default::default() };
+            let t = std::time::Instant::now();
+            let out = ctx.run_ui(input, |ui| {
+                let t = std::time::Instant::now();
+                egui::Panel::left("thumbs").default_size(170.0).show(ui, |ui| app.sidebar(ui));
+                parts[0] += t.elapsed();
+                let t = std::time::Instant::now();
+                egui::Panel::right("markups").default_size(280.0).show(ui, |ui| app.markup_list(ui));
+                parts[1] += t.elapsed();
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    app.canvas = ui.max_rect();
+                    // Hovering in Select runs the hit test, as moving the pointer does.
+                    let t = std::time::Instant::now();
+                    let h = pos2(300.0 + f as f32, 300.0);
+                    let over = app.page_at(h).map(|pg| (pg, app.screen_to_page(pg, h)));
+                    if let Some((pg, p)) = over {
+                        std::hint::black_box(app.hit(pg, p));
+                    }
+                    parts[2] += t.elapsed();
+                    let t = std::time::Instant::now();
+                    app.paint(ui);
+                    parts[3] += t.elapsed();
+                });
+                let t = std::time::Instant::now();
+                measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+                parts[4] += t.elapsed();
+            });
+            ui_t += t.elapsed();
+            let t = std::time::Instant::now();
+            let prim = ctx.tessellate(out.shapes, 1.0);
+            tess_t += t.elapsed();
+            prims = prim.len();
+            // Pan a little each frame, as scrolling does.
+            app.offset.y += 1.0;
+        }
+        eprintln!("{} markups: ui {:?}/frame, tessellate {:?}/frame ({prims} clipped prims)", app.annots.len(), ui_t / frames, tess_t / frames);
+        let names = ["thumbnails", "markup list", "hover hit test", "paint", "relabel"];
+        for (n, t) in names.iter().zip(parts) {
+            eprintln!("  {n}: {:?}/frame", t / frames);
+        }
+    }
 }

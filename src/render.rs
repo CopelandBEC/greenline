@@ -972,3 +972,64 @@ mod sample {
         }
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::tests::{test_pdfium, PDFIUM_TESTS};
+    use super::*;
+    use std::time::Instant;
+
+    /// GREENLINE_SAMPLE=/path/to.pdf cargo test --release bench_ -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_worker_steps() {
+        let src = PathBuf::from(std::env::var("GREENLINE_SAMPLE").unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let t = Instant::now();
+        let doc = pdfium.load_pdf_from_file(&src, None).unwrap();
+        eprintln!("load: {:?}", t.elapsed());
+        let t = Instant::now();
+        let a: Vec<Vec2> = doc.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
+        eprintln!("sizes by loading every page ({}): {:?}", a.len(), t.elapsed());
+        let t = Instant::now();
+        let b: Vec<Vec2> = doc.pages().page_sizes().unwrap().iter().map(|r| vec2(r.width().value, r.height().value)).collect();
+        eprintln!("sizes by index: {:?} same={}", t.elapsed(), a == b);
+        for pi in [0usize, 5, 10] {
+            let t = Instant::now();
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            let load = t.elapsed();
+            let s = vec2(p.width().value, p.height().value);
+            let scale = 4096.0 / s.x.max(s.y);
+            let size = [(s.x * scale).round() as usize, (s.y * scale).round() as usize];
+            let cfg = PdfRenderConfig::new().set_fixed_size(size[0] as Pixels, size[1] as Pixels).render_annotations(true);
+            let mut bmp = PdfBitmap::empty(size[0] as Pixels, size[1] as Pixels, PdfBitmapFormat::BGRA).unwrap();
+            let t = Instant::now();
+            p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+            let r1 = t.elapsed();
+            let t = Instant::now();
+            p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+            let r2 = t.elapsed();
+            let t = Instant::now();
+            let rgba = bmp.as_rgba_bytes();
+            let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+            let conv = t.elapsed();
+            drop(img);
+            drop(p);
+            let t = Instant::now();
+            let _ = render_region(&doc, pi, scale, [0, 0], size).unwrap();
+            let full = t.elapsed();
+            eprintln!("page {pi} {size:?}: load {load:?}, render {r1:?}, again on loaded page {r2:?}, convert {conv:?}; render_region {full:?}");
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            for px in [512.0f32, 1024.0, 1448.0, 2048.0, 2896.0, 4096.0] {
+                let scale = px / s.x.max(s.y);
+                let size = [(s.x * scale).round() as usize, (s.y * scale).round() as usize];
+                let cfg = PdfRenderConfig::new().set_fixed_size(size[0] as Pixels, size[1] as Pixels).render_annotations(true);
+                let mut bmp = PdfBitmap::empty(size[0] as Pixels, size[1] as Pixels, PdfBitmapFormat::BGRA).unwrap();
+                let t = Instant::now();
+                p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+                eprintln!("   {px}px: {:?}", t.elapsed());
+            }
+        }
+    }
+}
