@@ -544,8 +544,9 @@ pub struct App {
     active_left: bool,
     /// Painting the other pane (with its state swapped in): no gestures or previews.
     inactive: bool,
-    /// Number of the latest save asked for; only its outcome counts.
+    /// Saves asked for so far, and by markups file the number of its latest: only that one's outcome counts.
     save_seq: u64,
+    save_seqs: HashMap<PathBuf, u64>,
     lock: Option<std::fs::File>,
     read_only: bool,
     /// Shown while `read_only`: why markups aren't being autosaved.
@@ -693,6 +694,7 @@ impl App {
             active_left: true,
             inactive: false,
             save_seq: 0,
+            save_seqs: HashMap::new(),
             lock: None,
             read_only: false,
             read_only_why: String::new(),
@@ -880,6 +882,8 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        // A background save still on its way may yet fail: know before letting a document go.
+        self.settle_saves();
         if i == self.cur_tab {
             if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
                 self.end_drag();
@@ -952,11 +956,25 @@ impl App {
     /// Split screen's other pane back to a second view of the shown document,
     /// where the shown view is (its document closed, say).
     fn reset_other_view(&mut self) {
+        let shown = self.other.as_ref().and_then(|o| o.doc);
+        self.forget_requests(shown);
         let id = self.new_view_id();
         let (zoom, offset) = (self.zoom, self.offset);
         if let Some(o) = self.other.as_mut() {
             o.doc = None;
             o.view = View { id, zoom, offset, fit_pending: true, ..Default::default() };
+        }
+    }
+
+    /// A background tab's document no longer shown in the other pane: renders it
+    /// asked for won't come (the worker drops them), so forget them, to be asked
+    /// for again when it's shown.
+    fn forget_requests(&mut self, doc: Option<u64>) {
+        let Some(g) = doc else { return };
+        if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == g) {
+            p.view.req_base.clear();
+            p.view.req_patch.clear();
+            p.req_thumb.clear();
         }
     }
 
@@ -1549,34 +1567,40 @@ impl App {
             return;
         };
         self.save_seq += 1;
+        self.save_seqs.insert(f.clone(), self.save_seq);
         self.saver.save_later(f, s, self.save_seq);
         self.dirty = false;
     }
 
-    /// Background saves that finished: the latest failing leaves the markups unsaved, retried in a few seconds.
+    /// Background saves that finished: the latest of a file's failing leaves its
+    /// markups unsaved (the shown document's, or a background tab's), to be retried.
     fn poll_saves(&mut self) {
         while let Ok((file, seq, result)) = self.saver.done.try_recv() {
-            // A background tab's (split screen's panes swapped as it saved): unsaved again, so
-            // it's retried with the other background tabs.
-            if Some(&file) != self.markups_file.as_ref() {
-                if result.is_err() {
-                    if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.markups_file.as_ref() == Some(&file)) {
-                        p.dirty = true;
-                    }
-                }
+            // Overtaken by a later save of the same file (each file counts its own:
+            // other documents' saves in between mustn't hide this one's failure).
+            if self.save_seqs.get(&file) != Some(&seq) {
                 continue;
             }
-            // Overtaken by a later save.
-            if seq != self.save_seq {
-                continue;
-            }
-            if let Err(e) = result {
+            let Err(e) = result else { continue };
+            if Some(&file) == self.markups_file.as_ref() {
                 self.dirty = true;
                 self.status = format!("AUTOSAVE FAILED: {e}");
                 self.status_until = f64::INFINITY;
                 self.save_retry_at = self.now + 5.0;
+            } else if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.markups_file.as_ref() == Some(&file)) {
+                // A background tab's (split screen's panes swapped, or the tab switched, as it
+                // saved): unsaved again, retried with the other background tabs.
+                p.dirty = true;
             }
         }
+    }
+
+    /// Waits for background saves and takes in how they went, so `dirty` (here and
+    /// in background tabs) is true for anything whose save failed. Before closing
+    /// a document or quitting, which go on only when it's saved.
+    fn settle_saves(&mut self) {
+        self.saver.flush();
+        self.poll_saves();
     }
 
     /// Saves now, waiting for it (before switching or closing a document, accepting
@@ -1591,6 +1615,7 @@ impl App {
         };
         // Any background save still to report is overtaken by this one.
         self.save_seq += 1;
+        self.save_seqs.insert(f.clone(), self.save_seq);
         match self.saver.save_now(f, s) {
             Ok(()) => self.dirty = false,
             Err(e) => {
@@ -2122,7 +2147,8 @@ impl App {
     /// shown document, where this one is; pick a tab while it's active to show
     /// another document there.
     fn toggle_split(&mut self) {
-        if self.other.take().is_some() {
+        if let Some(pane) = self.other.take() {
+            self.forget_requests(pane.doc);
             self.active_left = true;
             return;
         }
@@ -2149,11 +2175,31 @@ impl App {
                 self.swap_doc(&mut p);
                 self.swap_view(&mut p.view);
                 pane.doc = Some(p.generation);
+                // What was under way belongs to the document left: a calibration line, images
+                // being placed, a run of nudges, a toolbar drag, the typing format.
+                self.scale_win.target = None;
+                self.scale_win.calib = None;
+                self.queued_pictures.clear();
+                self.picture_epoch += 1;
+                self.last_nudge = (0.0, Vec::new());
+                self.fill_pending = None;
+                self.hatch_scale_pending = None;
+                self.props_hover = None;
+                self.props_checked = f64::NEG_INFINITY;
+                self.edit_sel = None;
+                self.typing = None;
+                // Scale suggestions asked for but not back are asked again when it's shown.
+                let found = &p.scale_found;
+                p.scale_asked.retain(|pg| found.contains_key(pg));
                 self.tabs[self.cur_tab].parked = Some(p);
                 self.cur_tab = k;
                 self.set_title();
                 if let Some(w) = &self.worker {
                     w.keep.lock().unwrap().search = self.find.id;
+                }
+                // A search cut short when this one was last left: carry on.
+                if self.find.open && self.find.pending > 0 {
+                    self.start_search();
                 }
             }
             None => {
@@ -2199,6 +2245,8 @@ impl App {
     /// the screen isn't split.
     fn with_other<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
         let mut pane = self.other.take()?;
+        // The overview is the active pane's; the other keeps its sheets meanwhile.
+        let overview = std::mem::replace(&mut self.overview, false);
         let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
         let r = match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
             Some((k, mut p)) => {
@@ -2220,6 +2268,7 @@ impl App {
             }
         };
         self.other = Some(pane);
+        self.overview = overview;
         Some(r)
     }
 
@@ -5692,6 +5741,8 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.commit_edit();
+        // Background saves finish (the process mustn't end mid-write), and any that failed get another go.
+        self.settle_saves();
         self.save_sidecar();
         // Background tabs were saved when parked; one whose save failed then gets another go.
         for i in 0..self.tabs.len() {
@@ -7439,5 +7490,114 @@ mod tests {
         for (n, t) in names.iter().zip(parts) {
             eprintln!("  {n}: {:?}/frame", t / frames);
         }
+    }
+
+    #[test]
+    fn a_document_left_in_the_other_pane_renders_when_shown_again() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.toggle_split();
+        // B in the active pane, A in the other.
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.doc_w = 600.0;
+        app.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
+        // The other pane (A) asks for its page.
+        let mut w = Wanted::default();
+        app.with_other(|o| { o.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0)); o.request_renders(&ctx, 100.0, &mut w, false) });
+        let n_other = w.reqs.len();
+        assert!(n_other > 0);
+        // Unsplit before the render arrives; the worker drops it (not in keep any more).
+        app.toggle_split();
+        app.switch_tab(0);
+        assert_eq!(app.path, Some(PathBuf::from("/a.pdf")));
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 200.0, &mut w, true);
+        assert!(w.reqs.iter().any(|r| matches!(r, Req::Render { layer: Layer::Base, .. })), "page never re-requested");
+    }
+
+    #[test]
+    fn a_failed_save_still_counts_after_another_documents_save() {
+        let (mut app, dir) = reviewing("seq");
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        app.markups_file = Some(dir.join("blocker").join("a.json"));
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave(); // seq 1, will fail
+        app.saver.flush(); // (stands for a slow write: result not yet polled)
+        // Switch to B, edit, autosave, switch back to A before polling.
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(dir.join("b.pdf"));
+        app.markups_file = Some(dir.join("b.json"));
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 100.0, 100.0);
+        app.changed();
+        app.autosave(); // seq 2
+        app.switch_tab(0);
+        app.poll_saves();
+        assert!(app.dirty, "A's failed save was silently taken as saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tab_whose_background_save_failed_stays_open() {
+        let (mut app, dir) = reviewing("close");
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        // B open in another tab, A shown.
+        let mut parked = app.park();
+        parked.path = Some(dir.join("b.pdf"));
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(dir.join("a.pdf"));
+        app.markups_file = Some(dir.join("blocker").join("a.json"));
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave();
+        app.saver.flush();
+        app.close_tab(1);
+        app.poll_saves();
+        assert_eq!(app.tabs.len(), 2, "tab closed with its only save failed");
+        assert!(app.dirty && app.status.contains("Autosave failed"), "{}", app.status);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_calibration_line_stays_with_its_document() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 1;
+        app.toggle_split();
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0); 3];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.scale_win.open = true;
+        app.scale_win.calib = Some((2, pos2(0.0, 0.0), pos2(300.0, 0.0)));
+        app.activate_other();
+        assert_eq!(app.path, Some(PathBuf::from("/b.pdf")));
+        assert!(app.scale_win.calib.is_none(), "a's line isn't b's");
+        assert!(app.scale_page() < app.pages.len(), "scale window would index pages[{}]", app.scale_page());
     }
 }
