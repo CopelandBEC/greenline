@@ -4315,6 +4315,9 @@ impl App {
                     paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0, &self.textures);
                     continue;
                 }
+                if speck(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, a, &g, 3.0) {
+                    continue;
+                }
                 paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &g.prims, k, 1.0, &self.textures);
             }
             // Live preview (of a gesture in the active pane only).
@@ -5007,7 +5010,11 @@ impl App {
         let k = self.text_k.unwrap_or((1.0, 0.8));
         let clip = painter.with_clip_rect(r);
         for a in self.annots.iter().filter(|a| a.page == i) {
-            paint_prims(&clip, r.min, z, &a.geom().prims, k, 1.0, &self.textures);
+            let g = a.geom();
+            // In a thumbnail markups show where they are, not what they say.
+            if !speck(&clip, r.min, z, a, &g, 6.0) {
+                paint_prims(&clip, r.min, z, &g.prims, k, 1.0, &self.textures);
+            }
         }
         if current {
             painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, crate::theme::accent(ui.visuals())), egui::StrokeKind::Outside);
@@ -5784,6 +5791,20 @@ fn cached_triangles(pts: &[Pos2]) -> Option<Triangles> {
 fn square(from: Pos2, p: Pos2) -> Pos2 {
     let d = p - from;
     if d.x.abs() >= d.y.abs() { pos2(p.x, from.y) } else { pos2(from.x, p.y) }
+}
+
+/// A markup too small on screen to make out (under `below` pixels across, zoomed
+/// far out or in a thumbnail) drawn as a mark of its colour, and true; drawing all
+/// its lines, text and hatching there would cost far more and show nothing more.
+fn speck(painter: &Painter, origin: Pos2, z: f32, a: &Annot, g: &annot::Geom, below: f32) -> bool {
+    let size = g.bounds.size() * z;
+    if size.x.max(size.y) >= below || matches!(a.kind, Kind::Image { .. }) {
+        return false;
+    }
+    let c = origin + g.bounds.center().to_vec2() * z;
+    let alpha = if matches!(a.kind, Kind::Highlight { .. }) { 90 } else { 230 };
+    painter.rect_filled(Rect::from_center_size(c, size.max(Vec2::splat(1.5))), 0.0, Color32::from_rgba_unmultiplied(a.color[0], a.color[1], a.color[2], alpha));
+    true
 }
 
 /// Drops points of a screen polyline closer than half a pixel to the last one
@@ -7328,6 +7349,10 @@ mod tests {
 
     /// A busy review sheet: about 400 markups of every kind on an ARCH D page.
     fn busy_app() -> App {
+        busy_app_with(400)
+    }
+
+    fn busy_app_with(n: usize) -> App {
         let mut app = App::with(None, String::new(), sidecar::Prefs::default());
         app.pages = vec![vec2(2592.0, 1728.0); 3];
         (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
@@ -7335,8 +7360,8 @@ mod tests {
         app.fit_width();
         let dashed = Arc::new(patterns::builtin_line_types()[0].clone());
         let hatch = HatchFill { pattern: Arc::new(patterns::builtin_hatches()[0].clone()), scale: 1.0 };
-        for i in 0..400usize {
-            let (x, y) = (40.0 + (i % 20) as f32 * 125.0, 40.0 + (i / 20) as f32 * 80.0);
+        for i in 0..n {
+            let (x, y) = (40.0 + (i % 20) as f32 * 125.0, 40.0 + (i / 20 % 20) as f32 * 80.0);
             let r = Rect::from_min_size(pos2(x, y), vec2(100.0, 60.0));
             let kind = match i % 8 {
                 0 => Kind::Callout { anchor: pos2(x + 110.0, y + 70.0), pos: pos2(x, y), box_w: 100.0, text: "Confirm flashing lap at sill and jamb, typ.".into(), size: 10.0, leaders: vec![] },
@@ -7366,7 +7391,8 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_frames() {
-        let mut app = busy_app();
+        let n = std::env::var("GREENLINE_BENCH_MARKUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let mut app = busy_app_with(n);
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         let frames = 60;

@@ -998,6 +998,7 @@ dependencies = [
  "eframe",
  "egui",
  "embed-resource",
+ "foldhash",
  "image",
  "pdfium-render",
  "quick-xml",

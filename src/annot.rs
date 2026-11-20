@@ -517,18 +517,22 @@ impl Annot {
     /// identity: a `Geom` holds on to the ones it was made with, so a pattern
     /// it saw can't be freed and another put in its place.
     fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        let f = |h: &mut std::collections::hash_map::DefaultHasher, v: f32| h.write_u32(v.to_bits());
-        let p = |h: &mut std::collections::hash_map::DefaultHasher, q: Pos2| {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        type H = foldhash::quality::FoldHasher<'static>;
+        // A fast, well-mixed 64-bit hash, seeded the same every run (it's asked
+        // for several times a frame per markup, so SipHash showed in profiles).
+        static SEED: foldhash::quality::FixedState = foldhash::quality::FixedState::with_seed(0x9e37_79b9_7f4a_7c15);
+        let mut h: H = SEED.build_hasher();
+        let f = |h: &mut H, v: f32| h.write_u32(v.to_bits());
+        let p = |h: &mut H, q: Pos2| {
             f(h, q.x);
             f(h, q.y);
         };
-        let r = |h: &mut std::collections::hash_map::DefaultHasher, r: Rect| {
+        let r = |h: &mut H, r: Rect| {
             p(h, r.min);
             p(h, r.max);
         };
-        let pts = |h: &mut std::collections::hash_map::DefaultHasher, v: &[Pos2]| {
+        let pts = |h: &mut H, v: &[Pos2]| {
             h.write_usize(v.len());
             v.iter().for_each(|q| p(h, *q));
         };
