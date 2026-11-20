@@ -23,7 +23,12 @@ pub fn install(ctx: &egui::Context, pref: ThemePreference) {
 pub fn add_font(fonts: &mut egui::FontDefinitions) {
     let data = egui::FontData::from_static(include_bytes!("../assets/fonts/Montserrat-Regular.ttf"));
     fonts.font_data.insert("montserrat".into(), std::sync::Arc::new(data));
-    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "montserrat".into());
+    let prop = fonts.families.entry(FontFamily::Proportional).or_default();
+    prop.insert(0, "montserrat".into());
+    // Symbols none of those have (● on an unsaved tab, say): egui's monospace font has many.
+    if !prop.iter().any(|f| f == "Hack") {
+        prop.push("Hack".into());
+    }
 }
 
 /// Brand green for marks on the UI (current page, markup counts), stepped

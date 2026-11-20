@@ -28,11 +28,12 @@ fn worker_opens_renders_and_reuses_renders_for_thumbnails() {
     // render, then its thumbnail shrunk from it.
     {
         let mut keep = w.keep.lock().unwrap();
-        keep.base.insert(0);
+        keep.base.insert((7, 0));
         keep.thumbs.insert(0);
         keep.thumbs_missing.insert(0);
+        keep.thumbs_generation = 1;
     }
-    w.send(Req::Render { generation: 1, page: 0, scale: 1.0, origin: [0, 0], size: [1224, 792], layer: Layer::Base });
+    w.send(Req::Render { generation: 1, view: 7, page: 0, scale: 1.0, origin: [0, 0], size: [1224, 792], layer: Layer::Base });
     let Resp::Rendered { layer: Layer::Base, image, .. } = next(&w) else { panic!("base") };
     assert_eq!(image.size, [1224, 792]);
     assert!(image.pixels.iter().all(|c| *c == egui::Color32::WHITE), "a blank page renders white and opaque");
@@ -42,15 +43,15 @@ fn worker_opens_renders_and_reuses_renders_for_thumbnails() {
 
     // Asked for again (the sidebar dropped it, say): answered from the one made.
     let t = Instant::now();
-    w.send(Req::Render { generation: 1, page: 0, scale, origin: [0, 0], size, layer: Layer::Thumb });
+    w.send(Req::Render { generation: 1, view: 7, page: 0, scale, origin: [0, 0], size, layer: Layer::Thumb });
     let Resp::Rendered { layer: Layer::Thumb, image, .. } = next(&w) else { panic!("thumbnail again") };
     assert_eq!(image.size, size);
     assert!(t.elapsed() < Duration::from_secs(1));
 
     // Tiles come in the order asked for; tiles no longer wanted are dropped.
-    w.keep.lock().unwrap().tiles = [(1, [0, 0]), (1, [512, 0])].into_iter().collect();
+    w.keep.lock().unwrap().tiles = [(7, 1, [0, 0]), (7, 1, [512, 0])].into_iter().collect();
     for origin in [[512, 0], [0, 0], [1024, 0]] {
-        w.send(Req::Render { generation: 1, page: 1, scale: 2.0, origin, size: [512, 512], layer: Layer::Patch });
+        w.send(Req::Render { generation: 1, view: 7, page: 1, scale: 2.0, origin, size: [512, 512], layer: Layer::Patch });
     }
     let mut got = Vec::new();
     while let Ok(r) = w.rx.recv_timeout(Duration::from_millis(1500)) {

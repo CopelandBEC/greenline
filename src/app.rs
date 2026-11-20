@@ -171,8 +171,10 @@ struct Mods {
 type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
 
 /// A document in a background tab: everything that belongs to it, parked while
-/// another tab is shown. Its rendered pages are dropped (re-rendered on return);
-/// the worker keeps the PDF open under `generation`.
+/// another tab is shown, with its view. The worker keeps the PDF open under
+/// `generation`. (`App::swap_doc` and `App::swap_view` trade these fields with
+/// the shown document's.)
+#[derive(Default)]
 struct Parked {
     path: Option<PathBuf>,
     generation: u64,
@@ -180,8 +182,6 @@ struct Parked {
     page_y: Vec<f32>,
     doc_w: f32,
     doc_h: f32,
-    zoom: f32,
-    offset: Vec2,
     props: Proposals,
     props_path: Option<PathBuf>,
     markups_file: Option<PathBuf>,
@@ -203,24 +203,76 @@ struct Parked {
     read_only: bool,
     read_only_why: String,
     failed: HashSet<usize>,
-    /// Loaded while in the background: fit it when first shown.
-    fit_pending: bool,
-    /// Its pages as last rendered, so switching back shows them at once (kept
-    /// for the most recently parked tabs only; see `TEX_TABS`).
-    tex: Option<ParkedTex>,
+    thumbs: HashMap<usize, PageTex>,
+    req_thumb: HashSet<usize>,
+    /// Where it was looking, and its pages as rendered then (kept for the most
+    /// recently parked tabs only, see `TEX_TABS`, so switching back is instant).
+    view: View,
     /// When it was parked, for keeping textures for the latest few.
     parked_seq: u64,
 }
 
-/// A parked tab's rendered pages and thumbnails.
-struct ParkedTex {
+/// One view of a document: where it looks, and what's rendered for it. The
+/// shown view's fields live in `App`; split screen's other pane and parked
+/// tabs keep theirs here.
+struct View {
+    /// Tells this view's renders from another's (both panes may show one document).
+    id: u64,
+    zoom: f32,
+    offset: Vec2,
+    canvas: Rect,
+    fit_pending: bool,
+    last_view_change: f64,
+    view_key: (f32, Vec2),
+    scroll_streak: (f64, f64, f32),
     base: HashMap<usize, PageTex>,
     patch: HashMap<TileKey, PageTex>,
-    thumbs: HashMap<usize, PageTex>,
+    req_base: HashMap<usize, f32>,
+    req_patch: HashMap<TileKey, f32>,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            canvas: Rect::NOTHING,
+            fit_pending: false,
+            last_view_change: 0.0,
+            view_key: (0.0, Vec2::ZERO),
+            scroll_streak: (0.0, 0.0, 0.0),
+            base: HashMap::new(),
+            patch: HashMap::new(),
+            req_base: HashMap::new(),
+            req_patch: HashMap::new(),
+        }
+    }
+}
+
+/// Split screen's other pane: the shown document at a place of its own, or
+/// another tab's document (whose view is then in its `Parked`).
+struct Pane {
+    /// `None`: the shown document. `Some`: the generation of the tab it shows.
+    doc: Option<u64>,
+    /// Its view of the shown document (unused while it shows another tab).
+    view: View,
 }
 
 /// Background tabs that keep their rendered pages.
 const TEX_TABS: usize = 2;
+
+/// What the shown views want rendered this frame: what the worker should
+/// keep (`render::Keep`) and the requests to send.
+#[derive(Default)]
+struct Wanted {
+    base: HashSet<(u64, usize)>,
+    tiles: HashSet<(u64, usize, [i32; 2])>,
+    thumbs: HashSet<usize>,
+    thumbs_missing: HashSet<usize>,
+    thumbs_generation: u64,
+    reqs: Vec<Req>,
+}
 
 /// An open document's place in the tab strip; the shown tab's state is in `App`.
 struct Tab {
@@ -461,6 +513,15 @@ pub struct App {
     saver: sidecar::Saver,
     /// Tabs parked so far (`Parked::parked_seq`).
     parked_seq: u64,
+    /// The shown view's id (`View::id`), and the last handed out.
+    view_id: u64,
+    next_view_id: u64,
+    /// Split screen's other pane, when the screen is split.
+    other: Option<Pane>,
+    /// Whether the shown (active) pane is the left one.
+    active_left: bool,
+    /// Painting the other pane (with its state swapped in): no gestures or previews.
+    inactive: bool,
     /// Number of the latest save asked for; only its outcome counts.
     save_seq: u64,
     lock: Option<std::fs::File>,
@@ -603,6 +664,11 @@ impl App {
             text_k: None,
             saver: sidecar::Saver::spawn(|| {}),
             parked_seq: 0,
+            view_id: 1,
+            next_view_id: 1,
+            other: None,
+            active_left: true,
+            inactive: false,
             save_seq: 0,
             lock: None,
             read_only: false,
@@ -627,90 +693,30 @@ impl App {
         }
         self.commit_edit();
         self.save_sidecar();
-        let p = Parked {
-            path: std::mem::take(&mut self.path),
-            generation: self.generation,
-            pages: std::mem::take(&mut self.pages),
-            page_y: std::mem::take(&mut self.page_y),
-            doc_w: self.doc_w,
-            doc_h: self.doc_h,
-            zoom: self.zoom,
-            offset: self.offset,
-            props: std::mem::take(&mut self.props),
-            props_path: std::mem::take(&mut self.props_path),
-            markups_file: std::mem::take(&mut self.markups_file),
-            accepted: std::mem::take(&mut self.accepted),
-            props_mtime: std::mem::take(&mut self.props_mtime),
-            overview_cursor: self.overview_cursor,
-            annots: std::mem::take(&mut self.annots),
-            scales: std::mem::take(&mut self.scales),
-            scale_found: std::mem::take(&mut self.scale_win.found),
-            scale_asked: std::mem::take(&mut self.scale_win.asked),
-            find: std::mem::take(&mut self.find),
-            find_from: self.find_from,
-            next_id: self.next_id,
-            undo: std::mem::take(&mut self.undo),
-            redo: std::mem::take(&mut self.redo),
-            dirty: self.dirty,
-            selected: std::mem::take(&mut self.selected),
-            lock: std::mem::take(&mut self.lock),
-            read_only: self.read_only,
-            read_only_why: std::mem::take(&mut self.read_only_why),
-            failed: std::mem::take(&mut self.failed),
-            fit_pending: self.fit_pending,
-            tex: Some(ParkedTex { base: std::mem::take(&mut self.base), patch: std::mem::take(&mut self.patch), thumbs: std::mem::take(&mut self.thumbs) }),
-            parked_seq: {
-                self.parked_seq += 1;
-                self.parked_seq
-            },
-        };
-        let mut p = p;
+        let mut p = Box::<Parked>::default();
+        self.swap_doc(&mut p);
+        self.swap_view(&mut p.view);
+        self.parked_seq += 1;
+        p.parked_seq = self.parked_seq;
         // Scale suggestions asked for but not back yet are asked again when it's shown.
-        p.scale_asked.retain(|pg| p.scale_found.contains_key(pg));
-        self.dirty = false;
-        self.read_only = false;
+        let found = &p.scale_found;
+        p.scale_asked.retain(|pg| found.contains_key(pg));
+        // Renders and thumbnails on their way are dropped (they're for a view no longer shown): ask again when shown.
+        p.view.req_base.clear();
+        p.view.req_patch.clear();
+        p.req_thumb.clear();
+        // What's left is a fresh, empty document and view.
         self.next_id = 1;
+        self.view_id = self.new_view_id();
         self.drop_view_state();
-        Box::new(p)
+        p
     }
 
     /// Makes a parked document the shown one.
-    fn unpark(&mut self, p: Box<Parked>) {
-        let p = *p;
+    fn unpark(&mut self, mut p: Box<Parked>) {
         self.drop_view_state();
-        self.path = p.path;
-        self.generation = p.generation;
-        self.pages = p.pages;
-        self.page_y = p.page_y;
-        self.doc_w = p.doc_w;
-        self.doc_h = p.doc_h;
-        self.zoom = p.zoom;
-        self.offset = p.offset;
-        self.props = p.props;
-        self.props_path = p.props_path;
-        self.markups_file = p.markups_file;
-        self.accepted = p.accepted;
-        self.props_mtime = p.props_mtime;
-        self.overview_cursor = p.overview_cursor;
-        self.annots = p.annots;
-        self.scales = p.scales;
-        self.scale_win.found = p.scale_found;
-        self.scale_win.asked = p.scale_asked;
-        self.find = p.find;
-        self.find_from = p.find_from;
-        self.next_id = p.next_id;
-        self.undo = p.undo;
-        self.redo = p.redo;
-        self.dirty = p.dirty;
-        self.selected = p.selected;
-        self.lock = p.lock;
-        self.read_only = p.read_only;
-        self.read_only_why = p.read_only_why;
-        self.failed = p.failed;
-        self.fit_pending = p.fit_pending;
-        if let Some(t) = p.tex {
-            (self.base, self.patch, self.thumbs) = (t.base, t.patch, t.thumbs);
-        }
+        self.swap_doc(&mut p);
+        self.swap_view(&mut p.view);
         // Find results are for this document's search; let the worker know which one is
         // wanted, and pick up a search that was cut short by the switch.
         if let Some(w) = &self.worker {
@@ -719,6 +725,62 @@ impl App {
         if self.find.open && self.find.pending > 0 {
             self.start_search();
         }
+    }
+
+    fn new_view_id(&mut self) -> u64 {
+        self.next_view_id += 1;
+        self.next_view_id
+    }
+
+    /// Trades the shown document (markups, selection, undo, lock...) for `p`'s.
+    fn swap_doc(&mut self, p: &mut Parked) {
+        use std::mem::swap;
+        swap(&mut self.path, &mut p.path);
+        swap(&mut self.generation, &mut p.generation);
+        swap(&mut self.pages, &mut p.pages);
+        swap(&mut self.page_y, &mut p.page_y);
+        swap(&mut self.doc_w, &mut p.doc_w);
+        swap(&mut self.doc_h, &mut p.doc_h);
+        swap(&mut self.props, &mut p.props);
+        swap(&mut self.props_path, &mut p.props_path);
+        swap(&mut self.markups_file, &mut p.markups_file);
+        swap(&mut self.accepted, &mut p.accepted);
+        swap(&mut self.props_mtime, &mut p.props_mtime);
+        swap(&mut self.overview_cursor, &mut p.overview_cursor);
+        swap(&mut self.annots, &mut p.annots);
+        swap(&mut self.scales, &mut p.scales);
+        swap(&mut self.scale_win.found, &mut p.scale_found);
+        swap(&mut self.scale_win.asked, &mut p.scale_asked);
+        swap(&mut self.find, &mut p.find);
+        swap(&mut self.find_from, &mut p.find_from);
+        swap(&mut self.next_id, &mut p.next_id);
+        swap(&mut self.undo, &mut p.undo);
+        swap(&mut self.redo, &mut p.redo);
+        swap(&mut self.dirty, &mut p.dirty);
+        swap(&mut self.selected, &mut p.selected);
+        swap(&mut self.lock, &mut p.lock);
+        swap(&mut self.read_only, &mut p.read_only);
+        swap(&mut self.read_only_why, &mut p.read_only_why);
+        swap(&mut self.failed, &mut p.failed);
+        swap(&mut self.thumbs, &mut p.thumbs);
+        swap(&mut self.req_thumb, &mut p.req_thumb);
+    }
+
+    /// Trades the shown view (zoom, place, rendered pages) for `v`.
+    fn swap_view(&mut self, v: &mut View) {
+        use std::mem::swap;
+        swap(&mut self.view_id, &mut v.id);
+        swap(&mut self.zoom, &mut v.zoom);
+        swap(&mut self.offset, &mut v.offset);
+        swap(&mut self.canvas, &mut v.canvas);
+        swap(&mut self.fit_pending, &mut v.fit_pending);
+        swap(&mut self.last_view_change, &mut v.last_view_change);
+        swap(&mut self.view_key, &mut v.view_key);
+        swap(&mut self.scroll_streak, &mut v.scroll_streak);
+        swap(&mut self.base, &mut v.base);
+        swap(&mut self.patch, &mut v.patch);
+        swap(&mut self.req_base, &mut v.req_base);
+        swap(&mut self.req_patch, &mut v.req_patch);
     }
 
     /// Clears what's tied to the shown document's view: rendered pages, gestures in progress.
@@ -751,24 +813,35 @@ impl App {
         self.hatch_scale_pending = None;
     }
 
-    /// Lets go of rendered pages kept for background tabs beyond the latest `TEX_TABS`.
+    /// Lets go of rendered pages kept for background tabs beyond the latest
+    /// `TEX_TABS` (not the one split screen's other pane shows).
     fn trim_parked_tex(&mut self) {
-        let mut seqs: Vec<u64> = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter(|p| p.tex.is_some()).map(|p| p.parked_seq).collect();
+        let shown = self.other.as_ref().and_then(|p| p.doc);
+        let has = |p: &Parked| !p.view.base.is_empty() || !p.view.patch.is_empty() || !p.thumbs.is_empty();
+        let mut seqs: Vec<u64> = self.tabs.iter().filter_map(|t| t.parked.as_deref()).filter(|p| has(p) && Some(p.generation) != shown).map(|p| p.parked_seq).collect();
         seqs.sort_unstable_by(|a, b| b.cmp(a));
         let Some(&oldest_kept) = seqs.get(TEX_TABS.saturating_sub(1)) else { return };
         for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
-            if p.parked_seq < oldest_kept {
-                p.tex = None;
+            if p.parked_seq < oldest_kept && Some(p.generation) != shown {
+                p.view.base.clear();
+                p.view.patch.clear();
+                p.thumbs.clear();
             }
         }
     }
 
-    /// Shows tab `i`.
+    /// Shows tab `i` (in the active pane; if the other pane shows it, that pane becomes the active one).
     fn switch_tab(&mut self, i: usize) {
         if i == self.cur_tab || i >= self.tabs.len() {
             return;
         }
-        let parked = self.park();
+        let g = self.tabs[i].parked.as_ref().map(|p| p.generation);
+        if g.is_some() && self.other.as_ref().is_some_and(|p| p.doc == g) {
+            self.activate_other();
+            return;
+        }
+        let mut parked = self.park();
+        self.leaving_shown_doc(&mut parked);
         self.tabs[self.cur_tab].parked = Some(parked);
         self.trim_parked_tex();
         self.cur_tab = i;
@@ -806,6 +879,8 @@ impl App {
             }
             drop(p);
             self.tabs.remove(i);
+            // Split screen on another document: that one takes over, in its pane.
+            let beside = self.other.as_ref().and_then(|o| o.doc).and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
             if self.tabs.is_empty() {
                 self.tabs.push(Tab { parked: None });
                 self.cur_tab = 0;
@@ -814,17 +889,26 @@ impl App {
                 self.status = String::from("Ctrl+O to open a PDF (or drop one here)");
                 self.status_until = f64::INFINITY;
             } else {
-                self.cur_tab = i.min(self.tabs.len() - 1);
+                self.cur_tab = beside.unwrap_or(i.min(self.tabs.len() - 1));
                 if let Some(p) = self.tabs[self.cur_tab].parked.take() {
                     self.unpark(p);
                 }
+                if beside.is_some() {
+                    self.active_left = !self.active_left;
+                }
             }
+            self.reset_other_view();
             self.set_title();
         } else {
             // Parked: it was saved when parked; a failed save is retried once more here.
             let tab = self.tabs.remove(i);
             if i < self.cur_tab {
                 self.cur_tab -= 1;
+            }
+            // Shown in split screen's other pane: that pane shows this document again.
+            let g = tab.parked.as_ref().map(|p| p.generation);
+            if g.is_some() && self.other.as_ref().is_some_and(|o| o.doc == g) && !tab.parked.as_ref().is_some_and(|p| p.dirty && !p.read_only) {
+                self.reset_other_view();
             }
             if let (Some(p), Some(w)) = (tab.parked, &self.worker) {
                 if p.dirty && !p.read_only {
@@ -839,6 +923,17 @@ impl App {
                 }
                 w.send(Req::Close { generation: p.generation });
             }
+        }
+    }
+
+    /// Split screen's other pane back to a second view of the shown document,
+    /// where the shown view is (its document closed, say).
+    fn reset_other_view(&mut self) {
+        let id = self.new_view_id();
+        let (zoom, offset) = (self.zoom, self.offset);
+        if let Some(o) = self.other.as_mut() {
+            o.doc = None;
+            o.view = View { id, zoom, offset, fit_pending: true, ..Default::default() };
         }
     }
 
@@ -892,8 +987,19 @@ impl App {
                     if unsaved {
                         short.insert_str(0, "● ");
                     }
+                    // The one split screen's other pane shows.
+                    let beside = self.other.as_ref().and_then(|o| o.doc).is_some_and(|g| self.tabs[i].parked.as_ref().is_some_and(|p| p.generation == g));
+                    if beside {
+                        short.insert_str(0, "⬌ ");
+                    }
                     let on = i == self.cur_tab;
-                    let tip = if unsaved { format!("{name} — not saved yet (retrying)") } else { name.clone() };
+                    let tip = if unsaved {
+                        format!("{name} — not saved yet (retrying)")
+                    } else if beside {
+                        format!("{name} — in the other pane")
+                    } else {
+                        name.clone()
+                    };
                     let r = ui.add(egui::Button::selectable(on, short)).on_hover_text(tip);
                     if on && std::mem::take(&mut self.tab_scroll) {
                         r.scroll_to_me(None);
@@ -939,7 +1045,8 @@ impl App {
         self.tab_scroll = true;
         // Open beside what's shown, in a new tab.
         if self.path.is_some() {
-            let parked = self.park();
+            let mut parked = self.park();
+            self.leaving_shown_doc(&mut parked);
             self.tabs[self.cur_tab].parked = Some(parked);
             self.trim_parked_tex();
             self.tabs.insert(self.cur_tab + 1, Tab { parked: None });
@@ -1298,8 +1405,18 @@ impl App {
     /// Background saves that finished: the latest failing leaves the markups unsaved, retried in a few seconds.
     fn poll_saves(&mut self) {
         while let Ok((file, seq, result)) = self.saver.done.try_recv() {
-            // Another document's (its tab has been switched away from and saved since), or overtaken by a later save.
-            if Some(&file) != self.markups_file.as_ref() || seq != self.save_seq {
+            // A background tab's (split screen's panes swapped as it saved): unsaved again, so
+            // it's retried with the other background tabs.
+            if Some(&file) != self.markups_file.as_ref() {
+                if result.is_err() {
+                    if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.markups_file.as_ref() == Some(&file)) {
+                        p.dirty = true;
+                    }
+                }
+                continue;
+            }
+            // Overtaken by a later save.
+            if seq != self.save_seq {
                 continue;
             }
             if let Err(e) = result {
@@ -1350,7 +1467,7 @@ impl App {
                     if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
                         (p.page_y, p.doc_w, p.doc_h) = layout(&pages);
                         p.pages = pages;
-                        p.fit_pending = true;
+                        p.view.fit_pending = true;
                     }
                 }
                 Resp::OpenFailed { generation, error } if generation != self.generation => {
@@ -1364,41 +1481,17 @@ impl App {
                     self.status = format!("Could not open: {error}");
                     self.path = None;
                 }
-                Resp::Rendered { generation, page, scale, origin, layer, image } if generation == self.generation => {
-                    let size = image.size;
-                    let mip = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
-                    let opts = if layer == Layer::Patch { TextureOptions::LINEAR } else { mip };
-                    let tex = ctx.load_texture(format!("p{page}{layer:?}"), image, opts);
-                    let t = PageTex { tex, scale, origin, size };
-                    match layer {
-                        Layer::Patch => {
-                            let key = (page, origin, scale.to_bits());
-                            if self.req_patch.get(&key) == Some(&scale) {
-                                self.req_patch.remove(&key);
+                Resp::Rendered { generation, view, page, scale, origin, layer, image } => self.route_render(ctx, generation, view, page, scale, origin, layer, image),
+                Resp::RenderFailed { generation, view, page, layer, error } => {
+                    if generation == self.generation && view == self.view_id {
+                        self.render_failed(page, layer, error);
+                    } else {
+                        self.with_other(|app| {
+                            if generation == app.generation && view == app.view_id {
+                                app.render_failed(page, layer, error);
                             }
-                            self.patch.insert(key, t);
-                        }
-                        Layer::Base => {
-                            self.req_base.remove(&page);
-                            self.base.insert(page, t);
-                        }
-                        Layer::Thumb => {
-                            self.req_thumb.remove(&page);
-                            self.thumbs.insert(page, t);
-                        }
+                        });
                     }
-                }
-                Resp::RenderFailed { generation, page, layer, error } if generation == self.generation => {
-                    match layer {
-                        Layer::Patch => {
-                            self.req_patch.retain(|k, _| k.0 != page);
-                            true
-                        }
-                        Layer::Base => self.req_base.remove(&page).is_some(),
-                        Layer::Thumb => self.req_thumb.remove(&page),
-                    };
-                    self.failed.insert(page);
-                    self.toast(format!("Page {} failed to render: {error}", page + 1));
                 }
                 Resp::Exported(Ok((p, 0))) => self.toast(format!("Exported → {}", p.display())),
                 Resp::Exported(Ok((p, missing))) => {
@@ -1423,6 +1516,61 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// A render arrived: into the textures of the view it's for, the shown one
+    /// or split screen's other pane (thumbnails go by document). One for a view
+    /// no longer shown is dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn route_render(&mut self, ctx: &egui::Context, generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage>) {
+        if generation == self.generation && (view == self.view_id || layer == Layer::Thumb) {
+            self.take_render(ctx, page, scale, origin, layer, image);
+        } else {
+            self.with_other(|app| {
+                if generation == app.generation && (view == app.view_id || layer == Layer::Thumb) {
+                    app.take_render(ctx, page, scale, origin, layer, image);
+                }
+            });
+        }
+    }
+
+    /// A render for the shown view arrived: into its textures.
+    fn take_render(&mut self, ctx: &egui::Context, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage>) {
+        let size = image.size;
+        let opts = TextureOptions::LINEAR;
+        let tex = ctx.load_texture(format!("p{page}{layer:?}"), image, opts);
+        let t = PageTex { tex, scale, origin, size };
+        match layer {
+            Layer::Patch => {
+                let key = (page, origin, scale.to_bits());
+                if self.req_patch.get(&key) == Some(&scale) {
+                    self.req_patch.remove(&key);
+                }
+                self.patch.insert(key, t);
+            }
+            Layer::Base => {
+                self.req_base.remove(&page);
+                self.base.insert(page, t);
+            }
+            Layer::Thumb => {
+                self.req_thumb.remove(&page);
+                self.thumbs.insert(page, t);
+            }
+        }
+    }
+
+    fn render_failed(&mut self, page: usize, layer: Layer, error: String) {
+        match layer {
+            Layer::Patch => self.req_patch.retain(|k, _| k.0 != page),
+            Layer::Base => {
+                self.req_base.remove(&page);
+            }
+            Layer::Thumb => {
+                self.req_thumb.remove(&page);
+            }
+        }
+        self.failed.insert(page);
+        self.toast(format!("Page {} failed to render: {error}", page + 1));
     }
 
     // -----------------------------------------------------------------------
@@ -1680,7 +1828,7 @@ impl App {
                         if ui.add_enabled(any, egui::Button::new("⏷")).on_hover_text("Next (Enter, F3)").clicked() {
                             self.step_hit(1);
                         }
-                        if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                        if ui.button("×").on_hover_text("Close (Esc)").clicked() {
                             close = true;
                         }
                     });
@@ -1724,8 +1872,33 @@ impl App {
     // -----------------------------------------------------------------------
     // Rendering requests
 
-    fn request_renders(&mut self, ctx: &egui::Context, now: f64) {
+    /// Asks the worker for what the shown view (and split screen's other pane)
+    /// needs: first telling it what's still wanted, so it drops the rest, then
+    /// sending what's missing.
+    fn request_all_renders(&mut self, ctx: &egui::Context, now: f64) {
+        if self.worker.is_none() {
+            return;
+        }
+        let mut wanted = Wanted { thumbs_generation: self.generation, ..Default::default() };
+        self.request_renders(ctx, now, &mut wanted, true);
+        self.with_other(|app| app.request_renders(ctx, now, &mut wanted, false));
         let Some(w) = &self.worker else { return };
+        {
+            let mut keep = w.keep.lock().unwrap();
+            keep.base = wanted.base;
+            keep.tiles = wanted.tiles;
+            keep.thumbs = wanted.thumbs;
+            keep.thumbs_missing = wanted.thumbs_missing;
+            keep.thumbs_generation = wanted.thumbs_generation;
+        }
+        for r in wanted.reqs {
+            w.send(r);
+        }
+    }
+
+    /// What the shown view needs rendered, into `wanted`; with `thumbs`, the
+    /// sidebar's or overview's thumbnails too.
+    fn request_renders(&mut self, ctx: &egui::Context, now: f64, wanted: &mut Wanted, thumbs: bool) {
         if self.pages.is_empty() {
             return;
         }
@@ -1740,28 +1913,27 @@ impl App {
             }
         }
         want.sort_by_key(|&i| (i as i64 - cur as i64).abs());
-        if self.overview {
+        if self.overview && !self.inactive {
             want.clear();
         }
-        let mut thumbs_wanted = std::mem::take(&mut self.thumbs_wanted);
-        thumbs_wanted.retain(|&i| i < self.pages.len());
-        {
-            let mut keep = w.keep.lock().unwrap();
-            keep.base = want.iter().copied().collect();
-            keep.thumbs = thumbs_wanted.iter().copied().collect();
-            keep.thumbs_missing = thumbs_wanted.iter().copied().filter(|i| !self.thumbs.contains_key(i)).collect();
-        }
-        self.req_thumb.retain(|k| thumbs_wanted.contains(k));
-        for &i in &thumbs_wanted {
-            if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
-                continue;
+        wanted.base.extend(want.iter().map(|&i| (self.view_id, i)));
+        if thumbs {
+            let mut thumbs_wanted = std::mem::take(&mut self.thumbs_wanted);
+            thumbs_wanted.retain(|&i| i < self.pages.len());
+            wanted.thumbs.extend(thumbs_wanted.iter().copied());
+            wanted.thumbs_missing.extend(thumbs_wanted.iter().copied().filter(|i| !self.thumbs.contains_key(i)));
+            self.req_thumb.retain(|k| thumbs_wanted.contains(k));
+            for &i in &thumbs_wanted {
+                if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
+                    continue;
+                }
+                let (scale, size) = crate::render::thumb_size(self.pages[i]);
+                wanted.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
+                self.req_thumb.insert(i);
             }
-            let (scale, size) = crate::render::thumb_size(self.pages[i]);
-            w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
-            self.req_thumb.insert(i);
-        }
-        if self.thumbs.len() > MAX_THUMBS {
-            self.thumbs.retain(|k, _| thumbs_wanted.contains(k));
+            if self.thumbs.len() > MAX_THUMBS {
+                self.thumbs.retain(|k, _| thumbs_wanted.contains(k));
+            }
         }
         let keep_tex: HashSet<usize> = want.iter().flat_map(|&i| i.saturating_sub(2)..=i + 2).collect();
         if !self.overview {
@@ -1783,12 +1955,117 @@ impl App {
             let have = self.base.get(&i).map(|t| t.scale);
             if have != Some(scale) && self.req_base.get(&i) != Some(&scale) {
                 let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
-                w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Base });
+                wanted.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: i, scale, origin: [0, 0], size, layer: Layer::Base });
                 self.req_base.insert(i, scale);
             }
         }
 
-        self.request_tiles(ctx, now, need, &vis);
+        self.request_tiles(ctx, now, need, &vis, wanted);
+    }
+
+    /// Split screen on or off. The other pane starts as a second view of the
+    /// shown document, where this one is; pick a tab while it's active to show
+    /// another document there.
+    fn toggle_split(&mut self) {
+        if self.other.take().is_some() {
+            self.active_left = true;
+            return;
+        }
+        let view = View { id: self.new_view_id(), zoom: self.zoom, offset: self.offset, canvas: self.canvas, ..Default::default() };
+        self.other = Some(Pane { doc: None, view });
+        self.active_left = true;
+    }
+
+    /// Makes split screen's other pane the active one: keys, tools and the
+    /// sidebar go to it. A gesture under way in this one is finished first.
+    fn activate_other(&mut self) {
+        let Some(mut pane) = self.other.take() else { return };
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        self.commit_edit();
+        self.drag = Drag::None;
+        self.building = None;
+        let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
+        match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
+            Some((k, mut p)) => {
+                // Another document: the two trade places, this one into its tab.
+                self.autosave();
+                self.swap_doc(&mut p);
+                self.swap_view(&mut p.view);
+                pane.doc = Some(p.generation);
+                self.tabs[self.cur_tab].parked = Some(p);
+                self.cur_tab = k;
+                self.set_title();
+                if let Some(w) = &self.worker {
+                    w.keep.lock().unwrap().search = self.find.id;
+                }
+            }
+            None => {
+                pane.doc = None;
+                self.swap_view(&mut pane.view);
+            }
+        }
+        self.other = Some(pane);
+        self.active_left = !self.active_left;
+        self.sidebar_synced = None;
+    }
+
+    /// Draws split screen's other pane into `r`, and keeps its view in bounds.
+    fn paint_other(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        self.with_other(|app| {
+            app.inactive = true;
+            app.canvas = r;
+            if app.fit_pending && !app.pages.is_empty() && r.width() > 50.0 {
+                app.fit_pending = false;
+                app.fit_width();
+            }
+            app.clamp_offset();
+            if app.zoom != app.view_key.0 {
+                app.last_view_change = now;
+            }
+            app.view_key = (app.zoom, app.offset);
+            app.paint(ui);
+            app.inactive = false;
+        });
+    }
+
+    /// The document now shown is being left for another tab: with the screen
+    /// split on one document, the other pane keeps showing it, where it was.
+    fn leaving_shown_doc(&mut self, parked: &mut Parked) {
+        if let Some(pane) = self.other.as_mut().filter(|p| p.doc.is_none()) {
+            std::mem::swap(&mut parked.view, &mut pane.view);
+            pane.doc = Some(parked.generation);
+        }
+    }
+
+    /// Runs `f` with split screen's other pane swapped in as the shown one (its
+    /// view, and its document if another tab's), then swaps back. Nothing if
+    /// the screen isn't split.
+    fn with_other<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let mut pane = self.other.take()?;
+        let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
+        let r = match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
+            Some((k, mut p)) => {
+                self.swap_doc(&mut p);
+                self.swap_view(&mut p.view);
+                let r = f(self);
+                self.swap_view(&mut p.view);
+                self.swap_doc(&mut p);
+                self.tabs[k].parked = Some(p);
+                r
+            }
+            None => {
+                // Its tab has gone: it shows the shown document.
+                pane.doc = None;
+                self.swap_view(&mut pane.view);
+                let r = f(self);
+                self.swap_view(&mut pane.view);
+                r
+            }
+        };
+        self.other = Some(pane);
+        Some(r)
     }
 
     /// Sharp tiles over the view (and a ring round it) where the whole-page
@@ -1796,13 +2073,12 @@ impl App {
     /// keeps the tiles already made and asks only for new ones as they come
     /// into view; a new zoom waits until zooming pauses, the old tiles shown
     /// until the new ones cover the view.
-    fn request_tiles(&mut self, ctx: &egui::Context, now: f64, need: f32, vis: &[usize]) {
+    fn request_tiles(&mut self, ctx: &egui::Context, now: f64, need: f32, vis: &[usize], out: &mut Wanted) {
         let bits = need.to_bits();
         let zooming = now - self.last_view_change < 0.12;
         let wanted = self.wanted_tiles(need, vis);
-        let Some(w) = &self.worker else { return };
         let keys: HashSet<TileKey> = wanted.iter().map(|t| t.0).collect();
-        w.keep.lock().unwrap().tiles = keys.iter().map(|k| (k.0, k.1)).collect();
+        out.tiles.extend(keys.iter().map(|k| (self.view_id, k.0, k.1)));
         // Forget requests the worker will drop, so they're asked for again if wanted later.
         self.req_patch.retain(|k, _| keys.contains(k));
         // Tiles at another scale stay only while those at this one don't yet cover the view.
@@ -1822,7 +2098,7 @@ impl App {
         }
         for (key, size, _, _) in wanted {
             if !self.patch.contains_key(&key) && !self.req_patch.contains_key(&key) {
-                w.send(Req::Render { generation: self.generation, page: key.0, scale: need, origin: key.1, size, layer: Layer::Patch });
+                out.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: key.0, scale: need, origin: key.1, size, layer: Layer::Patch });
                 self.req_patch.insert(key, need);
             }
         }
@@ -2498,6 +2774,9 @@ impl App {
         }
         if pressed(Key::S) {
             self.show_sidebar = !self.show_sidebar;
+        }
+        if pressed(Key::Backslash) && !self.pages.is_empty() {
+            self.toggle_split();
         }
         if pressed(Key::M) {
             self.toggle_right_panel(false);
@@ -3867,7 +4146,7 @@ impl App {
                 if !g.bounds.intersects(shown) {
                     continue;
                 }
-                if Some(a.id) == self.editing {
+                if Some(a.id) == self.editing && !self.inactive {
                     // The editor draws the text and its underlines.
                     let mut plain = a.clone();
                     plain.style.underline = false;
@@ -3883,8 +4162,9 @@ impl App {
                 }
                 paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &g.prims, k, 1.0, &self.textures);
             }
-            // Live preview.
-            match &self.drag {
+            // Live preview (of a gesture in the active pane only).
+            let drag = if self.inactive { &Drag::None } else { &self.drag };
+            match drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
                     let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline) { square(*start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
@@ -3919,7 +4199,7 @@ impl App {
                 }
             }
             // The measurement being clicked out, running to the pointer.
-            if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i) {
+            if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i && !self.inactive) {
                 let mut pts = pts.clone();
                 if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
                     let h = self.screen_to_page(i, h);
@@ -3959,7 +4239,7 @@ impl App {
                 }
             }
             // Where a stamp being placed will land: the drag so far, or centred on the pointer.
-            if let Some(place) = &self.placing {
+            if let Some(place) = self.placing.as_ref().filter(|_| !self.inactive) {
                 let at = match &self.drag {
                     Drag::Place { page, start, cur } => (*page == i).then_some((*start, *cur)),
                     _ => self.hover.filter(|h| self.page_at(*h) == Some(i)).map(|h| self.screen_to_page(i, h)).map(|p| (p, p)),
@@ -3987,7 +4267,7 @@ impl App {
                 }
             }
             // Selection, plus what a marquee in progress would add.
-            let marquee = match &self.drag {
+            let marquee = match drag {
                 Drag::Marquee { page, start, cur } if *page == i => Some(Rect::from_two_pos(*start, *cur)),
                 _ => None,
             };
@@ -4170,6 +4450,10 @@ impl App {
                 }
                 if ui.selectable_label(self.overview, "Overview   (O)").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
                     self.toggle_overview();
+                    ui.close();
+                }
+                if ui.selectable_label(self.other.is_some(), "Split screen   (\\)").on_hover_text("Two places side by side: click a pane to work in it, and pick a tab to show another document there").clicked() && !self.pages.is_empty() {
+                    self.toggle_split();
                     ui.close();
                 }
                 if ui.selectable_label(self.show_markups, "Markups   (M)").on_hover_text("List of markups").clicked() {
@@ -5028,6 +5312,7 @@ impl App {
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
                     ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab"),
+                    ("\\", "Split screen: two places side by side; click a pane to work in it, pick a tab to show another document there"),
                     ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
                     ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
@@ -5153,7 +5438,25 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).fill(sheets)).show(ui, |ui| self.overview_grid(ui));
         } else {
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            let rect = ui.max_rect();
+            let full = ui.max_rect();
+            // Split screen: the active pane and the other, each with an id by its side.
+            let (left, right) = if self.other.is_some() {
+                let mid = (full.center().x).round();
+                (Rect::from_min_max(full.min, pos2(mid - 1.0, full.max.y)), Some(Rect::from_min_max(pos2(mid + 1.0, full.min.y), full.max)))
+            } else {
+                (full, None)
+            };
+            let pane_id = |left: bool| egui::Id::new(("greenline-pane", left));
+            // Pointing into the other pane (a press, a scroll or a zoom) makes it the active one.
+            if let Some(right) = right {
+                let other_rect = if self.active_left { right } else { left };
+                let r = ui.interact(other_rect, pane_id(!self.active_left), Sense::click_and_drag());
+                let wheel = r.hovered() && ui.input(|i| i.smooth_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0);
+                if (r.is_pointer_button_down_on() || wheel) && matches!(self.drag, Drag::None | Drag::Ignore) {
+                    self.activate_other();
+                }
+            }
+            let rect = if self.active_left { left } else { right.unwrap_or(full) };
             if rect != self.canvas {
                 self.canvas = rect;
             }
@@ -5161,7 +5464,7 @@ impl eframe::App for App {
                 self.fit_pending = false;
                 self.fit_width();
             }
-            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+            let resp = ui.interact(rect, pane_id(self.active_left), Sense::click_and_drag());
             self.shortcuts(&ctx);
             self.canvas_input(ui, &resp);
             self.clamp_offset();
@@ -5173,6 +5476,14 @@ impl eframe::App for App {
             if self.pages.is_empty() {
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), ui.visuals().text_color());
             }
+            if let Some(right) = right {
+                let other_rect = if self.active_left { right } else { left };
+                self.paint_other(ui, other_rect, now);
+                // The active pane outlined, so it's clear where keys and tools go.
+                let accent = crate::theme::accent(ui.visuals());
+                ui.painter().rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, accent), egui::StrokeKind::Inside);
+                ui.painter().line_segment([pos2(full.center().x.round(), full.min.y), pos2(full.center().x.round(), full.max.y)], Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+            }
         });
         }
         self.text_editor(&ctx);
@@ -5181,7 +5492,7 @@ impl eframe::App for App {
         self.find_bar(&ctx);
         self.new_doc_window(&ctx);
         self.help(&ctx);
-        self.request_renders(&ctx, now);
+        self.request_all_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
 
         let shown = (self.show_sidebar, self.show_markups, self.show_stamps);
@@ -6336,12 +6647,75 @@ mod tests {
             app.base.insert(0, tex(name));
             app.thumbs.insert(0, tex(name));
         }
-        let kept: Vec<bool> = app.tabs[..3].iter().map(|t| t.parked.as_ref().unwrap().tex.is_some()).collect();
+        let kept: Vec<bool> = app.tabs[..3].iter().map(|t| !t.parked.as_ref().unwrap().view.base.is_empty()).collect();
         assert_eq!(kept, [false, true, true], "the two latest background tabs keep theirs");
         app.switch_tab(2);
         assert!(app.base.contains_key(&0) && app.thumbs.contains_key(&0), "shown at once");
         app.switch_tab(0);
         assert!(app.base.is_empty(), "rendered again");
+    }
+
+    /// Split screen: a second view of the document, each pane with its own
+    /// place and renders; picking another tab in the active pane leaves the
+    /// first document in the other; clicking its tab (or pane) swaps them.
+    #[test]
+    fn split_screen_shows_two_places_or_two_documents() {
+        let ctx = egui::Context::default();
+        let img = || Arc::new(egui::ColorImage::filled([4, 4], Color32::WHITE));
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        let a = rect(&mut app, 100.0, 100.0);
+        app.zoom = 2.0;
+        app.toggle_split();
+        let (ga, va) = (app.generation, app.view_id);
+        let vb = app.other.as_ref().unwrap().view.id;
+        assert_ne!(va, vb, "two views, told apart");
+        assert_eq!(app.with_other(|o| (o.zoom, o.annots.len())), Some((2.0, 1)), "the same document, where this one is");
+        // Each pane's renders go to it.
+        app.route_render(&ctx, ga, vb, 0, 1.0, [0, 0], Layer::Base, img());
+        assert!(app.base.is_empty());
+        assert_eq!(app.with_other(|o| o.base.len()), Some(1));
+        app.route_render(&ctx, ga, va, 0, 1.0, [0, 0], Layer::Base, img());
+        assert_eq!(app.base.len(), 1);
+        // The other pane becomes the active one: views trade places, the document stays.
+        app.with_other(|o| o.zoom = 0.5);
+        app.activate_other();
+        assert!(!app.active_left);
+        assert_eq!((app.zoom, app.view_id), (0.5, vb));
+        assert_eq!(app.with_other(|o| (o.zoom, o.view_id)), Some((2.0, va)));
+        // A second document in the active pane: the first stays in the other, at its place.
+        let parked = app.park();
+        let mut parked = parked;
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 300.0, 300.0);
+        rect(&mut app, 400.0, 300.0);
+        assert_eq!(app.other.as_ref().unwrap().doc, Some(ga));
+        assert_eq!(app.with_other(|o| (o.path.clone(), o.annots.len(), o.zoom, o.view_id)), Some((Some(PathBuf::from("/a.pdf")), 1, 2.0, va)));
+        assert_eq!(app.annots.len(), 2, "b's markups here");
+        // Renders for a's view reach it in the other pane.
+        app.route_render(&ctx, ga, va, 0, 2.0, [0, 0], Layer::Base, img());
+        assert_eq!(app.with_other(|o| o.base.get(&0).map(|t| t.scale)), Some(Some(2.0)));
+        // Clicking a's tab makes its pane the active one; b goes to the other.
+        app.switch_tab(0);
+        assert_eq!((app.cur_tab, app.path.clone(), app.annots.len()), (0, Some(PathBuf::from("/a.pdf")), 1));
+        assert!(app.find(a).is_some());
+        assert_eq!(app.other.as_ref().unwrap().doc, Some(2));
+        assert_eq!(app.with_other(|o| o.annots.len()), Some(2));
+        // Closing b, shown in the other pane: that pane shows a again.
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.other.as_ref().unwrap().doc, None);
+        assert_eq!(app.with_other(|o| o.annots.len()), Some(1));
+        app.toggle_split();
+        assert!(app.other.is_none() && app.active_left);
     }
 
     #[test]
@@ -6377,7 +6751,7 @@ mod tests {
         if let Some(p) = app.tabs[0].parked.as_mut() {
             (p.page_y, p.doc_w, p.doc_h) = layout(&[vec2(612.0, 792.0), vec2(1224.0, 792.0)]);
             p.pages = vec![vec2(612.0, 792.0), vec2(1224.0, 792.0)];
-            p.fit_pending = true;
+            p.view.fit_pending = true;
         }
         app.switch_tab(0);
         assert_eq!(app.pages.len(), 2);

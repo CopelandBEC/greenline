@@ -18,15 +18,19 @@ pub enum Layer {
 }
 
 /// Pages the viewer still wants; queued renders for other pages are dropped.
+/// Whole-page renders and tiles are by view (`Req::Render::view`): split
+/// screen shows two, maybe of one document.
 #[derive(Default)]
 pub struct Keep {
-    pub base: HashSet<usize>,
+    pub base: HashSet<(u64, usize)>,
+    /// Thumbnails, of the document `thumbs_generation`.
     pub thumbs: HashSet<usize>,
+    pub thumbs_generation: u64,
     /// Of those, the ones the viewer has no thumbnail for yet: a whole-page
     /// render of one is shrunk into its thumbnail.
     pub thumbs_missing: HashSet<usize>,
-    /// Sharp tiles over the view (page, top-left pixel); others queued are dropped.
-    pub tiles: HashSet<(usize, [i32; 2])>,
+    /// Sharp tiles over the view (view, page, top-left pixel); others queued are dropped.
+    pub tiles: HashSet<(u64, usize, [i32; 2])>,
     /// The search still wanted; page searches for older ones are dropped.
     pub search: u64,
 }
@@ -35,8 +39,8 @@ pub enum Req {
     Open { generation: u64, path: PathBuf },
     /// A tab closed: let its document go.
     Close { generation: u64 },
-    /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
-    Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
+    /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt, for view `view`.
+    Render { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
@@ -50,8 +54,8 @@ pub enum Req {
 pub enum Resp {
     Opened { generation: u64, pages: Vec<Vec2> },
     OpenFailed { generation: u64, error: String },
-    Rendered { generation: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage> },
-    RenderFailed { generation: u64, page: usize, layer: Layer, error: String },
+    Rendered { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage> },
+    RenderFailed { generation: u64, view: u64, page: usize, layer: Layer, error: String },
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
     PageText { generation: u64, page: usize, text: String },
@@ -154,12 +158,12 @@ fn run(
                     Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
                 }
             }
-            Req::Render { generation, page, scale, origin, size, layer } => {
+            Req::Render { generation, view, page, scale, origin, size, layer } => {
                 let Some(d) = docs.get(&generation) else { continue };
                 // A thumbnail made from this page's last whole-page render costs nothing.
                 if layer == Layer::Thumb {
                     if let Some(image) = thumbs.get(generation, page, size) {
-                        if tx.send(Resp::Rendered { generation, page, scale, origin, layer, image }).is_err() {
+                        if tx.send(Resp::Rendered { generation, view, page, scale, origin, layer, image }).is_err() {
                             return;
                         }
                         ctx.request_repaint();
@@ -170,16 +174,20 @@ fn run(
                 match rendered {
                     Ok((image, page_size)) => {
                         let image = Arc::new(image);
-                        if tx.send(Resp::Rendered { generation, page, scale, origin, layer, image: image.clone() }).is_err() {
+                        if tx.send(Resp::Rendered { generation, view, page, scale, origin, layer, image: image.clone() }).is_err() {
                             return;
                         }
                         ctx.request_repaint();
                         // A thumbnail the sidebar or overview is waiting for, from this
                         // whole-page render (after sending it, so the view isn't kept waiting).
-                        if layer == Layer::Base && keep.lock().unwrap().thumbs_missing.contains(&page) {
+                        let wanted = {
+                            let k = keep.lock().unwrap();
+                            k.thumbs_generation == generation && k.thumbs_missing.contains(&page)
+                        };
+                        if layer == Layer::Base && wanted {
                             let (thumb_scale, thumb_size) = thumb_size(page_size);
                             if let Some(thumb) = thumbs.add(generation, page, &image, thumb_size) {
-                                if tx.send(Resp::Rendered { generation, page, scale: thumb_scale, origin: [0, 0], layer: Layer::Thumb, image: thumb }).is_err() {
+                                if tx.send(Resp::Rendered { generation, view, page, scale: thumb_scale, origin: [0, 0], layer: Layer::Thumb, image: thumb }).is_err() {
                                     return;
                                 }
                                 ctx.request_repaint();
@@ -187,7 +195,7 @@ fn run(
                         }
                         continue;
                     }
-                    Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
+                    Err(e) => Resp::RenderFailed { generation, view, page, layer, error: e.to_string() },
                 }
             }
             Req::PageText { generation, page } => {
@@ -237,8 +245,8 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut 
     let mut seen = HashSet::new();
     let mut kept = VecDeque::new();
     while let Some(r) = queue.pop_back() {
-        if let Req::Render { page, layer, origin, .. } = &r {
-            if !seen.insert((*page, *layer, *origin)) {
+        if let Req::Render { view, page, layer, origin, .. } = &r {
+            if !seen.insert((*view, *page, *layer, *origin)) {
                 continue;
             }
         }
@@ -247,9 +255,9 @@ fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut 
     *queue = kept;
     let keep = keep.lock().unwrap();
     queue.retain(|r| match r {
-        Req::Render { page, layer: Layer::Base, .. } => keep.base.contains(page),
-        Req::Render { page, layer: Layer::Thumb, .. } => keep.thumbs.contains(page),
-        Req::Render { page, layer: Layer::Patch, origin, .. } => keep.tiles.contains(&(*page, *origin)),
+        Req::Render { view, page, layer: Layer::Base, .. } => keep.base.contains(&(*view, *page)),
+        Req::Render { generation, page, layer: Layer::Thumb, .. } => *generation == keep.thumbs_generation && keep.thumbs.contains(page),
+        Req::Render { view, page, layer: Layer::Patch, origin, .. } => keep.tiles.contains(&(*view, *page, *origin)),
         _ => true,
     });
     // Tiles in the order asked for: the viewer asks for the middle of the view first.
@@ -1052,10 +1060,10 @@ pub(crate) mod tests {
     /// A search takes turns with thumbnails, behind base renders; a stale one is dropped.
     #[test]
     fn searches_share_the_worker() {
-        let keep = Mutex::new(Keep { base: HashSet::from([0]), thumbs: HashSet::from([1, 2]), search: 7, ..Default::default() });
-        let thumb = |page| Req::Render { generation: 1, page, scale: 0.1, origin: [0, 0], size: [10, 10], layer: Layer::Thumb };
+        let keep = Mutex::new(Keep { base: HashSet::from([(1, 0)]), thumbs: HashSet::from([1, 2]), thumbs_generation: 1, search: 7, ..Default::default() });
+        let thumb = |page| Req::Render { generation: 1, view: 0, page, scale: 0.1, origin: [0, 0], size: [10, 10], layer: Layer::Thumb };
         let search = |id| Req::Search { generation: 1, id, pages: VecDeque::from([0, 1, 2]), query: "x".into() };
-        let mut q = VecDeque::from([search(6), thumb(1), thumb(2), search(7), Req::Render { generation: 1, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base }]);
+        let mut q = VecDeque::from([search(6), thumb(1), thumb(2), search(7), Req::Render { generation: 1, view: 1, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base }]);
         let mut turn = false;
         let mut order = Vec::new();
         while let Some(r) = next_request(&mut q, &keep, &mut turn) {
