@@ -415,6 +415,14 @@ pub struct App {
     text_format: [bool; 3],
     /// Line types and hatches to pick from.
     patterns: patterns::Library,
+    /// The library being read in the background.
+    patterns_rx: Option<mpsc::Receiver<patterns::Library>>,
+    /// The image decoder thread's queue (started when first needed).
+    decoder: Option<mpsc::Sender<String>>,
+    /// Images decoded for textures, by stored name.
+    decoding: (mpsc::Sender<(String, Result<egui::ColorImage, String>)>, mpsc::Receiver<(String, Result<egui::ColorImage, String>)>),
+    /// Wakes the window when background work finishes (none in tests).
+    repaint: Option<egui::Context>,
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -479,6 +487,7 @@ impl App {
         let mut app = Self::with(worker, status, prefs);
         let ctx = cc.egui_ctx.clone();
         app.saver = sidecar::Saver::spawn(move || ctx.request_repaint());
+        app.repaint = Some(cc.egui_ctx.clone());
         app.library = stamps::Library::load();
         app.reload_patterns();
         if let Some(p) = path {
@@ -563,7 +572,11 @@ impl App {
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
             text_format: [false; 3],
-            patterns: patterns::Library::default(),
+            patterns: patterns::Library::builtins(),
+            patterns_rx: None,
+            decoder: None,
+            decoding: mpsc::channel(),
+            repaint: None,
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -1228,8 +1241,26 @@ impl App {
     }
 
     /// Rereads the pattern library (built-ins, own, shared folder).
+    /// Rereads the pattern library on a thread of its own (the shared folder may
+    /// be on a slow network drive); the pickers show it when it's in.
     fn reload_patterns(&mut self) {
-        self.patterns = patterns::Library::load(self.prefs.pattern_dir.as_deref());
+        let (tx, rx) = mpsc::channel();
+        let dir = self.prefs.pattern_dir.clone();
+        let ctx = self.repaint.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(patterns::Library::load(dir.as_deref()));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.patterns_rx = Some(rx);
+    }
+
+    /// A pattern library read by `reload_patterns`, once it's in.
+    fn poll_patterns(&mut self) {
+        let Some(lib) = self.patterns_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.patterns_rx = None;
+        self.patterns = lib;
         let n = self.patterns.line_types.len() + self.patterns.hatches.len();
         if let Some(p) = self.patterns.problems.first() {
             let more = self.patterns.problems.len() - 1;
@@ -3693,14 +3724,36 @@ impl App {
             .filter(|n| !self.textures.contains_key(*n) && !self.tex_failed.contains(*n))
             .cloned()
             .collect();
+        // Decoded on threads of their own (a photo takes a while); a pale square
+        // stands in meanwhile.
         for name in names {
-            match stamps::decode(&name) {
-                Ok(img) => {
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            let blank = egui::ColorImage::filled([1, 1], Color32::from_gray(235));
+            self.textures.insert(name.clone(), ctx.load_texture(format!("img-{name}"), blank, TextureOptions::LINEAR));
+            // One decoder thread, in turn: a document with many photos mustn't decode them all at once.
+            let decoder = self.decoder.get_or_insert_with(|| {
+                let (tx, rx) = mpsc::channel::<String>();
+                let (done, ctx) = (self.decoding.0.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    for name in rx {
+                        let img = stamps::decode(&name).map(|img| egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())).map_err(|e| e.to_string());
+                        if done.send((name, img)).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+                tx
+            });
+            let _ = decoder.send(name);
+        }
+        while let Ok((name, img)) = self.decoding.1.try_recv() {
+            match img {
+                Ok(ci) => {
                     let opts = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
                     self.textures.insert(name.clone(), ctx.load_texture(format!("img-{name}"), ci, opts));
                 }
                 Err(e) => {
+                    self.textures.remove(&name);
                     self.tex_failed.insert(name);
                     self.toast(format!("Stamp image missing: {e}"));
                 }
@@ -4967,6 +5020,7 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.poll_worker(&ctx);
         self.poll_dialog();
+        self.poll_patterns();
         while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
             self.picture_ready(stored, target, generation);
         }
