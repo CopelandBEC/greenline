@@ -4598,6 +4598,9 @@ impl App {
                     .margin(egui::Margin::ZERO)
                     .desired_width(width.max(20.0))
                     .desired_rows(1)
+                    // Its row height sizes the editor and the caret, even with a layouter
+                    // (which still picks each word's face; the styled faces share this height).
+                    .font(FontId::new(fs, helv()))
                     .layouter(&mut layouter)
                     .show(ui)
             })
@@ -7509,6 +7512,29 @@ mod tests {
         app.scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
         app.show_markups = true;
         app
+    }
+
+    /// The note editor is a line of the note's own text high, caret and all,
+    /// zoomed out or in: not a line of menu text.
+    #[test]
+    fn note_editor_is_sized_to_the_note() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        for zoom in [0.5, 3.0] {
+            let mut app = app();
+            app.zoom = zoom;
+            let id = callout(&mut app, pos2(50.0, 50.0), pos2(200.0, 200.0));
+            app.start_edit(id);
+            let generation = app.generation;
+            for _ in 0..2 {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 900.0))), ..Default::default() };
+                ctx.run_ui(input, |ui| app.text_editor(ui.ctx())).textures_delta.clear();
+            }
+            let fs = (12.0 * zoom * app.text_k.unwrap_or((1.0, 0.8)).0).max(6.0);
+            let row = ctx.fonts_mut(|f| f.row_height(&FontId::new(fs, helv())));
+            let r = ctx.read_response(egui::Id::new(("greenline-edit", generation, id))).expect("the editor").rect;
+            assert!((r.height() - row).abs() < 1.0, "at {zoom}x: {} high for a {row} line", r.height());
+        }
     }
 
     /// cargo test --release --lib bench_frames -- --ignored --nocapture
