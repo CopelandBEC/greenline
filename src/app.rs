@@ -1531,7 +1531,7 @@ impl App {
                         if ui.add_enabled(any, egui::Button::new("⏷")).on_hover_text("Next (Enter, F3)").clicked() {
                             self.step_hit(1);
                         }
-                        if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                        if ui.button("×").on_hover_text("Close (Esc)").clicked() {
                             close = true;
                         }
                     });
