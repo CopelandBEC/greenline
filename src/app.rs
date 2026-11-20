@@ -195,7 +195,22 @@ struct Parked {
     failed: HashSet<usize>,
     /// Loaded while in the background: fit it when first shown.
     fit_pending: bool,
+    /// Its pages as last rendered, so switching back shows them at once (kept
+    /// for the most recently parked tabs only; see `TEX_TABS`).
+    tex: Option<ParkedTex>,
+    /// When it was parked, for keeping textures for the latest few.
+    parked_seq: u64,
 }
+
+/// A parked tab's rendered pages and thumbnails.
+struct ParkedTex {
+    base: HashMap<usize, PageTex>,
+    patch: HashMap<usize, PageTex>,
+    thumbs: HashMap<usize, PageTex>,
+}
+
+/// Background tabs that keep their rendered pages.
+const TEX_TABS: usize = 2;
 
 /// An open document's place in the tab strip; the shown tab's state is in `App`.
 struct Tab {
@@ -417,6 +432,12 @@ pub struct App {
     /// and its baseline offset as a fraction of the font size.
     text_k: Option<(f32, f32)>,
 
+    /// Writes markups files off the UI thread.
+    saver: sidecar::Saver,
+    /// Tabs parked so far (`Parked::parked_seq`).
+    parked_seq: u64,
+    /// Number of the latest save asked for; only its outcome counts.
+    save_seq: u64,
     lock: Option<std::fs::File>,
     read_only: bool,
     /// Shown while `read_only`: why markups aren't being autosaved.
@@ -443,6 +464,8 @@ impl App {
             Err(e) => (None, format!("PDFium failed to load: {e}")),
         };
         let mut app = Self::with(worker, status, prefs);
+        let ctx = cc.egui_ctx.clone();
+        app.saver = sidecar::Saver::spawn(move || ctx.request_repaint());
         app.library = stamps::Library::load();
         app.reload_patterns();
         if let Some(p) = path {
@@ -546,6 +569,9 @@ impl App {
             copy_pages: String::new(),
             renaming: None,
             text_k: None,
+            saver: sidecar::Saver::spawn(|| {}),
+            parked_seq: 0,
+            save_seq: 0,
             lock: None,
             read_only: false,
             read_only_why: String::new(),
@@ -600,6 +626,11 @@ impl App {
             read_only_why: std::mem::take(&mut self.read_only_why),
             failed: std::mem::take(&mut self.failed),
             fit_pending: self.fit_pending,
+            tex: Some(ParkedTex { base: std::mem::take(&mut self.base), patch: std::mem::take(&mut self.patch), thumbs: std::mem::take(&mut self.thumbs) }),
+            parked_seq: {
+                self.parked_seq += 1;
+                self.parked_seq
+            },
         };
         let mut p = p;
         // Scale suggestions asked for but not back yet are asked again when it's shown.
@@ -645,6 +676,9 @@ impl App {
         self.read_only_why = p.read_only_why;
         self.failed = p.failed;
         self.fit_pending = p.fit_pending;
+        if let Some(t) = p.tex {
+            (self.base, self.patch, self.thumbs) = (t.base, t.patch, t.thumbs);
+        }
         // Find results are for this document's search; let the worker know which one is
         // wanted, and pick up a search that was cut short by the switch.
         if let Some(w) = &self.worker {
@@ -685,6 +719,18 @@ impl App {
         self.hatch_scale_pending = None;
     }
 
+    /// Lets go of rendered pages kept for background tabs beyond the latest `TEX_TABS`.
+    fn trim_parked_tex(&mut self) {
+        let mut seqs: Vec<u64> = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter(|p| p.tex.is_some()).map(|p| p.parked_seq).collect();
+        seqs.sort_unstable_by(|a, b| b.cmp(a));
+        let Some(&oldest_kept) = seqs.get(TEX_TABS.saturating_sub(1)) else { return };
+        for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
+            if p.parked_seq < oldest_kept {
+                p.tex = None;
+            }
+        }
+    }
+
     /// Shows tab `i`.
     fn switch_tab(&mut self, i: usize) {
         if i == self.cur_tab || i >= self.tabs.len() {
@@ -692,6 +738,7 @@ impl App {
         }
         let parked = self.park();
         self.tabs[self.cur_tab].parked = Some(parked);
+        self.trim_parked_tex();
         self.cur_tab = i;
         if let Some(p) = self.tabs[i].parked.take() {
             self.unpark(p);
@@ -781,6 +828,7 @@ impl App {
                 p.dirty = false;
                 continue;
             };
+            self.saver.flush();
             match sidecar::save_file(f, pdf, &p.annots, &p.scales, &p.accepted) {
                 Ok(()) => p.dirty = false,
                 Err(e) => failed = Some(format!("AUTOSAVE FAILED for {}: {e}", pdf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
@@ -861,6 +909,7 @@ impl App {
         if self.path.is_some() {
             let parked = self.park();
             self.tabs[self.cur_tab].parked = Some(parked);
+            self.trim_parked_tex();
             self.tabs.insert(self.cur_tab + 1, Tab { parked: None });
             self.cur_tab += 1;
         }
@@ -1175,15 +1224,56 @@ impl App {
         }
     }
 
+    /// The shown document's markups as they are now, to write to `markups_file`.
+    fn sidecar_now(&self) -> Option<(PathBuf, sidecar::Sidecar)> {
+        let (Some(p), Some(f)) = (&self.path, &self.markups_file) else { return None };
+        Some((f.clone(), sidecar::Sidecar { pdf: p.clone(), annots: self.annots.clone(), scales: self.scales.clone(), accepted: self.accepted.clone() }))
+    }
+
+    /// Autosave: hands the markups to the saver thread and carries on. A failure
+    /// comes back through `poll_saves`, which marks them unsaved again.
+    fn autosave(&mut self) {
+        if !self.dirty || self.read_only {
+            return;
+        }
+        let Some((f, s)) = self.sidecar_now() else {
+            self.dirty = false;
+            return;
+        };
+        self.save_seq += 1;
+        self.saver.save_later(f, s, self.save_seq);
+        self.dirty = false;
+    }
+
+    /// Background saves that finished: the latest failing leaves the markups unsaved, retried in a few seconds.
+    fn poll_saves(&mut self) {
+        while let Ok((file, seq, result)) = self.saver.done.try_recv() {
+            // Another document's (its tab has been switched away from and saved since), or overtaken by a later save.
+            if Some(&file) != self.markups_file.as_ref() || seq != self.save_seq {
+                continue;
+            }
+            if let Err(e) = result {
+                self.dirty = true;
+                self.status = format!("AUTOSAVE FAILED: {e}");
+                self.status_until = f64::INFINITY;
+                self.save_retry_at = self.now + 5.0;
+            }
+        }
+    }
+
+    /// Saves now, waiting for it (before switching or closing a document, accepting
+    /// proposals or quitting, which go on only if it worked: `dirty` says).
     fn save_sidecar(&mut self) {
         if !self.dirty || self.read_only {
             return;
         }
-        let (Some(p), Some(f)) = (&self.path, &self.markups_file) else {
+        let Some((f, s)) = self.sidecar_now() else {
             self.dirty = false;
             return;
         };
-        match sidecar::save_file(f, p, &self.annots, &self.scales, &self.accepted) {
+        // Any background save still to report is overtaken by this one.
+        self.save_seq += 1;
+        match self.saver.save_now(f, s) {
             Ok(()) => self.dirty = false,
             Err(e) => {
                 // Stays dirty; retried on the next change or document switch.
@@ -3246,6 +3336,8 @@ impl App {
                     scales_now.push(s);
                 }
                 if let Some(f) = &markups_file {
+                    // After any autosave still on its way, so it can't land on top.
+                    self.saver.flush();
                     sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
                     saved = true;
                 }
@@ -4901,8 +4993,9 @@ impl eframe::App for App {
             sidecar::save_prefs(&self.prefs);
         }
         self.now = now;
+        self.poll_saves();
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
-            self.save_sidecar();
+            self.autosave();
         }
         self.save_parked(now);
         // Background tabs still unsaved: keep retrying even when nothing else wakes the window.
@@ -5942,6 +6035,35 @@ mod tests {
         assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1);
     }
 
+    /// A tab switched back to shows the pages it had rendered; only the latest
+    /// few background tabs keep theirs.
+    #[test]
+    fn background_tabs_keep_their_rendered_pages() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| PageTex { tex: ctx.load_texture(name, egui::ColorImage::filled([4, 4], Color32::WHITE), TextureOptions::LINEAR), scale: 1.0, origin: [0, 0], size: [4, 4] };
+        let mut app = app();
+        for (i, name) in ["/a.pdf", "/b.pdf", "/c.pdf", "/d.pdf"].iter().enumerate() {
+            if i > 0 {
+                let parked = app.park();
+                app.tabs[app.cur_tab].parked = Some(parked);
+                app.trim_parked_tex();
+                app.tabs.push(Tab { parked: None });
+                app.cur_tab = i;
+                app.pages = vec![vec2(600.0, 800.0)];
+                app.page_y = vec![0.0];
+            }
+            app.path = Some(PathBuf::from(name));
+            app.base.insert(0, tex(name));
+            app.thumbs.insert(0, tex(name));
+        }
+        let kept: Vec<bool> = app.tabs[..3].iter().map(|t| t.parked.as_ref().unwrap().tex.is_some()).collect();
+        assert_eq!(kept, [false, true, true], "the two latest background tabs keep theirs");
+        app.switch_tab(2);
+        assert!(app.base.contains_key(&0) && app.thumbs.contains_key(&0), "shown at once");
+        app.switch_tab(0);
+        assert!(app.base.is_empty(), "rendered again");
+    }
+
     #[test]
     fn a_move_under_way_is_finished_before_its_tab_is_parked() {
         let mut app = app();
@@ -6208,6 +6330,48 @@ mod tests {
         assert!(app.annots.is_empty() && app.scales.is_empty());
         assert_eq!(app.props.count(), 4, "still proposed");
         assert!(app.undo.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Autosave writes in the background; a failure comes back and leaves the
+    /// markups unsaved, and a save that waits sees every background one land first.
+    #[test]
+    fn autosave_writes_in_the_background_and_reports_failures() {
+        let (mut app, dir) = reviewing("autosave");
+        let file = dir.join("doc.json");
+        for i in 0..20 {
+            rect(&mut app, 10.0 * i as f32, 10.0);
+            app.changed();
+            app.autosave();
+            assert!(!app.dirty);
+        }
+        app.saver.flush();
+        assert_eq!(sidecar::load_file(&file).unwrap().annots.len(), 20, "the last background save landed");
+        app.poll_saves();
+        assert!(!app.dirty && !app.status.contains("FAILED"));
+
+        // The file's folder is a file: the background save fails, and says so.
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        app.markups_file = Some(dir.join("blocker").join("doc.json"));
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave();
+        app.saver.flush();
+        app.poll_saves();
+        assert!(app.dirty && app.status.contains("AUTOSAVE FAILED"), "{}", app.status);
+
+        // Back to a good place: a waiting save goes after the background ones.
+        app.markups_file = Some(file.clone());
+        rect(&mut app, 400.0, 400.0);
+        app.changed();
+        app.autosave();
+        rect(&mut app, 500.0, 400.0);
+        app.changed();
+        app.save_sidecar();
+        assert!(!app.dirty);
+        assert_eq!(sidecar::load_file(&file).unwrap().annots.len(), 23);
+        app.poll_saves();
+        assert!(!app.dirty, "an older background result doesn't undo the newer save");
         std::fs::remove_dir_all(&dir).ok();
     }
 
