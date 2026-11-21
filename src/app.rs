@@ -1015,12 +1015,38 @@ impl App {
         path.and_then(|p| p.file_name()).map_or_else(|| "New tab".into(), |f| f.to_string_lossy().into_owned())
     }
 
-    /// The tab strip, shown once two or more documents are open.
+    /// Moves tab `from` to index `to` (counted after it's taken out); the shown tab stays shown.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.tabs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        let cur = self.cur_tab;
+        self.cur_tab = if cur == from {
+            to
+        } else if from < cur && cur <= to {
+            cur - 1
+        } else if to <= cur && cur < from {
+            cur + 1
+        } else {
+            cur
+        };
+        self.tab_scroll = true;
+    }
+
+    /// The tab strip, shown once two or more documents are open. Tabs drag to reorder.
     fn tab_strip(&mut self, ui: &mut Ui) {
         let mut switch = None;
         let mut close = None;
+        let mut reorder = None;
         egui::ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Each tab's extent (label and ×), and the tab being dragged or just dropped.
+                let mut spans = Vec::with_capacity(self.tabs.len());
+                let mut dragging = None;
+                let mut dropped = None;
                 for i in 0..self.tabs.len() {
                     let name = self.tab_name(i);
                     let mut short: String = if name.chars().count() > 28 { format!("{}…", name.chars().take(27).collect::<String>()) } else { name.clone() };
@@ -1041,7 +1067,7 @@ impl App {
                     } else {
                         name.clone()
                     };
-                    let r = ui.add(egui::Button::selectable(on, short)).on_hover_text(tip);
+                    let r = ui.add(egui::Button::selectable(on, short).sense(Sense::click_and_drag())).on_hover_text(tip);
                     if on && std::mem::take(&mut self.tab_scroll) {
                         r.scroll_to_me(None);
                     }
@@ -1051,15 +1077,58 @@ impl App {
                     if r.middle_clicked() {
                         close = Some(i);
                     }
-                    if ui.add(egui::Button::new(egui::RichText::new("×").weak()).frame(false)).on_hover_text("Close (Ctrl+W)").clicked() {
+                    if r.dragged_by(PointerButton::Primary) {
+                        dragging = Some(i);
+                    }
+                    if r.drag_stopped_by(PointerButton::Primary) {
+                        dropped = Some(i);
+                    }
+                    let x = ui.add(egui::Button::new(egui::RichText::new("×").weak()).frame(false)).on_hover_text("Close (Ctrl+W)");
+                    if x.clicked() {
                         close = Some(i);
                     }
+                    spans.push(r.rect.union(x.rect));
                     ui.add_space(6.0);
+                }
+                // Where a dragged tab would land: before the first tab whose middle is right of the pointer.
+                let Some(from) = dragging.or(dropped) else { return };
+                let Some(p) = ui.input(|i| i.pointer.interact_pos()) else { return };
+                let slot = spans.iter().filter(|s| s.center().x < p.x).count();
+                // Counted with the dragged tab taken out.
+                let to = if slot > from { slot - 1 } else { slot };
+                if dropped.is_some() {
+                    reorder = Some((from, to));
+                    return;
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                if to != from {
+                    let x = match spans.get(slot) {
+                        Some(s) => s.left() - 3.0,
+                        None => spans[spans.len() - 1].right() + 3.0,
+                    };
+                    let y = spans[from].y_range();
+                    ui.painter().vline(x, y, Stroke::new(2.0, ui.visuals().selection.stroke.color));
+                }
+                // Near either end of a strip too long to show whole: scroll it along.
+                let clip = ui.clip_rect();
+                let edge = 24.0;
+                let step = if p.x < clip.left() + edge {
+                    8.0
+                } else if p.x > clip.right() - edge {
+                    -8.0
+                } else {
+                    0.0
+                };
+                if step != 0.0 {
+                    ui.scroll_with_delta(vec2(step, 0.0));
+                    ui.ctx().request_repaint();
                 }
             });
         });
         if let Some(i) = close {
             self.close_tab(i);
+        } else if let Some((from, to)) = reorder {
+            self.move_tab(from, to);
         } else if let Some(i) = switch {
             self.switch_tab(i);
         }
@@ -5547,7 +5616,7 @@ impl App {
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
-                    ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab"),
+                    ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab; drag a tab to move it"),
                     ("\\", "Split screen: two places side by side; click a pane to work in it, pick a tab to show another document there"),
                     ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
                     ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
@@ -6861,6 +6930,44 @@ mod tests {
         app.picture_ready(Ok(("cd.png".into(), "Old".into(), vec2(100.0, 100.0))), Some((0, pos2(100.0, 100.0))), started);
         assert_eq!(app.annots.len(), n);
         assert!(app.placing.is_none());
+    }
+
+    #[test]
+    fn dragging_a_tab_reorders_and_keeps_the_shown_one_shown() {
+        let mut app = app();
+        // Four documents, "c" shown; the others parked.
+        let mut parked = |name: &str| {
+            let mut p = app.park();
+            p.path = Some(PathBuf::from(format!("/{name}.pdf")));
+            Tab { parked: Some(p) }
+        };
+        let (a, b, d) = (parked("a"), parked("b"), parked("d"));
+        app.tabs = vec![a, b, Tab { parked: None }, d];
+        app.cur_tab = 2;
+        app.path = Some(PathBuf::from("/c.pdf"));
+        let names = |app: &App| (0..app.tabs.len()).map(|i| app.tab_name(i)).collect::<Vec<_>>().join(" ").replace(".pdf", "");
+        let shown = |app: &App| app.tab_name(app.cur_tab).replace(".pdf", "");
+        assert_eq!(names(&app), "a b c d");
+        // The shown tab itself.
+        app.move_tab(2, 0);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("c a b d", "c"));
+        // Others across it, both ways.
+        app.move_tab(3, 0);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("d c a b", "c"));
+        app.move_tab(0, 3);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("c a b d", "c"));
+        // Others not crossing it.
+        app.move_tab(1, 2);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("c b a d", "c"));
+        // Out of range or in place: nothing.
+        app.move_tab(1, 1);
+        app.move_tab(9, 0);
+        app.move_tab(0, 9);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("c b a d", "c"));
+        // Switching still finds each document.
+        app.switch_tab(3);
+        assert_eq!((names(&app).as_str(), shown(&app).as_str()), ("c b a d", "d"));
+        assert!(app.tabs[3].parked.is_none() && app.tabs[0].parked.is_some());
     }
 
     #[test]
