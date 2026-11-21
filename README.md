@@ -16,7 +16,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `Ctrl+click` with a callout selected | Add another leader: arrowhead at the click, tail at the first leader's bend; drag a tip to adjust |
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
-| `N` / `Shift+N` | Polyline / polygon: click the corners, double-click or `Enter` to finish (a polygon also closes on its first point) |
+| `N` / `Shift+N` | Polyline / polygon: click the corners, double-click or `Enter` to finish (click the first point again to close it as a polygon) |
 | `D` `E` | Measure a length or an area: click the points, double-click or `Enter` to finish (drag for one segment or a rectangle); `Shift` squares a point to the last |
 | `U` | Scale for measuring: pick the drawing scale, use one written on the sheet, calibrate on a known dimension, or add a region for a detail at its own scale. A reduced or scanned set needs calibrating |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |

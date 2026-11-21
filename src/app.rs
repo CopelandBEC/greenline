@@ -3618,7 +3618,19 @@ impl App {
         }
         let last = *pts.last().unwrap();
         let p = if shift { square(last, p) } else { p };
-        let closes = area && pts.len() >= 3 && (pts[0] - p).length() <= tol;
+        // Back on the first point: an area or polygon closes, and so does a
+        // polyline, which becomes a polygon.
+        let closes = (area || self.tool == Tool::Polyline) && pts.len() >= 3 && (pts[0] - p).length() <= tol;
+        if closes && self.tool == Tool::Polyline {
+            let (page, pts) = self.building.take().unwrap();
+            if measure::not_simple(&pts) {
+                self.building = Some((page, pts));
+                self.toast("The outline crosses itself: Backspace to take back a point, or Esc to drop it".into());
+            } else {
+                self.add_poly(page, pts, true);
+            }
+            return;
+        }
         // The second click of a double-click lands on the first.
         if !closes && (p - last).length() > 2.0 / self.zoom {
             pts.push(p);
@@ -3693,6 +3705,12 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Whether a click at `p` would close the outline being clicked out `pts`:
+    /// back on its first point, for an area, polygon or polyline of three points or more.
+    fn closes_on(&self, pts: &[Pos2], p: Pos2) -> bool {
+        matches!(self.tool, Tool::Area | Tool::Polygon | Tool::Polyline) && pts.len() >= 3 && (pts[0] - p).length() <= HIT_PX / self.zoom
     }
 
     /// Whether the tool clicks out a polyline or polygon (rather than a measurement).
@@ -4495,14 +4513,20 @@ impl App {
             // The measurement being clicked out, running to the pointer.
             if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i && !self.inactive) {
                 let mut pts = pts.clone();
+                // Over the first point, where a click would close the outline: it snaps there.
+                let mut closing = false;
                 if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
                     let h = self.screen_to_page(i, h);
-                    pts.push(if self.shift { square(*pts.last().unwrap(), h) } else { h });
+                    let h = if self.shift { square(*pts.last().unwrap(), h) } else { h };
+                    closing = self.closes_on(&pts, h);
+                    if !closing {
+                        pts.push(h);
+                    }
                 }
                 let calibrating = self.tool == Tool::Calibrate;
                 let color = if calibrating { [0, 150, 255] } else { self.color() };
                 let kind = if self.outlining() {
-                    Kind::Poly { pts: pts.clone(), closed: self.tool == Tool::Polygon && pts.len() >= 3 }
+                    Kind::Poly { pts: pts.clone(), closed: (self.tool == Tool::Polygon || closing) && pts.len() >= 3 }
                 } else {
                     Kind::Measure { pts: pts.clone(), area: self.tool == Tool::Area && pts.len() >= 3, name: String::new(), value: String::new(), size: self.text_size }
                 };
@@ -4513,6 +4537,11 @@ impl App {
                 paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.8, &self.textures);
                 for p in &pts {
                     pp.circle_stroke(self.page_to_screen(i, *p), 3.0, Stroke::new(1.0, SEL));
+                }
+                if closing {
+                    let c = self.page_to_screen(i, pts[0]);
+                    pp.circle_filled(c, 6.0, SEL.gamma_multiply(0.35));
+                    pp.circle_stroke(c, 6.0, Stroke::new(2.0, SEL));
                 }
             }
             // Scale regions and the calibration line while the scale window is up.
@@ -5604,7 +5633,7 @@ impl App {
                     ("T", "Text box (click, or drag for width)"),
                     ("K / R / H", "Revision cloud / rectangle / highlight (drag)"),
                     ("A / L / P", "Arrow / line / pen"),
-                    ("N / Shift+N", "Polyline / polygon: click the corners, double-click or Enter to finish (a polygon also closes on its first point)"),
+                    ("N / Shift+N", "Polyline / polygon: click the corners, double-click or Enter to finish (click the first point again to close it as a polygon)"),
                     ("D / E", "Measure length / area: click the points, double-click or Enter to finish (drag: one segment / a rectangle)"),
                     ("Y", "Review: markups proposed by agents (greenline-cli); accept or reject each, or a whole batch"),
                     ("U", "Scale: pick the drawing scale, use one written on the sheet, calibrate, or add a region for a detail"),
@@ -5987,6 +6016,56 @@ fn thin(pts: Vec<Pos2>) -> Vec<Pos2> {
     out
 }
 
+/// egui joins a stroke's segments with unlimited mitres, so a sharp corner
+/// spikes far past its point. A sharp turn gets a tiny arc instead (points
+/// within a pixel of the corner), which egui draws as a round join, as the
+/// export does (PDF line join round).
+fn round_corners(pts: Vec<Pos2>, closed: bool, width: f32) -> Vec<Pos2> {
+    let n = pts.len();
+    if n < 3 || width < 2.0 {
+        return pts;
+    }
+    // Sharper than this turn, round the corner (mitres up to about 1.3 × the half-width).
+    const MAX_TURN: f32 = 80.0_f32.to_radians();
+    let mut out = Vec::with_capacity(n + 8);
+    for i in 0..n {
+        let p = pts[i];
+        let (prev, next) = match (i, closed) {
+            (0, false) => (None, None),
+            (_, false) if i == n - 1 => (None, None),
+            _ => (Some(pts[(i + n - 1) % n]), Some(pts[(i + 1) % n])),
+        };
+        let (Some(a), Some(b)) = (prev, next) else {
+            out.push(p);
+            continue;
+        };
+        let (din, dout) = (p - a, b - p);
+        let (lin, lout) = (din.length(), dout.length());
+        if lin < 1e-3 || lout < 1e-3 {
+            out.push(p);
+            continue;
+        }
+        let (uin, uout) = (din / lin, dout / lout);
+        let turn = uin.dot(uout).clamp(-1.0, 1.0).acos();
+        if turn <= MAX_TURN {
+            out.push(p);
+            continue;
+        }
+        // A tiny arc round the corner, turning a few degrees at each step
+        // (even a full reversal, which a curve through the corner would cusp).
+        let steps = (turn / 12.0_f32.to_radians()).ceil() as usize;
+        let side = if uin.x * uout.y - uin.y * uout.x < 0.0 { -1.0 } else { 1.0 };
+        let step = 0.05;
+        let mut q = p - uin * (step * steps as f32 / 2.0);
+        out.push(q);
+        for k in 1..=steps {
+            q += Vec2::angled(uin.angle() + side * turn * k as f32 / steps as f32) * step;
+            out.push(q);
+        }
+    }
+    out
+}
+
 /// Paints prims for a page whose top-left is at `origin` on screen, drawn at
 /// `z` screen points per PDF point. `k` is the text calibration from `text_metrics`.
 fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32, f32), alpha_mul: f32, images: &HashMap<String, TextureHandle>) {
@@ -6041,7 +6120,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
-                let pts = thin(map(pts));
+                let pts = round_corners(thin(map(pts)), *closed, s.width);
                 if *closed {
                     painter.add(Shape::closed_line(pts, s));
                 } else {
@@ -6066,7 +6145,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                         painter.add(Shape::mesh(mesh));
                     }
                     if stroke != Stroke::NONE {
-                        painter.add(Shape::closed_line(pts, stroke));
+                        painter.add(Shape::closed_line(round_corners(pts, true, stroke.width), stroke));
                     }
                 }
             }
@@ -6677,6 +6756,30 @@ mod tests {
         }).collect()
     }
 
+    /// A sharp corner drawn on screen ends near its point, as the export's round
+    /// join does, not in a mitre spike far beyond it.
+    #[test]
+    fn sharp_corners_dont_spike_on_screen() {
+        let reach = |pts: Vec<Pos2>| {
+            let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+            let mut mesh = egui::Mesh::default();
+            t.tessellate_shape(Shape::closed_line(pts, Stroke::new(10.0, Color32::BLACK)), &mut mesh);
+            mesh.vertices.iter().map(|v| v.pos.x).fold(f32::MIN, f32::max)
+        };
+        // A sliver: its tip at x = 300, the width 10.
+        let sliver = vec![pos2(0.0, 0.0), pos2(300.0, 10.0), pos2(0.0, 20.0)];
+        assert!(reach(sliver.clone()) > 400.0, "egui alone mitres far past the tip");
+        let r = reach(round_corners(sliver, true, 10.0));
+        assert!(r < 300.0 + 5.0 + 2.0, "rounded: within the half-width of the tip, got {r}");
+        // Gentle corners are left alone; so is a full reversal's neighbourhood.
+        let square = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0), pos2(0.0, 100.0)];
+        assert_eq!(round_corners(square.clone(), true, 10.0).len(), 4 + 4 * 8);
+        let gentle = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(200.0, 30.0)];
+        assert_eq!(round_corners(gentle.clone(), false, 10.0), gentle);
+        let back = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 0.0)];
+        assert!(reach(round_corners(back, false, 10.0)) < 100.0 + 5.0 + 2.0);
+    }
+
     #[test]
     fn polylines_and_polygons_are_clicked_out() {
         let mut app = app();
@@ -6687,6 +6790,13 @@ mod tests {
         app.click(pos2(200.0, 200.0), true, PLAIN);
         assert!(app.building.is_none());
         assert_eq!(polys(&app), vec![(vec![pos2(100.0, 100.0), pos2(200.0, 100.0), pos2(200.0, 200.0)], false)]);
+        // A polyline clicked back to its first point closes, as a polygon.
+        for p in [pos2(100.0, 300.0), pos2(150.0, 300.0), pos2(150.0, 350.0), pos2(101.0, 301.0)] {
+            app.click(p, false, PLAIN);
+        }
+        assert!(app.building.is_none());
+        assert_eq!(polys(&app)[1], (vec![pos2(100.0, 300.0), pos2(150.0, 300.0), pos2(150.0, 350.0)], true));
+        app.annots.pop();
         // A polygon closes on its first point and takes the tool's fill.
         app.set_tool(Tool::Polygon);
         app.fill_alpha = 100;

@@ -4,7 +4,7 @@ Greenline 2.0.0-rc.1 — fast PDF markup for drawing, spec and deck review. **Re
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
 
 **New in 2.0**
-- **Polylines and polygons.** `N` for a polyline, `Shift+N` for a polygon: click the corners, double-click or Enter to finish (a polygon also closes on its first point). Drag a corner to reshape.
+- **Polylines and polygons.** `N` for a polyline, `Shift+N` for a polygon: click the corners, double-click or Enter to finish (click the first point again to close it as a polygon). Drag a corner to reshape.
 - **Fill.** The swatch beside the colours sets a fill — any markup colour or white — and its opacity, for clouds, rectangles, polygons, areas, callouts and text boxes. A filled shape selects with a click inside.
 - **Line types.** The sample beside the line width: dashed, dotted, dash-dot, or one from your pattern library.
 - **Hatches.** In the fill picker, with a scale: diagonal, crosshatch, horizontal, or from the library.
