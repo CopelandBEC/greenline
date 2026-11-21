@@ -8,6 +8,9 @@
 use crate::patterns::{HatchFill, LineType};
 use egui::{pos2, vec2, Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub type Rgb = [u8; 3];
@@ -51,15 +54,89 @@ pub struct Style {
     pub italic: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub underline: bool,
+    /// Formatting word by word: runs of characters through the note, in
+    /// order. Empty: the whole note as the flags above say. When there are
+    /// runs, the flags say what the whole note has (all of it bold, say), which
+    /// is also how a version without runs shows it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<Run>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// How a character of a note is set: bold, italic, underlined.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Fmt {
+    #[serde(skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub underline: bool,
+}
+
+impl Fmt {
+    /// Bold (0), italic (1) or underline (2).
+    pub fn get(&self, which: usize) -> bool {
+        [self.bold, self.italic, self.underline][which]
+    }
+
+    pub fn set(&mut self, which: usize, on: bool) {
+        *[&mut self.bold, &mut self.italic, &mut self.underline][which] = on;
+    }
+}
+
+/// `len` characters of a note set alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Run {
+    pub len: usize,
+    #[serde(flatten)]
+    pub fmt: Fmt,
+}
+
 impl Style {
     pub fn is_plain(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The whole note's flags.
+    pub fn whole(&self) -> Fmt {
+        Fmt { bold: self.bold, italic: self.italic, underline: self.underline }
+    }
+
+    /// Each character's formatting, for a note of `n` characters (any beyond
+    /// the runs take the whole note's flags).
+    pub fn fmts(&self, n: usize) -> Vec<Fmt> {
+        let mut v = Vec::with_capacity(n);
+        for r in &self.runs {
+            let k = r.len.min(n - v.len());
+            v.extend(std::iter::repeat_n(r.fmt, k));
+        }
+        v.resize(n, self.whole());
+        v
+    }
+
+    /// Sets each character's formatting: one throughout goes in the flags, and
+    /// a mix in runs, with the flags then saying what all of it has.
+    pub fn set_fmts(&mut self, f: &[Fmt]) {
+        self.runs.clear();
+        let Some(&first) = f.first() else { return };
+        if f.iter().all(|x| *x == first) {
+            (self.bold, self.italic, self.underline) = (first.bold, first.italic, first.underline);
+            return;
+        }
+        for x in f {
+            match self.runs.last_mut() {
+                Some(r) if r.fmt == *x => r.len += 1,
+                _ => self.runs.push(Run { len: 1, fmt: *x }),
+            }
+        }
+        self.bold = f.iter().all(|x| x.bold);
+        self.italic = f.iter().all(|x| x.italic);
+        self.underline = f.iter().all(|x| x.underline);
     }
 }
 
@@ -109,6 +186,18 @@ pub enum Prim {
     /// of `tint` (the outline, with an opacity for the ink) instead.
     Segments { segs: Arc<Vec<[Pos2; 2]>>, offset: Vec2, width: f32, color: Rgb, tile: f32, tint: Option<(Arc<Vec<Pos2>>, u8)> },
 }
+
+/// A markup's prims and bounds, worked out once per look and position (`Annot::geom`).
+pub struct Geom {
+    pub prims: Vec<Prim>,
+    pub bounds: Rect,
+    /// The patterns it was made with, kept alive so their addresses (part of
+    /// the cache key) can't be reused by different ones.
+    _pins: (Option<Arc<LineType>>, Option<Arc<crate::patterns::Hatch>>),
+}
+
+/// Markups remembered per generation of the geometry cache.
+const GEOM_GENERATION: usize = 4096;
 
 pub const WHITE: Rgb = [255, 255, 255];
 
@@ -183,29 +272,44 @@ pub fn wrap(text: &str, size: f32, max_w: f32) -> Vec<String> {
 }
 
 pub fn wrap_b(text: &str, size: f32, max_w: f32, bold: bool) -> Vec<String> {
-    let text_width = |s: &str, size: f32| text_width_b(s, size, bold);
-    let char_width = |c: char, size: f32| char_width_b(c, size, bold);
+    let chars: Vec<char> = text.chars().collect();
+    let w: Vec<f32> = chars.iter().map(|&c| char_width_b(c, size, bold)).collect();
+    wrap_ranges(&chars, &w, max_w).into_iter().map(|r| chars[r].iter().collect()).collect()
+}
+
+/// Greedy word wrap into lines given as ranges of `chars`; `w` is each
+/// character's width. Lines break at spaces (the space belongs to neither
+/// line) and at newlines (kept as breaks); a word too wide alone is broken.
+pub fn wrap_ranges(chars: &[char], w: &[f32], max_w: f32) -> Vec<std::ops::Range<usize>> {
+    // Summed in order, character by character, as the lines' text would be.
+    let width = |r: std::ops::Range<usize>| -> f32 { w[r].iter().sum() };
     let mut out = Vec::new();
-    for para in text.split('\n') {
-        let mut line = String::new();
-        for word in para.split(' ') {
-            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if text_width(&candidate, size) <= max_w || line.is_empty() && text_width(word, size) <= max_w {
+    let mut start = 0;
+    for para in chars.split(|&c| c == '\n') {
+        let end = start + para.len();
+        let mut line = start..start;
+        let mut ws = start;
+        for word in para.split(|&c| c == ' ') {
+            let word_r = ws..ws + word.len();
+            ws = word_r.end + 1;
+            let candidate = if line.is_empty() { word_r.clone() } else { line.start..word_r.end };
+            if width(candidate.clone()) <= max_w || line.is_empty() && width(word_r.clone()) <= max_w {
                 line = candidate;
                 continue;
             }
             if !line.is_empty() {
-                out.push(std::mem::take(&mut line));
+                out.push(std::mem::replace(&mut line, word_r.start..word_r.start));
             }
             // Break a word that alone is too wide.
-            for c in word.chars() {
-                if !line.is_empty() && text_width(&line, size) + char_width(c, size) > max_w {
-                    out.push(std::mem::take(&mut line));
+            for i in word_r {
+                if !line.is_empty() && width(line.clone()) + w[i] > max_w {
+                    out.push(std::mem::replace(&mut line, i..i));
                 }
-                line.push(c);
+                line = if line.is_empty() { i..i + 1 } else { line.start..i + 1 };
             }
         }
         out.push(line);
+        start = end + 1;
     }
     out
 }
@@ -235,7 +339,36 @@ pub fn box_rect(pos: Pos2, box_w: f32, text: &str, size: f32) -> Rect {
 
 pub fn box_rect_b(pos: Pos2, box_w: f32, text: &str, size: f32, bold: bool) -> Rect {
     let n = text_lines_b(text, size, box_w, bold).len().max(1) as f32;
-    Rect::from_min_size(pos, vec2(box_w, 2.0 * pad(size) + n * line_h(size)))
+    box_of(pos, box_w, n, size)
+}
+
+fn box_of(pos: Pos2, box_w: f32, lines: f32, size: f32) -> Rect {
+    Rect::from_min_size(pos, vec2(box_w, 2.0 * pad(size) + lines * line_h(size)))
+}
+
+/// A note's characters, their formatting and widths, and its lines in a box `box_w` wide.
+pub struct NoteLayout {
+    pub chars: Vec<char>,
+    pub fmts: Vec<Fmt>,
+    pub widths: Vec<f32>,
+    pub lines: Vec<std::ops::Range<usize>>,
+}
+
+impl NoteLayout {
+    pub fn new(text: &str, size: f32, box_w: f32, style: &Style) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let fmts = style.fmts(chars.len());
+        let widths: Vec<f32> = chars.iter().zip(&fmts).map(|(&c, f)| char_width_b(c, size, f.bold)).collect();
+        let lines = wrap_ranges(&chars, &widths, (box_w - 2.0 * pad(size)).max(size));
+        Self { chars, fmts, widths, lines }
+    }
+
+    /// Width of line `i` without the spaces at its end.
+    pub fn line_width(&self, i: usize) -> f32 {
+        let r = self.lines[i].clone();
+        let end = r.start + self.chars[r.clone()].iter().rposition(|c| !c.is_whitespace()).map_or(0, |k| k + 1);
+        self.widths[r.start..end].iter().sum()
+    }
 }
 
 pub fn default_box_w(size: f32) -> f32 {
@@ -249,7 +382,7 @@ impl Annot {
     pub fn text_box(&self) -> Option<Rect> {
         match &self.kind {
             Kind::Callout { pos, box_w, text, size, .. } | Kind::Text { pos, box_w, text, size } => {
-                Some(box_rect_b(*pos, *box_w, text, *size, self.style.bold))
+                Some(box_of(*pos, *box_w, NoteLayout::new(text, *size, *box_w, &self.style).lines.len().max(1) as f32, *size))
             }
             _ => None,
         }
@@ -276,8 +409,8 @@ impl Annot {
             Kind::Callout { text, .. } | Kind::Text { text, .. } => text.clone(),
             _ => return,
         };
-        let bold = self.style.bold;
-        let widest = text_lines_b(&text, size, r.width(), bold).iter().map(|l| text_width_b(l.trim_end(), size, bold)).fold(0.0, f32::max);
+        let layout = NoteLayout::new(&text, size, r.width(), &self.style);
+        let widest = (0..layout.lines.len()).map(|i| layout.line_width(i)).fold(0.0, f32::max);
         // A little slack so float rounding never re-wraps the last word.
         let fit = (widest + 2.0 * pad(size) + 0.5).max(4.0 * size);
         if fit < r.width() {
@@ -345,7 +478,120 @@ impl Annot {
         }
     }
 
+    /// Everything the markup draws, with the box round it, remembered by content
+    /// (see `Geom`): painting, hit-testing and lists ask every frame.
+    pub fn geom(&self) -> Rc<Geom> {
+        thread_local! {
+            static CACHE: RefCell<[HashMap<u64, Rc<Geom>>; 2]> = RefCell::new([HashMap::new(), HashMap::new()]);
+        }
+        let key = self.fingerprint();
+        if let Some(g) = CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            let hit = c[0].get(&key).cloned().or_else(|| c[1].remove(&key));
+            if let Some(g) = &hit {
+                c[0].entry(key).or_insert_with(|| g.clone());
+            }
+            hit
+        }) {
+            return g;
+        }
+        let g = Rc::new(Geom {
+            prims: self.prims(),
+            bounds: self.bounds_uncached(),
+            _pins: (self.style.line.clone(), self.style.hatch.as_ref().map(|h| h.pattern.clone())),
+        });
+        CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            // Two generations: the one filling up, and the last, whose entries
+            // move back over when used. Whatever went unused for a whole
+            // generation is let go.
+            if c[0].len() >= GEOM_GENERATION {
+                c[1] = std::mem::take(&mut c[0]);
+            }
+            c[0].insert(key, g.clone());
+        });
+        g
+    }
+
+    /// A hash of everything `prims` and `bounds` depend on. Patterns count by
+    /// identity: a `Geom` holds on to the ones it was made with, so a pattern
+    /// it saw can't be freed and another put in its place.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{BuildHasher, Hash, Hasher};
+        type H = foldhash::quality::FoldHasher<'static>;
+        // A fast, well-mixed 64-bit hash, seeded the same every run (it's asked
+        // for several times a frame per markup, so SipHash showed in profiles).
+        static SEED: foldhash::quality::FixedState = foldhash::quality::FixedState::with_seed(0x9e37_79b9_7f4a_7c15);
+        let mut h: H = SEED.build_hasher();
+        let f = |h: &mut H, v: f32| h.write_u32(v.to_bits());
+        let p = |h: &mut H, q: Pos2| {
+            f(h, q.x);
+            f(h, q.y);
+        };
+        let r = |h: &mut H, r: Rect| {
+            p(h, r.min);
+            p(h, r.max);
+        };
+        let pts = |h: &mut H, v: &[Pos2]| {
+            h.write_usize(v.len());
+            v.iter().for_each(|q| p(h, *q));
+        };
+        self.color.hash(&mut h);
+        f(&mut h, self.width);
+        std::mem::discriminant(&self.kind).hash(&mut h);
+        match &self.kind {
+            Kind::Callout { anchor, pos, box_w, text, size, leaders } => {
+                p(&mut h, *anchor);
+                p(&mut h, *pos);
+                f(&mut h, *box_w);
+                text.hash(&mut h);
+                f(&mut h, *size);
+                pts(&mut h, leaders);
+            }
+            Kind::Text { pos, box_w, text, size } => {
+                p(&mut h, *pos);
+                f(&mut h, *box_w);
+                text.hash(&mut h);
+                f(&mut h, *size);
+            }
+            Kind::Cloud { rect } | Kind::Rect { rect } | Kind::Highlight { rect } => r(&mut h, *rect),
+            Kind::Arrow { a, b } | Kind::Line { a, b } => {
+                p(&mut h, *a);
+                p(&mut h, *b);
+            }
+            Kind::Pen { pts: v } => pts(&mut h, v),
+            Kind::Poly { pts: v, closed } => {
+                pts(&mut h, v);
+                closed.hash(&mut h);
+            }
+            Kind::Image { rect, image, name } => {
+                r(&mut h, *rect);
+                image.hash(&mut h);
+                name.hash(&mut h);
+            }
+            Kind::Measure { pts: v, area, name, value, size } => {
+                pts(&mut h, v);
+                area.hash(&mut h);
+                name.hash(&mut h);
+                value.hash(&mut h);
+                f(&mut h, *size);
+            }
+        }
+        let s = &self.style;
+        s.fill.map(|x| (x.color, x.alpha)).hash(&mut h);
+        s.line.as_ref().map(Arc::as_ptr).hash(&mut h);
+        s.hatch.as_ref().map(|x| Arc::as_ptr(&x.pattern)).hash(&mut h);
+        s.hatch.as_ref().map(|x| x.scale.to_bits()).hash(&mut h);
+        (s.bold, s.italic, s.underline).hash(&mut h);
+        s.runs.hash(&mut h);
+        h.finish()
+    }
+
     pub fn bounds(&self) -> Rect {
+        self.geom().bounds
+    }
+
+    fn bounds_uncached(&self) -> Rect {
         let b = self.shape_bounds();
         match self.style.line.as_deref().filter(|_| self.takes_line_type()) {
             Some(lt) => b.expand(lt.reach(self.width)),
@@ -435,8 +681,8 @@ impl Annot {
             }
         }
         let mut best = f32::INFINITY;
-        for prim in self.prims() {
-            let (pts, closed) = match &prim {
+        for prim in self.geom().prims.iter() {
+            let (pts, closed) = match prim {
                 Prim::Stroke { pts, closed, .. } => (pts, *closed),
                 Prim::Fill { pts, .. } => (pts, true),
                 Prim::Image { rect, .. } => {
@@ -473,7 +719,7 @@ impl Annot {
             }
         }
         let r = r.expand(self.width / 2.0);
-        self.prims().iter().any(|prim| match prim {
+        self.geom().prims.iter().any(|prim| match prim {
             Prim::Stroke { pts, closed, .. } => polyline_hits(pts, *closed, r),
             Prim::Fill { pts, .. } => polyline_hits(pts, true, r),
             Prim::Text { .. } | Prim::Image { .. } | Prim::Segments { .. } => false,
@@ -671,20 +917,64 @@ impl Annot {
 }
 
 fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb, style: &Style) {
-    let x = r.min.x + pad(size);
-    for (i, line) in text_lines_b(text, size, r.width(), style.bold).into_iter().enumerate() {
-        if line.trim().is_empty() {
+    let x0 = r.min.x + pad(size);
+    let note = NoteLayout::new(text, size, r.width(), style);
+    for (i, line) in note.lines.iter().enumerate() {
+        let chars = &note.chars[line.clone()];
+        if chars.iter().all(|c| c.is_whitespace()) {
             continue;
         }
         let y = r.min.y + pad(size) + i as f32 * line_h(size) + ascent(size);
-        if style.underline {
-            // Helvetica's underline: 0.1 em below the baseline, 0.05 em thick.
-            let w = text_width_b(line.trim_end(), size, style.bold);
-            let uy = y + 0.1 * size;
-            out.push(Prim::Stroke { pts: vec![pos2(x, uy), pos2(x + w, uy)], closed: false, width: 0.05 * size, color });
+        // Spaces at the end of a line aren't underlined.
+        let ink_end = line.start + chars.iter().rposition(|c| !c.is_whitespace()).map_or(0, |k| k + 1);
+        // One text prim per stretch set alike.
+        let mut x = x0;
+        let mut k = line.start;
+        while k < line.end {
+            let f = note.fmts[k];
+            let e = (k..line.end).find(|&j| note.fmts[j] != f).unwrap_or(line.end);
+            let w: f32 = note.widths[k..e].iter().sum();
+            if f.underline && k < ink_end {
+                // Helvetica's underline: 0.1 em below the baseline, 0.05 em thick.
+                let uw: f32 = note.widths[k..e.min(ink_end)].iter().sum();
+                let uy = y + 0.1 * size;
+                out.push(Prim::Stroke { pts: vec![pos2(x, uy), pos2(x + uw, uy)], closed: false, width: 0.05 * size, color });
+            }
+            let run: String = note.chars[k..e].iter().collect();
+            if !run.trim().is_empty() {
+                out.push(Prim::Text { origin: pos2(x, y), text: run, size, color, bold: f.bold, italic: f.italic });
+            }
+            x += w;
+            k = e;
         }
-        out.push(Prim::Text { origin: pos2(x, y), text: line, size, color, bold: style.bold, italic: style.italic });
     }
+}
+
+/// Formatting carried through an edit of a note from `old` (formatted `fmts`)
+/// to `new`: characters kept keep theirs, and typed ones take `typed`, or else
+/// the formatting of the character before them (at the start, of the first).
+/// `cursor` (a character index into `new`, where the cursor ended up) places
+/// the edit: typing, deleting and pasting all leave the cursor where the
+/// change ends, which tells repeated text apart ("go go" losing its first
+/// "go " keeps the second's formatting). The edit is the smallest change
+/// from `old` to `new`, keeping what's the same at both ends; the cursor only
+/// picks between equally small ones, so a cursor elsewhere (put back by an
+/// undo, say) can't make the change look bigger than it is.
+pub fn carry_fmts(old: &str, fmts: &[Fmt], new: &str, typed: Option<Fmt>, whole: Fmt, cursor: Option<usize>) -> Vec<Fmt> {
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let fmt = |i: usize| fmts.get(i).copied().unwrap_or(whole);
+    let same = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let inferred = (same, o[same..].iter().rev().zip(n[same..].iter().rev()).take_while(|(a, b)| a == b).count());
+    let at_cursor = cursor.filter(|&c| c <= n.len() && n.len() - c <= o.len() && o[o.len() - (n.len() - c)..] == n[c..]).map(|c| {
+        let s = n.len() - c;
+        (same.min(c).min(o.len() - s), s)
+    });
+    let (p, s) = at_cursor.filter(|&(p, s)| p + s == inferred.0 + inferred.1).unwrap_or(inferred);
+    let at = typed.unwrap_or_else(|| if p > 0 { fmt(p - 1) } else { fmt(0) });
+    let mut out: Vec<Fmt> = (0..p).map(fmt).collect();
+    out.extend(std::iter::repeat_n(at, n.len() - p - s));
+    out.extend((o.len() - s..o.len()).map(fmt));
+    out
 }
 
 /// Rect with one corner at `fixed`, reaching towards `p`, with width/height
@@ -935,6 +1225,52 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 12.0, 100.0), vec!["a", "", "b"]);
     }
 
+    /// The wrap as it was before lines became character ranges: every note
+    /// must still break where it did.
+    fn old_wrap(text: &str, size: f32, max_w: f32, bold: bool) -> Vec<String> {
+        let text_width = |s: &str, size: f32| text_width_b(s, size, bold);
+        let char_width = |c: char, size: f32| char_width_b(c, size, bold);
+        let mut out = Vec::new();
+        for para in text.split('\n') {
+            let mut line = String::new();
+            for word in para.split(' ') {
+                let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+                if text_width(&candidate, size) <= max_w || line.is_empty() && text_width(word, size) <= max_w {
+                    line = candidate;
+                    continue;
+                }
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                for c in word.chars() {
+                    if !line.is_empty() && text_width(&line, size) + char_width(c, size) > max_w {
+                        out.push(std::mem::take(&mut line));
+                    }
+                    line.push(c);
+                }
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    #[test]
+    fn wrap_breaks_where_it_always_did() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let pieces = ["a", "flashing", "WWWWWWWWWWWWWWWWWWWWWW", " ", " ", "  ", "\n", "sill", "Ø25", "—", "jamb,", "i"];
+        for _ in 0..3000 {
+            let text: String = (0..rnd(14)).map(|_| pieces[rnd(pieces.len() as u64) as usize]).collect();
+            let (size, max_w, bold) = ([8.0, 10.0, 12.0, 18.0][rnd(4) as usize], 5.0 + rnd(300) as f32, rnd(2) == 1);
+            assert_eq!(wrap_b(&text, size, max_w, bold), old_wrap(&text, size, max_w, bold), "{text:?} {size} {max_w} {bold}");
+        }
+    }
+
     #[test]
     fn fit_box_shrinks_and_keeps_callout_edge() {
         let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 2.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Callout { anchor: pos2(500.0, 0.0), pos: pos2(100.0, 0.0), box_w: 300.0, text: "Short".into(), size: 12.0, leaders: vec![] } };
@@ -1044,6 +1380,94 @@ mod tests {
         // Old files without the flags read as plain.
         let s: Style = serde_json::from_str("{}").unwrap();
         assert!(!s.bold && !s.italic && !s.underline && s.is_plain());
+    }
+
+    /// The cached geometry follows every change to a markup: text, position,
+    /// style, and a pattern swapped for another of the same name.
+    #[test]
+    fn cached_geometry_follows_changes() {
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Text { pos: pos2(0.0, 0.0), box_w: 120.0, text: "Short".into(), size: 12.0 } };
+        let texts = |a: &Annot| a.geom().prims.iter().filter_map(|p| if let Prim::Text { text, .. } = p { Some(text.clone()) } else { None }).collect::<Vec<_>>();
+        assert_eq!(texts(&a), ["Short"]);
+        let h1 = a.bounds().height();
+        *a.text_mut().unwrap() = "Seal the head flashing to the jamb at every opening".into();
+        assert!(texts(&a).len() > 1 && a.bounds().height() > h1, "new text, taller box");
+        a.translate(vec2(10.0, 0.0));
+        assert_eq!(a.bounds().min.x, 10.0);
+        a.style.bold = true;
+        assert!(a.geom().prims.iter().any(|p| matches!(p, Prim::Text { bold: true, .. })));
+        a.color = [255, 0, 0];
+        assert!(a.geom().prims.iter().all(|p| !matches!(p, Prim::Text { color, .. } if *color != [255, 0, 0])));
+        let mut l = Annot { kind: Kind::Line { a: pos2(0.0, 100.0), b: pos2(200.0, 100.0) }, ..a.clone() };
+        let tall = |h: f32| Arc::new(crate::patterns::LineType { name: "same".into(), scale_with_width: false, lines: vec![crate::patterns::LinePattern { offset: 0.0, comps: vec![crate::patterns::Comp::Symbol { left: 5.0, right: 5.0, stretch: 1.0, fill: false, paths: vec![vec![pos2(0.0, -h), pos2(0.0, h)]] }] }] });
+        l.style.line = Some(tall(10.0));
+        let short = l.bounds();
+        l.style.line = Some(tall(30.0));
+        assert!(l.bounds().height() > short.height() + 30.0, "{short:?} {:?}", l.bounds());
+    }
+
+    /// Words formatted on their own: laid out run by run (a bold word is wider,
+    /// the next run starts where it ends), underlined only where they are,
+    /// carried through typing, and saved compactly.
+    #[test]
+    fn formatting_word_by_word() {
+        let b = Fmt { bold: true, ..Default::default() };
+        let u = Fmt { underline: true, ..Default::default() };
+        let p = Fmt::default();
+        let mut a = Annot { id: 1, page: 0, color: [0, 0, 0], width: 1.0, wrap_w: None, group: None, style: Default::default(), kind: Kind::Text { pos: pos2(0.0, 0.0), box_w: 400.0, text: "Seal the sill".into(), size: 10.0 } };
+        let mut f = vec![p; 13];
+        f[5..8].iter_mut().for_each(|x| *x = b);
+        f[9..13].iter_mut().for_each(|x| *x = u);
+        a.style.set_fmts(&f);
+        assert_eq!(a.style.runs.len(), 4);
+        assert!(!a.style.bold && !a.style.underline, "the flags say what all of it has");
+        assert_eq!(a.style.fmts(13), f);
+        let texts: Vec<(String, f32, bool)> = a.geom().prims.iter().filter_map(|p| if let Prim::Text { text, origin, bold, .. } = p { Some((text.clone(), origin.x, *bold)) } else { None }).collect();
+        // The plain space between two runs needs no text of its own.
+        assert_eq!(texts.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["Seal ", "the", "sill"]);
+        let x0 = pad(10.0);
+        assert!((texts[1].1 - (x0 + text_width("Seal ", 10.0))).abs() < 1e-3 && texts[1].2);
+        assert!((texts[2].1 - (texts[1].1 + text_width_b("the", 10.0, true) + text_width(" ", 10.0))).abs() < 1e-3, "after the bold word, by its bold width");
+        let unders: Vec<f32> = a.geom().prims.iter().filter_map(|p| if let Prim::Stroke { pts, .. } = p { Some(pts[1].x - pts[0].x) } else { None }).collect();
+        assert_eq!(unders.len(), 1);
+        assert!((unders[0] - text_width("sill", 10.0)).abs() < 1e-3);
+        // All one way: back to the flags, no runs.
+        a.style.set_fmts(&[b; 13]);
+        assert!(a.style.runs.is_empty() && a.style.bold);
+        // Saved and read back; an old file has no runs.
+        a.style.set_fmts(&f);
+        let json = serde_json::to_string(&a.style).unwrap();
+        assert!(json.contains(r#""runs":[{"len":5},{"len":3,"bold":true}"#), "{json}");
+        assert_eq!(serde_json::from_str::<Style>(&json).unwrap(), a.style);
+    }
+
+    #[test]
+    fn typing_carries_formatting() {
+        let b = Fmt { bold: true, ..Default::default() };
+        let p = Fmt::default();
+        let f = [p, p, b, b, p];
+        // Typed inside the bold word: bold. At the start: as the first. Deleted: gone.
+        assert_eq!(carry_fmts("ab12c", &f, "ab1x2c", None, p, None), [p, p, b, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "zab12c", None, p, None), [p, p, p, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "abc", None, p, None), [p, p, p]);
+        // Typing with B turned on at the cursor.
+        assert_eq!(carry_fmts("ab12c", &f, "abYY12c", Some(b), p, None), [p, p, b, b, b, b, p]);
+        // Replacing a selection takes the formatting before it.
+        assert_eq!(carry_fmts("ab12c", &f, "aQc", None, p, None), [p, p, p]);
+        assert_eq!(carry_fmts("", &[], "new", None, b, None), [b, b, b]);
+        // Repeated text: where the cursor ends up says which copy changed.
+        let g = [p, p, p, b, b];
+        assert_eq!(carry_fmts("go go", &g, "go", None, p, Some(0)), [b, b], "the first \"go \" deleted");
+        assert_eq!(carry_fmts("go go", &g, "go", None, p, Some(2)), [p, p], "the last \" go\" deleted");
+        assert_eq!(carry_fmts("go go", &g, "go go go", None, p, Some(6)), [p, p, p, p, p, p, b, b], "\"go \" typed at the start of the second");
+        assert_eq!(carry_fmts("go go", &g, "go gogo", None, p, Some(7)), [p, p, p, b, b, b, b], "\"go\" typed at the end");
+        assert_eq!(carry_fmts("go go", &g, "go o", None, p, Some(3)), [p, p, p, b], "forward delete: the cursor stays");
+        // A cursor away from the change (put back by an undo): "X" taken out of
+        // "aXbc", the bold after it kept.
+        assert_eq!(carry_fmts("aXbc", &[p, p, b, b], "abc", None, p, Some(3)), [p, b, b]);
+        // A cursor that can't be where the edit ended: as without one.
+        assert_eq!(carry_fmts("ab12c", &f, "ab1x2c", None, p, Some(0)), [p, p, b, b, b, p]);
+        assert_eq!(carry_fmts("ab12c", &f, "abc", None, p, Some(9)), [p, p, p]);
     }
 
     #[test]

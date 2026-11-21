@@ -23,8 +23,7 @@ const SEL: Color32 = Color32::from_rgb(0, 150, 255);
 const PROPOSED: Color32 = Color32::from_rgb(235, 120, 0);
 /// Search matches.
 const FOUND: Color32 = Color32::from_rgb(255, 190, 0);
-/// Thumbnail render size (physical px on the long side) and cache cap.
-const THUMB_PX: f32 = 420.0;
+/// Thumbnails kept at most.
 const MAX_THUMBS: usize = 400;
 const SCROLL_SPEED: f32 = 1.8;
 /// Scroll acceleration: after SCROLL_ACCEL_DELAY s of continuous scrolling in one
@@ -106,6 +105,16 @@ struct PageTex {
     size: [usize; 2],
 }
 
+/// A tile of a page rendered at its own scale: the page, the tile's top-left
+/// (pixels at that scale) and the scale's bits.
+type TileKey = (usize, [i32; 2], u32);
+
+/// Tile size, in physical pixels.
+const TILE_PX: i32 = 512;
+
+/// Tiles kept at most (about 1 MB each).
+const MAX_TILES: usize = 160;
+
 #[derive(Clone, Copy, Debug)]
 enum Handle {
     /// Rect corner; holds the fixed opposite corner.
@@ -158,12 +167,34 @@ struct Mods {
     shift: bool,
 }
 
+/// Long jobs greenline-cli does for the app, in a process of its own.
+#[derive(Clone, Copy, Debug)]
+enum CliJob {
+    Export,
+    Shrink,
+}
+
+/// A greenline-cli job's answer: its JSON, or what it said went wrong.
+type CliDone = (CliJob, Result<serde_json::Value, String>);
+
+/// greenline-cli beside this program (it's installed with it), if it's there.
+fn cli_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.with_file_name(if cfg!(windows) { "greenline-cli.exe" } else { "greenline-cli" });
+    p.is_file().then_some(p)
+}
+
+/// A library image decoded for a texture (or why not), by stored name.
+type Decoded = (String, Result<egui::ColorImage, String>);
+
 /// A stored image (stored name, file name, pixels) or why not, where it was dropped, and the placing epoch it began in.
 type PictureDone = (Result<(String, String, Vec2), String>, Option<(usize, Pos2)>, u64);
 
 /// A document in a background tab: everything that belongs to it, parked while
-/// another tab is shown. Its rendered pages are dropped (re-rendered on return);
-/// the worker keeps the PDF open under `generation`.
+/// another tab is shown, with its view. The worker keeps the PDF open under
+/// `generation`. (`App::swap_doc` and `App::swap_view` trade these fields with
+/// the shown document's.)
+#[derive(Default)]
 struct Parked {
     path: Option<PathBuf>,
     generation: u64,
@@ -171,8 +202,6 @@ struct Parked {
     page_y: Vec<f32>,
     doc_w: f32,
     doc_h: f32,
-    zoom: f32,
-    offset: Vec2,
     props: Proposals,
     props_path: Option<PathBuf>,
     markups_file: Option<PathBuf>,
@@ -194,8 +223,75 @@ struct Parked {
     read_only: bool,
     read_only_why: String,
     failed: HashSet<usize>,
-    /// Loaded while in the background: fit it when first shown.
+    thumbs: HashMap<usize, PageTex>,
+    req_thumb: HashSet<usize>,
+    /// Where it was looking, and its pages as rendered then (kept for the most
+    /// recently parked tabs only, see `TEX_TABS`, so switching back is instant).
+    view: View,
+    /// When it was parked, for keeping textures for the latest few.
+    parked_seq: u64,
+}
+
+/// One view of a document: where it looks, and what's rendered for it. The
+/// shown view's fields live in `App`; split screen's other pane and parked
+/// tabs keep theirs here.
+struct View {
+    /// Tells this view's renders from another's (both panes may show one document).
+    id: u64,
+    zoom: f32,
+    offset: Vec2,
+    canvas: Rect,
     fit_pending: bool,
+    last_view_change: f64,
+    view_key: (f32, Vec2),
+    scroll_streak: (f64, f64, f32),
+    base: HashMap<usize, PageTex>,
+    patch: HashMap<TileKey, PageTex>,
+    req_base: HashMap<usize, f32>,
+    req_patch: HashMap<TileKey, f32>,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+            canvas: Rect::NOTHING,
+            fit_pending: false,
+            last_view_change: 0.0,
+            view_key: (0.0, Vec2::ZERO),
+            scroll_streak: (0.0, 0.0, 0.0),
+            base: HashMap::new(),
+            patch: HashMap::new(),
+            req_base: HashMap::new(),
+            req_patch: HashMap::new(),
+        }
+    }
+}
+
+/// Split screen's other pane: the shown document at a place of its own, or
+/// another tab's document (whose view is then in its `Parked`).
+struct Pane {
+    /// `None`: the shown document. `Some`: the generation of the tab it shows.
+    doc: Option<u64>,
+    /// Its view of the shown document (unused while it shows another tab).
+    view: View,
+}
+
+/// Background tabs that keep their rendered pages.
+const TEX_TABS: usize = 2;
+
+/// What the shown views want rendered this frame: what the worker should
+/// keep (`render::Keep`) and the requests to send.
+#[derive(Default)]
+struct Wanted {
+    base: HashSet<(u64, usize)>,
+    tiles: HashSet<(u64, usize, [i32; 2])>,
+    thumbs: HashSet<usize>,
+    thumbs_missing: HashSet<usize>,
+    thumbs_generation: u64,
+    reqs: Vec<Req>,
 }
 
 /// An open document's place in the tab strip; the shown tab's state is in `App`.
@@ -290,15 +386,18 @@ pub struct App {
     offset: Vec2,
     canvas: Rect,
     fit_pending: bool,
+    /// When the zoom last changed: tiles wait for it to settle (panning doesn't make them wait).
     last_view_change: f64,
     /// (streak start time, last scroll time, direction) for scroll acceleration.
     scroll_streak: (f64, f64, f32),
     view_key: (f32, Vec2),
 
     base: HashMap<usize, PageTex>,
-    patch: HashMap<usize, PageTex>,
+    /// Sharp tiles over the view when zoomed in past the whole-page render.
+    patch: HashMap<TileKey, PageTex>,
     req_base: HashMap<usize, f32>,
-    req_patch: HashMap<usize, (f32, [i32; 2], [usize; 2])>,
+    /// Tiles asked for, at the scale asked for.
+    req_patch: HashMap<TileKey, f32>,
     thumbs: HashMap<usize, PageTex>,
     req_thumb: HashSet<usize>,
     /// Thumbnails drawn this frame (sidebar or overview); requested after layout.
@@ -386,8 +485,22 @@ pub struct App {
     tool_hatch: HashMap<Tool, HatchFill>,
     /// Bold, italic, underline for new notes.
     text_format: [bool; 3],
+    /// The characters selected in the note being typed (the cursor, when equal).
+    edit_sel: Option<std::ops::Range<usize>>,
+    /// Formatting for what's typed next at the cursor (B / I / U with nothing selected).
+    typing: Option<annot::Fmt>,
     /// Line types and hatches to pick from.
     patterns: patterns::Library,
+    /// The library being read in the background.
+    patterns_rx: Option<mpsc::Receiver<patterns::Library>>,
+    /// The image decoder thread's queue (started when first needed).
+    decoder: Option<mpsc::Sender<String>>,
+    /// Images decoded for textures, by stored name.
+    decoding: (mpsc::Sender<Decoded>, mpsc::Receiver<Decoded>),
+    /// Wakes the window when background work finishes (none in tests).
+    repaint: Option<egui::Context>,
+    /// Answers from greenline-cli jobs (`run_cli`).
+    cli_done: (mpsc::Sender<CliDone>, mpsc::Receiver<CliDone>),
     width: f32,
     text_size: f32,
     /// Selected markup ids; the last one is the lead whose colour/size the toolbar shows.
@@ -403,6 +516,9 @@ pub struct App {
     textures: HashMap<String, TextureHandle>,
     tex_failed: HashSet<String>,
     placing: Option<Place>,
+    /// Markup list rows as last laid out: by markup id, the note and width they
+    /// were laid out for, and their height.
+    list_heights: HashMap<u64, ((u64, &'static str), f32)>,
     /// Pointer over the canvas, for the placement preview.
     hover: Option<Pos2>,
     date_text: String,
@@ -415,6 +531,22 @@ pub struct App {
     /// and its baseline offset as a fraction of the font size.
     text_k: Option<(f32, f32)>,
 
+    /// Writes markups files off the UI thread.
+    saver: sidecar::Saver,
+    /// Tabs parked so far (`Parked::parked_seq`).
+    parked_seq: u64,
+    /// The shown view's id (`View::id`), and the last handed out.
+    view_id: u64,
+    next_view_id: u64,
+    /// Split screen's other pane, when the screen is split.
+    other: Option<Pane>,
+    /// Whether the shown (active) pane is the left one.
+    active_left: bool,
+    /// Painting the other pane (with its state swapped in): no gestures or previews.
+    inactive: bool,
+    /// Saves asked for so far, and by markups file the number of its latest: only that one's outcome counts.
+    save_seq: u64,
+    save_seqs: HashMap<PathBuf, u64>,
     lock: Option<std::fs::File>,
     read_only: bool,
     /// Shown while `read_only`: why markups aren't being autosaved.
@@ -441,6 +573,9 @@ impl App {
             Err(e) => (None, format!("PDFium failed to load: {e}")),
         };
         let mut app = Self::with(worker, status, prefs);
+        let ctx = cc.egui_ctx.clone();
+        app.saver = sidecar::Saver::spawn(move || ctx.request_repaint());
+        app.repaint = Some(cc.egui_ctx.clone());
         app.library = stamps::Library::load();
         app.reload_patterns();
         if let Some(p) = path {
@@ -525,7 +660,14 @@ impl App {
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
             text_format: [false; 3],
-            patterns: patterns::Library::default(),
+            edit_sel: None,
+            typing: None,
+            patterns: patterns::Library::builtins(),
+            patterns_rx: None,
+            decoder: None,
+            decoding: mpsc::channel(),
+            repaint: None,
+            cli_done: mpsc::channel(),
             width: 2.0,
             text_size: 12.0,
             selected: Vec::new(),
@@ -538,11 +680,21 @@ impl App {
             textures: HashMap::new(),
             tex_failed: HashSet::new(),
             placing: None,
+            list_heights: HashMap::new(),
             hover: None,
             copy_all: true,
             copy_pages: String::new(),
             renaming: None,
             text_k: None,
+            saver: sidecar::Saver::spawn(|| {}),
+            parked_seq: 0,
+            view_id: 1,
+            next_view_id: 1,
+            other: None,
+            active_left: true,
+            inactive: false,
+            save_seq: 0,
+            save_seqs: HashMap::new(),
             lock: None,
             read_only: false,
             read_only_why: String::new(),
@@ -566,82 +718,30 @@ impl App {
         }
         self.commit_edit();
         self.save_sidecar();
-        let p = Parked {
-            path: std::mem::take(&mut self.path),
-            generation: self.generation,
-            pages: std::mem::take(&mut self.pages),
-            page_y: std::mem::take(&mut self.page_y),
-            doc_w: self.doc_w,
-            doc_h: self.doc_h,
-            zoom: self.zoom,
-            offset: self.offset,
-            props: std::mem::take(&mut self.props),
-            props_path: std::mem::take(&mut self.props_path),
-            markups_file: std::mem::take(&mut self.markups_file),
-            accepted: std::mem::take(&mut self.accepted),
-            props_mtime: std::mem::take(&mut self.props_mtime),
-            overview_cursor: self.overview_cursor,
-            annots: std::mem::take(&mut self.annots),
-            scales: std::mem::take(&mut self.scales),
-            scale_found: std::mem::take(&mut self.scale_win.found),
-            scale_asked: std::mem::take(&mut self.scale_win.asked),
-            find: std::mem::take(&mut self.find),
-            find_from: self.find_from,
-            next_id: self.next_id,
-            undo: std::mem::take(&mut self.undo),
-            redo: std::mem::take(&mut self.redo),
-            dirty: self.dirty,
-            selected: std::mem::take(&mut self.selected),
-            lock: std::mem::take(&mut self.lock),
-            read_only: self.read_only,
-            read_only_why: std::mem::take(&mut self.read_only_why),
-            failed: std::mem::take(&mut self.failed),
-            fit_pending: self.fit_pending,
-        };
-        let mut p = p;
+        let mut p = Box::<Parked>::default();
+        self.swap_doc(&mut p);
+        self.swap_view(&mut p.view);
+        self.parked_seq += 1;
+        p.parked_seq = self.parked_seq;
         // Scale suggestions asked for but not back yet are asked again when it's shown.
-        p.scale_asked.retain(|pg| p.scale_found.contains_key(pg));
-        self.dirty = false;
-        self.read_only = false;
+        let found = &p.scale_found;
+        p.scale_asked.retain(|pg| found.contains_key(pg));
+        // Renders and thumbnails on their way are dropped (they're for a view no longer shown): ask again when shown.
+        p.view.req_base.clear();
+        p.view.req_patch.clear();
+        p.req_thumb.clear();
+        // What's left is a fresh, empty document and view.
         self.next_id = 1;
+        self.view_id = self.new_view_id();
         self.drop_view_state();
-        Box::new(p)
+        p
     }
 
     /// Makes a parked document the shown one.
-    fn unpark(&mut self, p: Box<Parked>) {
-        let p = *p;
+    fn unpark(&mut self, mut p: Box<Parked>) {
         self.drop_view_state();
-        self.path = p.path;
-        self.generation = p.generation;
-        self.pages = p.pages;
-        self.page_y = p.page_y;
-        self.doc_w = p.doc_w;
-        self.doc_h = p.doc_h;
-        self.zoom = p.zoom;
-        self.offset = p.offset;
-        self.props = p.props;
-        self.props_path = p.props_path;
-        self.markups_file = p.markups_file;
-        self.accepted = p.accepted;
-        self.props_mtime = p.props_mtime;
-        self.overview_cursor = p.overview_cursor;
-        self.annots = p.annots;
-        self.scales = p.scales;
-        self.scale_win.found = p.scale_found;
-        self.scale_win.asked = p.scale_asked;
-        self.find = p.find;
-        self.find_from = p.find_from;
-        self.next_id = p.next_id;
-        self.undo = p.undo;
-        self.redo = p.redo;
-        self.dirty = p.dirty;
-        self.selected = p.selected;
-        self.lock = p.lock;
-        self.read_only = p.read_only;
-        self.read_only_why = p.read_only_why;
-        self.failed = p.failed;
-        self.fit_pending = p.fit_pending;
+        self.swap_doc(&mut p);
+        self.swap_view(&mut p.view);
         // Find results are for this document's search; let the worker know which one is
         // wanted, and pick up a search that was cut short by the switch.
         if let Some(w) = &self.worker {
@@ -650,6 +750,62 @@ impl App {
         if self.find.open && self.find.pending > 0 {
             self.start_search();
         }
+    }
+
+    fn new_view_id(&mut self) -> u64 {
+        self.next_view_id += 1;
+        self.next_view_id
+    }
+
+    /// Trades the shown document (markups, selection, undo, lock...) for `p`'s.
+    fn swap_doc(&mut self, p: &mut Parked) {
+        use std::mem::swap;
+        swap(&mut self.path, &mut p.path);
+        swap(&mut self.generation, &mut p.generation);
+        swap(&mut self.pages, &mut p.pages);
+        swap(&mut self.page_y, &mut p.page_y);
+        swap(&mut self.doc_w, &mut p.doc_w);
+        swap(&mut self.doc_h, &mut p.doc_h);
+        swap(&mut self.props, &mut p.props);
+        swap(&mut self.props_path, &mut p.props_path);
+        swap(&mut self.markups_file, &mut p.markups_file);
+        swap(&mut self.accepted, &mut p.accepted);
+        swap(&mut self.props_mtime, &mut p.props_mtime);
+        swap(&mut self.overview_cursor, &mut p.overview_cursor);
+        swap(&mut self.annots, &mut p.annots);
+        swap(&mut self.scales, &mut p.scales);
+        swap(&mut self.scale_win.found, &mut p.scale_found);
+        swap(&mut self.scale_win.asked, &mut p.scale_asked);
+        swap(&mut self.find, &mut p.find);
+        swap(&mut self.find_from, &mut p.find_from);
+        swap(&mut self.next_id, &mut p.next_id);
+        swap(&mut self.undo, &mut p.undo);
+        swap(&mut self.redo, &mut p.redo);
+        swap(&mut self.dirty, &mut p.dirty);
+        swap(&mut self.selected, &mut p.selected);
+        swap(&mut self.lock, &mut p.lock);
+        swap(&mut self.read_only, &mut p.read_only);
+        swap(&mut self.read_only_why, &mut p.read_only_why);
+        swap(&mut self.failed, &mut p.failed);
+        swap(&mut self.thumbs, &mut p.thumbs);
+        swap(&mut self.req_thumb, &mut p.req_thumb);
+    }
+
+    /// Trades the shown view (zoom, place, rendered pages) for `v`.
+    fn swap_view(&mut self, v: &mut View) {
+        use std::mem::swap;
+        swap(&mut self.view_id, &mut v.id);
+        swap(&mut self.zoom, &mut v.zoom);
+        swap(&mut self.offset, &mut v.offset);
+        swap(&mut self.canvas, &mut v.canvas);
+        swap(&mut self.fit_pending, &mut v.fit_pending);
+        swap(&mut self.last_view_change, &mut v.last_view_change);
+        swap(&mut self.view_key, &mut v.view_key);
+        swap(&mut self.scroll_streak, &mut v.scroll_streak);
+        swap(&mut self.base, &mut v.base);
+        swap(&mut self.patch, &mut v.patch);
+        swap(&mut self.req_base, &mut v.req_base);
+        swap(&mut self.req_patch, &mut v.req_patch);
     }
 
     /// Clears what's tied to the shown document's view: rendered pages, gestures in progress.
@@ -682,13 +838,37 @@ impl App {
         self.hatch_scale_pending = None;
     }
 
-    /// Shows tab `i`.
+    /// Lets go of rendered pages kept for background tabs beyond the latest
+    /// `TEX_TABS` (not the one split screen's other pane shows).
+    fn trim_parked_tex(&mut self) {
+        let shown = self.other.as_ref().and_then(|p| p.doc);
+        let has = |p: &Parked| !p.view.base.is_empty() || !p.view.patch.is_empty() || !p.thumbs.is_empty();
+        let mut seqs: Vec<u64> = self.tabs.iter().filter_map(|t| t.parked.as_deref()).filter(|p| has(p) && Some(p.generation) != shown).map(|p| p.parked_seq).collect();
+        seqs.sort_unstable_by(|a, b| b.cmp(a));
+        let Some(&oldest_kept) = seqs.get(TEX_TABS.saturating_sub(1)) else { return };
+        for p in self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()) {
+            if p.parked_seq < oldest_kept && Some(p.generation) != shown {
+                p.view.base.clear();
+                p.view.patch.clear();
+                p.thumbs.clear();
+            }
+        }
+    }
+
+    /// Shows tab `i` (in the active pane; if the other pane shows it, that pane becomes the active one).
     fn switch_tab(&mut self, i: usize) {
         if i == self.cur_tab || i >= self.tabs.len() {
             return;
         }
-        let parked = self.park();
+        let g = self.tabs[i].parked.as_ref().map(|p| p.generation);
+        if g.is_some() && self.other.as_ref().is_some_and(|p| p.doc == g) {
+            self.activate_other();
+            return;
+        }
+        let mut parked = self.park();
+        self.leaving_shown_doc(&mut parked);
         self.tabs[self.cur_tab].parked = Some(parked);
+        self.trim_parked_tex();
         self.cur_tab = i;
         if let Some(p) = self.tabs[i].parked.take() {
             self.unpark(p);
@@ -702,6 +882,8 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        // A background save still on its way may yet fail: know before letting a document go.
+        self.settle_saves();
         if i == self.cur_tab {
             if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
                 self.end_drag();
@@ -724,6 +906,8 @@ impl App {
             }
             drop(p);
             self.tabs.remove(i);
+            // Split screen on another document: that one takes over, in its pane.
+            let beside = self.other.as_ref().and_then(|o| o.doc).and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
             if self.tabs.is_empty() {
                 self.tabs.push(Tab { parked: None });
                 self.cur_tab = 0;
@@ -732,17 +916,26 @@ impl App {
                 self.status = String::from("Ctrl+O to open a PDF (or drop one here)");
                 self.status_until = f64::INFINITY;
             } else {
-                self.cur_tab = i.min(self.tabs.len() - 1);
+                self.cur_tab = beside.unwrap_or(i.min(self.tabs.len() - 1));
                 if let Some(p) = self.tabs[self.cur_tab].parked.take() {
                     self.unpark(p);
                 }
+                if beside.is_some() {
+                    self.active_left = !self.active_left;
+                }
             }
+            self.reset_other_view();
             self.set_title();
         } else {
             // Parked: it was saved when parked; a failed save is retried once more here.
             let tab = self.tabs.remove(i);
             if i < self.cur_tab {
                 self.cur_tab -= 1;
+            }
+            // Shown in split screen's other pane: that pane shows this document again.
+            let g = tab.parked.as_ref().map(|p| p.generation);
+            if g.is_some() && self.other.as_ref().is_some_and(|o| o.doc == g) && !tab.parked.as_ref().is_some_and(|p| p.dirty && !p.read_only) {
+                self.reset_other_view();
             }
             if let (Some(p), Some(w)) = (tab.parked, &self.worker) {
                 if p.dirty && !p.read_only {
@@ -757,6 +950,31 @@ impl App {
                 }
                 w.send(Req::Close { generation: p.generation });
             }
+        }
+    }
+
+    /// Split screen's other pane back to a second view of the shown document,
+    /// where the shown view is (its document closed, say).
+    fn reset_other_view(&mut self) {
+        let shown = self.other.as_ref().and_then(|o| o.doc);
+        self.forget_requests(shown);
+        let id = self.new_view_id();
+        let (zoom, offset) = (self.zoom, self.offset);
+        if let Some(o) = self.other.as_mut() {
+            o.doc = None;
+            o.view = View { id, zoom, offset, fit_pending: true, ..Default::default() };
+        }
+    }
+
+    /// A background tab's document no longer shown in the other pane: renders it
+    /// asked for won't come (the worker drops them), so forget them, to be asked
+    /// for again when it's shown.
+    fn forget_requests(&mut self, doc: Option<u64>) {
+        let Some(g) = doc else { return };
+        if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == g) {
+            p.view.req_base.clear();
+            p.view.req_patch.clear();
+            p.req_thumb.clear();
         }
     }
 
@@ -778,6 +996,7 @@ impl App {
                 p.dirty = false;
                 continue;
             };
+            self.saver.flush();
             match sidecar::save_file(f, pdf, &p.annots, &p.scales, &p.accepted) {
                 Ok(()) => p.dirty = false,
                 Err(e) => failed = Some(format!("AUTOSAVE FAILED for {}: {e}", pdf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
@@ -835,8 +1054,19 @@ impl App {
                     if unsaved {
                         short.insert_str(0, "● ");
                     }
+                    // The one split screen's other pane shows.
+                    let beside = self.other.as_ref().and_then(|o| o.doc).is_some_and(|g| self.tabs[i].parked.as_ref().is_some_and(|p| p.generation == g));
+                    if beside {
+                        short.insert_str(0, "⬌ ");
+                    }
                     let on = i == self.cur_tab;
-                    let tip = if unsaved { format!("{name} — not saved yet (retrying)") } else { name.clone() };
+                    let tip = if unsaved {
+                        format!("{name} — not saved yet (retrying)")
+                    } else if beside {
+                        format!("{name} — in the other pane")
+                    } else {
+                        name.clone()
+                    };
                     let r = ui.add(egui::Button::selectable(on, short).sense(Sense::click_and_drag())).on_hover_text(tip);
                     if on && std::mem::take(&mut self.tab_scroll) {
                         r.scroll_to_me(None);
@@ -925,8 +1155,10 @@ impl App {
         self.tab_scroll = true;
         // Open beside what's shown, in a new tab.
         if self.path.is_some() {
-            let parked = self.park();
+            let mut parked = self.park();
+            self.leaving_shown_doc(&mut parked);
             self.tabs[self.cur_tab].parked = Some(parked);
+            self.trim_parked_tex();
             self.tabs.insert(self.cur_tab + 1, Tab { parked: None });
             self.cur_tab += 1;
         }
@@ -1031,22 +1263,150 @@ impl App {
         }
     }
 
-    fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
-        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
+    /// Whether `out` may be written: not the original PDF, nor one open in another tab (says why not).
+    fn may_write(&mut self, out: &std::path::Path) -> bool {
+        let Some(src) = &self.path else { return false };
         // Compare real paths so a symlinked folder can't alias the original.
-        let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.clone());
-        if real_out == *src || dunce::canonicalize(&out).is_ok_and(|o| o == *src) {
+        let real_out = out.parent().and_then(|d| dunce::canonicalize(d).ok()).zip(out.file_name()).map(|(d, f)| d.join(f)).unwrap_or_else(|| out.to_path_buf());
+        if real_out == *src || dunce::canonicalize(out).is_ok_and(|o| o == *src) {
             self.toast("Refusing to overwrite the original PDF".into());
-            return;
+            return false;
         }
-        // Nor a PDF open in another tab.
-        let open_elsewhere = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter_map(|p| p.path.as_ref()).any(|p| *p == real_out || dunce::canonicalize(&out).is_ok_and(|o| o == *p));
+        let open_elsewhere = self.tabs.iter().filter_map(|t| t.parked.as_ref()).filter_map(|p| p.path.as_ref()).any(|p| *p == real_out || dunce::canonicalize(out).is_ok_and(|o| o == *p));
         if open_elsewhere {
-            self.toast("That PDF is open in another tab: export to another name".into());
+            self.toast("That PDF is open in another tab: write it under another name".into());
+            return false;
+        }
+        true
+    }
+
+    /// Writes `<name>_smaller.pdf` beside the original: its big scans and photos
+    /// brought down and recompressed (markups aren't part of it; export them as usual).
+    fn smaller_copy(&mut self) {
+        let Some(src) = self.path.clone() else { return };
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        let out = src.with_file_name(format!("{stem}_smaller.pdf"));
+        if !self.may_write(&out) {
             return;
         }
-        let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
+        // A big scanned set takes a while: in a process of its own if we can.
+        let dpi = crate::render::SHRINK_DPI;
+        if self.run_cli(CliJob::Shrink, vec!["shrink".into(), src.clone().into(), "--out".into(), out.clone().into(), "--dpi".into(), dpi.to_string().into()]) {
+            self.status = "Making a smaller copy… (carry on meanwhile)".into();
+            self.status_until = f64::INFINITY;
+        } else if let Some(w) = &self.worker {
+            w.send(Req::Shrink { src, out, dpi });
+            self.status = "Making a smaller copy…".into();
+            self.status_until = f64::INFINITY;
+        }
+    }
+
+    /// Saves the markups now (even if they look saved: a background save may
+    /// have failed unreported), and says whether their file is up to date.
+    fn markups_saved(&mut self) -> bool {
+        if self.read_only || self.markups_file.is_none() {
+            return false;
+        }
+        self.dirty = true;
+        self.save_sidecar();
+        !self.dirty
+    }
+
+    /// Runs greenline-cli (beside this program) with `args` on a thread of its
+    /// own, its answer coming back through `cli_done`. False if it isn't there.
+    fn run_cli(&mut self, job: CliJob, args: Vec<std::ffi::OsString>) -> bool {
+        let Some(cli) = cli_path() else { return false };
+        let (tx, ctx) = (self.cli_done.0.clone(), self.repaint.clone());
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new(cli);
+            cmd.args(args).stdin(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                // A console program: no window flashing up.
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            let result = match cmd.output() {
+                Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout).map_err(|e| e.to_string()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().trim_start_matches("error: ").to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send((job, result));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        true
+    }
+
+    /// Answers from greenline-cli jobs.
+    fn poll_cli(&mut self) {
+        while let Ok((job, result)) = self.cli_done.1.try_recv() {
+            match (job, result) {
+                (CliJob::Export, Ok(v)) => {
+                    let file = PathBuf::from(v["file"].as_str().unwrap_or_default());
+                    self.exported(Ok((file, v["characters_without_font"].as_u64().unwrap_or(0) as usize)));
+                }
+                (CliJob::Export, Err(e)) => self.exported(Err(e)),
+                (CliJob::Shrink, Ok(v)) => {
+                    let n = |k: &str| v[k].as_u64().unwrap_or(0);
+                    let check_pages = v["check_pages"].as_array().map(|a| a.iter().filter_map(|p| p.as_u64().map(|p| p as usize)).collect()).unwrap_or_default();
+                    let r = crate::render::Shrunk { before: n("bytes_before"), after: n("bytes_after"), recompressed: n("images_recompressed") as usize, kept: n("images_kept") as usize, check_pages };
+                    self.shrunk(Ok((PathBuf::from(v["file"].as_str().unwrap_or_default()), r)));
+                }
+                (CliJob::Shrink, Err(e)) => self.shrunk(Err(e)),
+            }
+        }
+    }
+
+    fn exported(&mut self, r: Result<(PathBuf, usize), String>) {
+        self.toast(match r {
+            Ok((p, 0)) => format!("Exported → {}", p.display()),
+            Ok((p, missing)) => format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()),
+            Err(e) => format!("Export failed: {e}"),
+        });
+    }
+
+    fn shrunk(&mut self, r: Result<(PathBuf, crate::render::Shrunk), String>) {
+        let (p, r) = match r {
+            Ok(x) => x,
+            Err(e) => return self.toast(format!("Smaller copy failed: {e}")),
+        };
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let check = if r.check_pages.is_empty() {
+            String::new()
+        } else {
+            format!("; check page{} {}", if r.check_pages.len() == 1 { "" } else { "s" }, r.check_pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+        };
+        self.toast(if r.recompressed == 0 {
+            format!("Nothing to make smaller: no big scans or photos ({})", p.display())
+        } else {
+            format!("Smaller copy → {}: {:.1} MB → {:.1} MB ({} images){check}", p.display(), mb(r.before), mb(r.after), r.recompressed)
+        });
+    }
+
+    fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
+        if !self.may_write(&out) {
+            return;
+        }
+        let Some(src) = self.path.clone() else { return };
         let author = if self.prefs.author.trim().is_empty() { default_author() } else { self.prefs.author.trim().to_string() };
+        // In a process of its own, so the sheets keep rendering meanwhile; it reads the
+        // markups from their file, so they're saved first.
+        if self.markups_saved() {
+            let units = if self.prefs.units == Units::Metric { "metric" } else { "imperial" };
+            let mut args: Vec<std::ffi::OsString> = vec!["export".into(), src.into(), "--out".into(), out.clone().into(), "--author".into(), author.clone().into(), "--units".into(), units.into()];
+            if mode == ExportMode::Editable {
+                args.push("--editable".into());
+            }
+            if self.run_cli(CliJob::Export, args) {
+                self.status = "Exporting… (carry on meanwhile)".into();
+                self.status_until = f64::INFINITY;
+                return;
+            }
+        }
+        let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
+        let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
         w.send(Req::Export { src: src.clone(), out, annots, mode, author });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
@@ -1187,7 +1547,8 @@ impl App {
     /// The image is decoded and stored off the UI thread (a big photo takes a moment).
     fn place_picture(&mut self, src: &std::path::Path, at: Option<Pos2>) {
         // Where it was dropped, fixed now: the view may move before it's ready.
-        let target = at.filter(|_| !self.overview).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
+        // Only on the pane's own sheets: a page reaching past it (zoomed in, split) isn't hit.
+        let target = at.filter(|s| !self.overview && self.canvas.contains(*s)).and_then(|s| self.page_at(s).map(|pg| (pg, self.screen_to_page(pg, s))));
         // Placing starts in Select now; changing tool or Esc before it's ready cancels it.
         if self.tool != Tool::Select {
             self.set_tool(Tool::Select);
@@ -1232,8 +1593,26 @@ impl App {
     }
 
     /// Rereads the pattern library (built-ins, own, shared folder).
+    /// Rereads the pattern library on a thread of its own (the shared folder may
+    /// be on a slow network drive); the pickers show it when it's in.
     fn reload_patterns(&mut self) {
-        self.patterns = patterns::Library::load(self.prefs.pattern_dir.as_deref());
+        let (tx, rx) = mpsc::channel();
+        let dir = self.prefs.pattern_dir.clone();
+        let ctx = self.repaint.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(patterns::Library::load(dir.as_deref()));
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.patterns_rx = Some(rx);
+    }
+
+    /// A pattern library read by `reload_patterns`, once it's in.
+    fn poll_patterns(&mut self) {
+        let Some(lib) = self.patterns_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.patterns_rx = None;
+        self.patterns = lib;
         let n = self.patterns.line_types.len() + self.patterns.hatches.len();
         if let Some(p) = self.patterns.problems.first() {
             let more = self.patterns.problems.len() - 1;
@@ -1241,15 +1620,73 @@ impl App {
         }
     }
 
+    /// The shown document's markups as they are now, to write to `markups_file`.
+    fn sidecar_now(&self) -> Option<(PathBuf, sidecar::Sidecar)> {
+        let (Some(p), Some(f)) = (&self.path, &self.markups_file) else { return None };
+        Some((f.clone(), sidecar::Sidecar { pdf: p.clone(), annots: self.annots.clone(), scales: self.scales.clone(), accepted: self.accepted.clone() }))
+    }
+
+    /// Autosave: hands the markups to the saver thread and carries on. A failure
+    /// comes back through `poll_saves`, which marks them unsaved again.
+    fn autosave(&mut self) {
+        if !self.dirty || self.read_only {
+            return;
+        }
+        let Some((f, s)) = self.sidecar_now() else {
+            self.dirty = false;
+            return;
+        };
+        self.save_seq += 1;
+        self.save_seqs.insert(f.clone(), self.save_seq);
+        self.saver.save_later(f, s, self.save_seq);
+        self.dirty = false;
+    }
+
+    /// Background saves that finished: the latest of a file's failing leaves its
+    /// markups unsaved (the shown document's, or a background tab's), to be retried.
+    fn poll_saves(&mut self) {
+        while let Ok((file, seq, result)) = self.saver.done.try_recv() {
+            // Overtaken by a later save of the same file (each file counts its own:
+            // other documents' saves in between mustn't hide this one's failure).
+            if self.save_seqs.get(&file) != Some(&seq) {
+                continue;
+            }
+            let Err(e) = result else { continue };
+            if Some(&file) == self.markups_file.as_ref() {
+                self.dirty = true;
+                self.status = format!("AUTOSAVE FAILED: {e}");
+                self.status_until = f64::INFINITY;
+                self.save_retry_at = self.now + 5.0;
+            } else if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.markups_file.as_ref() == Some(&file)) {
+                // A background tab's (split screen's panes swapped, or the tab switched, as it
+                // saved): unsaved again, retried with the other background tabs.
+                p.dirty = true;
+            }
+        }
+    }
+
+    /// Waits for background saves and takes in how they went, so `dirty` (here and
+    /// in background tabs) is true for anything whose save failed. Before closing
+    /// a document or quitting, which go on only when it's saved.
+    fn settle_saves(&mut self) {
+        self.saver.flush();
+        self.poll_saves();
+    }
+
+    /// Saves now, waiting for it (before switching or closing a document, accepting
+    /// proposals or quitting, which go on only if it worked: `dirty` says).
     fn save_sidecar(&mut self) {
         if !self.dirty || self.read_only {
             return;
         }
-        let (Some(p), Some(f)) = (&self.path, &self.markups_file) else {
+        let Some((f, s)) = self.sidecar_now() else {
             self.dirty = false;
             return;
         };
-        match sidecar::save_file(f, p, &self.annots, &self.scales, &self.accepted) {
+        // Any background save still to report is overtaken by this one.
+        self.save_seq += 1;
+        self.save_seqs.insert(f.clone(), self.save_seq);
+        match self.saver.save_now(f, s) {
             Ok(()) => self.dirty = false,
             Err(e) => {
                 // Stays dirty; retried on the next change or document switch.
@@ -1276,7 +1713,7 @@ impl App {
                     if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
                         (p.page_y, p.doc_w, p.doc_h) = layout(&pages);
                         p.pages = pages;
-                        p.fit_pending = true;
+                        p.view.fit_pending = true;
                     }
                 }
                 Resp::OpenFailed { generation, error } if generation != self.generation => {
@@ -1290,45 +1727,24 @@ impl App {
                     self.status = format!("Could not open: {error}");
                     self.path = None;
                 }
-                Resp::Rendered { generation, page, scale, origin, layer, image } if generation == self.generation => {
-                    let size = image.size;
-                    let mip = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
-                    let opts = if layer == Layer::Patch { TextureOptions::LINEAR } else { mip };
-                    let tex = ctx.load_texture(format!("p{page}{layer:?}"), image, opts);
-                    let t = PageTex { tex, scale, origin, size };
-                    match layer {
-                        Layer::Patch => {
-                            self.req_patch.remove(&page);
-                            self.patch.insert(page, t);
-                        }
-                        Layer::Base => {
-                            self.req_base.remove(&page);
-                            self.base.insert(page, t);
-                        }
-                        Layer::Thumb => {
-                            self.req_thumb.remove(&page);
-                            self.thumbs.insert(page, t);
-                        }
+                Resp::Rendered { generation, view, page, scale, origin, layer, image } => self.route_render(ctx, generation, view, page, scale, origin, layer, image),
+                Resp::RenderFailed { generation, view, page, layer, error } => {
+                    if generation == self.generation && view == self.view_id {
+                        self.render_failed(page, layer, error);
+                    } else {
+                        self.with_other(|app| {
+                            if generation == app.generation && view == app.view_id {
+                                app.render_failed(page, layer, error);
+                            }
+                        });
                     }
                 }
-                Resp::RenderFailed { generation, page, layer, error } if generation == self.generation => {
-                    match layer {
-                        Layer::Patch => self.req_patch.remove(&page).is_some(),
-                        Layer::Base => self.req_base.remove(&page).is_some(),
-                        Layer::Thumb => self.req_thumb.remove(&page),
-                    };
-                    self.failed.insert(page);
-                    self.toast(format!("Page {} failed to render: {error}", page + 1));
-                }
-                Resp::Exported(Ok((p, 0))) => self.toast(format!("Exported → {}", p.display())),
-                Resp::Exported(Ok((p, missing))) => {
-                    self.toast(format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()))
-                }
-                Resp::Exported(Err(e)) => self.toast(format!("Export failed: {e}")),
+                Resp::Exported(r) => self.exported(r),
                 Resp::Created(Ok(path)) => {
                     let lock = self.creating.take().map(|c| c.1);
                     self.open_with(path, lock);
                 }
+                Resp::Shrunk(r) => self.shrunk(r),
                 Resp::Created(Err(e)) => {
                     self.creating = None;
                     self.toast(format!("Could not create the document: {e}"));
@@ -1343,6 +1759,61 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// A render arrived: into the textures of the view it's for, the shown one
+    /// or split screen's other pane (thumbnails go by document). One for a view
+    /// no longer shown is dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn route_render(&mut self, ctx: &egui::Context, generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage>) {
+        if generation == self.generation && (view == self.view_id || layer == Layer::Thumb) {
+            self.take_render(ctx, page, scale, origin, layer, image);
+        } else {
+            self.with_other(|app| {
+                if generation == app.generation && (view == app.view_id || layer == Layer::Thumb) {
+                    app.take_render(ctx, page, scale, origin, layer, image);
+                }
+            });
+        }
+    }
+
+    /// A render for the shown view arrived: into its textures.
+    fn take_render(&mut self, ctx: &egui::Context, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage>) {
+        let size = image.size;
+        let opts = TextureOptions::LINEAR;
+        let tex = ctx.load_texture(format!("p{page}{layer:?}"), image, opts);
+        let t = PageTex { tex, scale, origin, size };
+        match layer {
+            Layer::Patch => {
+                let key = (page, origin, scale.to_bits());
+                if self.req_patch.get(&key) == Some(&scale) {
+                    self.req_patch.remove(&key);
+                }
+                self.patch.insert(key, t);
+            }
+            Layer::Base => {
+                self.req_base.remove(&page);
+                self.base.insert(page, t);
+            }
+            Layer::Thumb => {
+                self.req_thumb.remove(&page);
+                self.thumbs.insert(page, t);
+            }
+        }
+    }
+
+    fn render_failed(&mut self, page: usize, layer: Layer, error: String) {
+        match layer {
+            Layer::Patch => self.req_patch.retain(|k, _| k.0 != page),
+            Layer::Base => {
+                self.req_base.remove(&page);
+            }
+            Layer::Thumb => {
+                self.req_thumb.remove(&page);
+            }
+        }
+        self.failed.insert(page);
+        self.toast(format!("Page {} failed to render: {error}", page + 1));
     }
 
     // -----------------------------------------------------------------------
@@ -1644,8 +2115,33 @@ impl App {
     // -----------------------------------------------------------------------
     // Rendering requests
 
-    fn request_renders(&mut self, ctx: &egui::Context, now: f64) {
+    /// Asks the worker for what the shown view (and split screen's other pane)
+    /// needs: first telling it what's still wanted, so it drops the rest, then
+    /// sending what's missing.
+    fn request_all_renders(&mut self, ctx: &egui::Context, now: f64) {
+        if self.worker.is_none() {
+            return;
+        }
+        let mut wanted = Wanted { thumbs_generation: self.generation, ..Default::default() };
+        self.request_renders(ctx, now, &mut wanted, true);
+        self.with_other(|app| app.request_renders(ctx, now, &mut wanted, false));
         let Some(w) = &self.worker else { return };
+        {
+            let mut keep = w.keep.lock().unwrap();
+            keep.base = wanted.base;
+            keep.tiles = wanted.tiles;
+            keep.thumbs = wanted.thumbs;
+            keep.thumbs_missing = wanted.thumbs_missing;
+            keep.thumbs_generation = wanted.thumbs_generation;
+        }
+        for r in wanted.reqs {
+            w.send(r);
+        }
+    }
+
+    /// What the shown view needs rendered, into `wanted`; with `thumbs`, the
+    /// sidebar's or overview's thumbnails too.
+    fn request_renders(&mut self, ctx: &egui::Context, now: f64, wanted: &mut Wanted, thumbs: bool) {
         if self.pages.is_empty() {
             return;
         }
@@ -1660,43 +2156,48 @@ impl App {
             }
         }
         want.sort_by_key(|&i| (i as i64 - cur as i64).abs());
-        if self.overview {
+        if self.overview && !self.inactive {
             want.clear();
         }
-        let mut thumbs_wanted = std::mem::take(&mut self.thumbs_wanted);
-        thumbs_wanted.retain(|&i| i < self.pages.len());
-        {
-            let mut keep = w.keep.lock().unwrap();
-            keep.base = want.iter().copied().collect();
-            keep.thumbs = thumbs_wanted.iter().copied().collect();
-        }
-        self.req_thumb.retain(|k| thumbs_wanted.contains(k));
-        for &i in &thumbs_wanted {
-            if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
-                continue;
+        wanted.base.extend(want.iter().map(|&i| (self.view_id, i)));
+        if thumbs {
+            let mut thumbs_wanted = std::mem::take(&mut self.thumbs_wanted);
+            thumbs_wanted.retain(|&i| i < self.pages.len());
+            wanted.thumbs.extend(thumbs_wanted.iter().copied());
+            wanted.thumbs_missing.extend(thumbs_wanted.iter().copied().filter(|i| !self.thumbs.contains_key(i)));
+            self.req_thumb.retain(|k| thumbs_wanted.contains(k));
+            for &i in &thumbs_wanted {
+                if self.thumbs.contains_key(&i) || self.req_thumb.contains(&i) || self.failed.contains(&i) {
+                    continue;
+                }
+                let (scale, size) = crate::render::thumb_size(self.pages[i]);
+                wanted.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
+                self.req_thumb.insert(i);
             }
-            let s = self.pages[i];
-            let scale = THUMB_PX / s.x.max(s.y);
-            let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
-            w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Thumb });
-            self.req_thumb.insert(i);
-        }
-        if self.thumbs.len() > MAX_THUMBS {
-            self.thumbs.retain(|k, _| thumbs_wanted.contains(k));
+            if self.thumbs.len() > MAX_THUMBS {
+                self.thumbs.retain(|k, _| thumbs_wanted.contains(k));
+            }
         }
         let keep_tex: HashSet<usize> = want.iter().flat_map(|&i| i.saturating_sub(2)..=i + 2).collect();
         if !self.overview {
             self.base.retain(|k, _| keep_tex.contains(k));
         }
-        self.patch.retain(|k, _| vis.contains(k));
         // The worker drops requests for pages that left `keep`; forget them so they are re-sent.
         self.req_base.retain(|k, _| want.contains(k));
-        self.req_patch.retain(|k, _| vis.contains(k));
 
+        // While zooming, a page already rendered keeps that render (scaled) until
+        // zooming pauses: each half-octave passed would otherwise queue a whole-page
+        // render, stale before it's done, ahead of the one wanted at the end.
+        let zooming = now - self.last_view_change < 0.12;
         for &i in &want {
+            if zooming && self.base.contains_key(&i) {
+                continue;
+            }
             let s = self.pages[i];
             let cap = MAX_BASE_PX / s.x.max(s.y);
-            let bucket = 2f32.powf(need.log2().ceil()).max(0.125);
+            // Half-octave steps: at most 1.41x the pixels needed across (2x in all),
+            // where whole octaves rendered up to 4x as many as the screen shows.
+            let bucket = 2f32.powf((need.log2() * 2.0).ceil() / 2.0).max(0.125);
             let scale = bucket.min(cap);
             if self.failed.contains(&i) {
                 continue;
@@ -1704,46 +2205,233 @@ impl App {
             let have = self.base.get(&i).map(|t| t.scale);
             if have != Some(scale) && self.req_base.get(&i) != Some(&scale) {
                 let size = [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize];
-                w.send(Req::Render { generation: self.generation, page: i, scale, origin: [0, 0], size, layer: Layer::Base });
+                wanted.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: i, scale, origin: [0, 0], size, layer: Layer::Base });
                 self.req_base.insert(i, scale);
             }
         }
 
-        // Sharp patch of the visible region once the view settles.
-        if self.overview {
+        self.request_tiles(ctx, now, need, &vis, wanted);
+    }
+
+    /// Split screen on or off. The other pane starts as a second view of the
+    /// shown document, where this one is; pick a tab while it's active to show
+    /// another document there.
+    fn toggle_split(&mut self) {
+        if let Some(pane) = self.other.take() {
+            self.forget_requests(pane.doc);
+            self.active_left = true;
             return;
         }
-        if now - self.last_view_change < 0.12 {
+        let view = View { id: self.new_view_id(), zoom: self.zoom, offset: self.offset, canvas: self.canvas, ..Default::default() };
+        self.other = Some(Pane { doc: None, view });
+        self.active_left = true;
+    }
+
+    /// Makes split screen's other pane the active one: keys, tools and the
+    /// sidebar go to it. A gesture under way in this one is finished first.
+    fn activate_other(&mut self) {
+        let Some(mut pane) = self.other.take() else { return };
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        self.commit_edit();
+        self.drag = Drag::None;
+        self.building = None;
+        let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
+        match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
+            Some((k, mut p)) => {
+                // Another document: the two trade places, this one into its tab.
+                self.autosave();
+                self.swap_doc(&mut p);
+                self.swap_view(&mut p.view);
+                pane.doc = Some(p.generation);
+                // What was under way belongs to the document left: a calibration line, images
+                // being placed, a run of nudges, a toolbar drag, the typing format.
+                self.scale_win.target = None;
+                self.scale_win.calib = None;
+                self.queued_pictures.clear();
+                self.picture_epoch += 1;
+                self.last_nudge = (0.0, Vec::new());
+                self.fill_pending = None;
+                self.hatch_scale_pending = None;
+                self.props_hover = None;
+                self.props_checked = f64::NEG_INFINITY;
+                self.edit_sel = None;
+                self.typing = None;
+                // Scale suggestions asked for but not back are asked again when it's shown.
+                let found = &p.scale_found;
+                p.scale_asked.retain(|pg| found.contains_key(pg));
+                // Its thumbnails on their way are dropped (the sidebar shows the other
+                // document now): asked for again when it's the active one.
+                p.req_thumb.clear();
+                self.tabs[self.cur_tab].parked = Some(p);
+                self.cur_tab = k;
+                self.set_title();
+                if let Some(w) = &self.worker {
+                    w.keep.lock().unwrap().search = self.find.id;
+                }
+                // A search cut short when this one was last left: carry on.
+                if self.find.open && self.find.pending > 0 {
+                    self.start_search();
+                }
+            }
+            None => {
+                pane.doc = None;
+                self.swap_view(&mut pane.view);
+            }
+        }
+        self.other = Some(pane);
+        self.active_left = !self.active_left;
+        self.sidebar_synced = None;
+    }
+
+    /// Split screen: makes the pane under `pos` the active one, for something
+    /// dropped there (an image is placed on that pane's document).
+    fn activate_pane_at(&mut self, pos: Pos2) {
+        // Its view (with the place it was last drawn) is with its document when that's another.
+        let other = self.with_other(|o| o.canvas).is_some_and(|r| r.contains(pos));
+        if other && !self.canvas.contains(pos) && !self.overview {
+            self.activate_other();
+        }
+    }
+
+    /// Draws split screen's other pane into `r`, and keeps its view in bounds.
+    fn paint_other(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        self.with_other(|app| {
+            app.inactive = true;
+            app.canvas = r;
+            if app.fit_pending && !app.pages.is_empty() && r.width() > 50.0 {
+                app.fit_pending = false;
+                app.fit_width();
+            }
+            app.clamp_offset();
+            if app.zoom != app.view_key.0 {
+                app.last_view_change = now;
+            }
+            app.view_key = (app.zoom, app.offset);
+            app.paint(ui);
+            app.inactive = false;
+        });
+    }
+
+    /// The document now shown is being left for another tab: with the screen
+    /// split on one document, the other pane keeps showing it, where it was.
+    fn leaving_shown_doc(&mut self, parked: &mut Parked) {
+        if let Some(pane) = self.other.as_mut().filter(|p| p.doc.is_none()) {
+            std::mem::swap(&mut parked.view, &mut pane.view);
+            pane.doc = Some(parked.generation);
+        }
+    }
+
+    /// Runs `f` with split screen's other pane swapped in as the shown one (its
+    /// view, and its document if another tab's), then swaps back. Nothing if
+    /// the screen isn't split.
+    fn with_other<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let mut pane = self.other.take()?;
+        // The overview is the active pane's; the other keeps its sheets meanwhile.
+        let overview = std::mem::replace(&mut self.overview, false);
+        let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
+        let r = match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
+            Some((k, mut p)) => {
+                self.swap_doc(&mut p);
+                self.swap_view(&mut p.view);
+                let r = f(self);
+                self.swap_view(&mut p.view);
+                self.swap_doc(&mut p);
+                self.tabs[k].parked = Some(p);
+                r
+            }
+            None => {
+                // Its tab has gone: it shows the shown document.
+                pane.doc = None;
+                self.swap_view(&mut pane.view);
+                let r = f(self);
+                self.swap_view(&mut pane.view);
+                r
+            }
+        };
+        self.other = Some(pane);
+        self.overview = overview;
+        Some(r)
+    }
+
+    /// Sharp tiles over the view (and a ring round it) where the whole-page
+    /// render is coarser than the screen, nearest the middle first. Panning
+    /// keeps the tiles already made and asks only for new ones as they come
+    /// into view; a new zoom waits until zooming pauses, the old tiles shown
+    /// until the new ones cover the view.
+    fn request_tiles(&mut self, ctx: &egui::Context, now: f64, need: f32, vis: &[usize], out: &mut Wanted) {
+        let bits = need.to_bits();
+        let zooming = now - self.last_view_change < 0.12;
+        let wanted = self.wanted_tiles(need, vis);
+        let keys: HashSet<TileKey> = wanted.iter().map(|t| t.0).collect();
+        out.tiles.extend(keys.iter().map(|k| (self.view_id, k.0, k.1)));
+        // Forget requests the worker will drop, so they're asked for again if wanted later.
+        self.req_patch.retain(|k, _| keys.contains(k));
+        // Tiles at another scale stay only while those at this one don't yet cover the view.
+        let covered = wanted.iter().filter(|t| t.3).all(|t| self.patch.contains_key(&t.0));
+        let shown: HashSet<usize> = vis.iter().copied().collect();
+        self.patch.retain(|k, _| if k.2 == bits { keys.contains(k) } else { !covered && shown.contains(&k.0) });
+        if self.patch.len() > MAX_TILES {
+            let mut old: Vec<TileKey> = self.patch.keys().filter(|k| k.2 != bits || !keys.contains(k)).copied().collect();
+            old.truncate(self.patch.len() - MAX_TILES);
+            for k in old {
+                self.patch.remove(&k);
+            }
+        }
+        if zooming {
             ctx.request_repaint_after(std::time::Duration::from_millis(130));
             return;
         }
+        for (key, size, _, _) in wanted {
+            if !self.patch.contains_key(&key) && !self.req_patch.contains_key(&key) {
+                out.reqs.push(Req::Render { generation: self.generation, view: self.view_id, page: key.0, scale: need, origin: key.1, size, layer: Layer::Patch });
+                self.req_patch.insert(key, need);
+            }
+        }
+    }
+
+    /// Tiles to show the view at `need` px/pt on pages `vis`, nearest the middle
+    /// first: each one's key, pixel size, distance from the view's middle, and
+    /// whether it's in view (the rest are a ring round it, for panning into).
+    /// None where a page's whole-page render is already sharp enough.
+    fn wanted_tiles(&self, need: f32, vis: &[usize]) -> Vec<(TileKey, [usize; 2], f32, bool)> {
+        let bits = need.to_bits();
         let view = Rect::from_min_size(self.offset.to_pos2(), self.canvas.size() / self.zoom);
-        for &i in &vis {
+        let ring = TILE_PX as f32 / need;
+        let mut wanted: Vec<(TileKey, [usize; 2], f32, bool)> = Vec::new();
+        if self.overview {
+            return wanted;
+        }
+        for &i in vis {
             let base_scale = self.base.get(&i).map(|t| t.scale).unwrap_or(0.0);
             if base_scale >= need * 0.98 || self.failed.contains(&i) {
-                self.patch.remove(&i);
                 continue;
             }
             let pr = self.page_doc_rect(i);
-            let local = view.intersect(pr).translate(-pr.min.to_vec2());
+            let local = view.expand(ring).intersect(pr).translate(-pr.min.to_vec2());
             if local.width() <= 0.0 || local.height() <= 0.0 {
                 continue;
             }
             let full = [(pr.width() * need).round() as i32, (pr.height() * need).round() as i32];
-            let x0 = ((local.min.x * need).floor() as i32).clamp(0, full[0]);
-            let y0 = ((local.min.y * need).floor() as i32).clamp(0, full[1]);
-            let x1 = ((local.max.x * need).ceil() as i32).clamp(0, full[0]);
-            let y1 = ((local.max.y * need).ceil() as i32).clamp(0, full[1]);
-            if x1 <= x0 || y1 <= y0 {
-                continue;
-            }
-            let key = (need, [x0, y0], [(x1 - x0) as usize, (y1 - y0) as usize]);
-            let have = self.patch.get(&i).map(|t| (t.scale, t.origin, t.size));
-            if have != Some(key) && self.req_patch.get(&i) != Some(&key) {
-                w.send(Req::Render { generation: self.generation, page: i, scale: need, origin: key.1, size: key.2, layer: Layer::Patch });
-                self.req_patch.insert(i, key);
+            let t = TILE_PX as f32;
+            let (x0, y0) = ((local.min.x * need / t).floor() as i32, (local.min.y * need / t).floor() as i32);
+            let (x1, y1) = ((local.max.x * need / t).ceil() as i32, (local.max.y * need / t).ceil() as i32);
+            for ty in y0.max(0)..y1 {
+                for tx in x0.max(0)..x1 {
+                    let origin = [tx * TILE_PX, ty * TILE_PX];
+                    let size = [(full[0] - origin[0]).min(TILE_PX), (full[1] - origin[1]).min(TILE_PX)];
+                    if size[0] <= 0 || size[1] <= 0 {
+                        continue;
+                    }
+                    let doc = Rect::from_min_size(pr.min + vec2(origin[0] as f32, origin[1] as f32) / need, vec2(size[0] as f32, size[1] as f32) / need);
+                    let dist = (doc.center() - view.center()).length();
+                    wanted.push(((i, origin, bits), [size[0] as usize, size[1] as usize], dist, doc.intersects(view)));
+                }
             }
         }
+        wanted.sort_by(|a, b| a.2.total_cmp(&b.2));
+        wanted
     }
 
     // -----------------------------------------------------------------------
@@ -1793,7 +2481,20 @@ impl App {
     /// The bold / italic / underline the toolbar shows: the note being typed or
     /// the lead selected one, else what new notes get.
     fn shown_format(&self) -> [bool; 3] {
-        let note = self.editing.or_else(|| self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. }))));
+        if let Some(a) = self.editing.and_then(|id| self.find(id)) {
+            let fmts = a.style.fmts(text_of(a).chars().count());
+            return match self.edit_sel.clone() {
+                // Words selected: what all of them have.
+                Some(r) if r.start < r.end && r.end <= fmts.len() => [0, 1, 2].map(|w| fmts[r.clone()].iter().all(|f| f.get(w))),
+                // Otherwise what typing would give.
+                r => {
+                    let at = r.map_or(fmts.len(), |r| r.start);
+                    let f = self.typing.unwrap_or_else(|| if at > 0 { fmts.get(at - 1).copied().unwrap_or(a.style.whole()) } else { fmts.first().copied().unwrap_or(a.style.whole()) });
+                    [f.bold, f.italic, f.underline]
+                }
+            };
+        }
+        let note = self.selected.iter().rev().copied().find(|&id| self.find(id).is_some_and(|a| matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. })));
         match note.and_then(|id| self.find(id)) {
             Some(a) => [a.style.bold, a.style.italic, a.style.underline],
             None => self.text_format,
@@ -1804,30 +2505,58 @@ impl App {
     /// selected or edited ones, as the toolbar shows it.
     fn toggle_format(&mut self, which: usize) {
         let on = !self.shown_format()[which];
+        if let Some(id) = self.editing {
+            // While typing: the words selected, or else what's typed next. The
+            // edit (begun with its own undo step) takes the change with it.
+            let sel = self.edit_sel.clone();
+            let typing = self.typing;
+            if let Some(a) = self.find_mut(id) {
+                let mut fmts = a.style.fmts(text_of(a).chars().count());
+                match sel {
+                    Some(r) if r.start < r.end && r.end <= fmts.len() => {
+                        fmts[r].iter_mut().for_each(|f| f.set(which, on));
+                        a.style.set_fmts(&fmts);
+                        self.changed();
+                    }
+                    r => {
+                        let at = r.map_or(fmts.len(), |r| r.start);
+                        let mut f = typing.unwrap_or_else(|| if at > 0 { fmts[at - 1] } else { fmts.first().copied().unwrap_or(a.style.whole()) });
+                        f.set(which, on);
+                        if fmts.is_empty() {
+                            // Nothing typed yet: the note's own flags.
+                            a.style.set_fmts(&[f]);
+                        }
+                        self.typing = Some(f);
+                    }
+                }
+            }
+            // A click on B / I / U mustn't end the typing.
+            self.edit_needs_focus = true;
+            return;
+        }
         self.text_format[which] = on;
-        let ids: Vec<u64> = match self.editing {
-            Some(id) => vec![id],
-            None => self.selected.clone(),
-        };
+        let ids = self.selected.clone();
         let notes = |a: &Annot| ids.contains(&a.id) && matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. });
         if self.annots.iter().any(notes) {
-            // While typing, the edit (begun with its own undo step) takes the change with it.
-            if self.editing.is_none() {
-                self.snapshot();
-            }
+            self.snapshot();
             for a in self.annots.iter_mut().filter(|a| notes(a)) {
-                [&mut a.style.bold, &mut a.style.italic, &mut a.style.underline][which].clone_from(&on);
+                // The whole note, keeping each word's other formatting.
+                let mut fmts = a.style.fmts(a.text().chars().count());
+                if fmts.is_empty() {
+                    let mut f = a.style.whole();
+                    f.set(which, on);
+                    a.style.set_fmts(&[f]);
+                } else {
+                    fmts.iter_mut().for_each(|f| f.set(which, on));
+                    a.style.set_fmts(&fmts);
+                }
                 // Bold text is wider: refit the box from the width it wraps at.
-                if which == 0 && self.editing != Some(a.id) {
+                if which == 0 {
                     a.widen_for_edit();
                     a.fit_box_w();
                 }
             }
             self.changed();
-        }
-        // A click on B / I / U mustn't end the typing.
-        if self.editing.is_some() {
-            self.edit_needs_focus = true;
         }
     }
 
@@ -1907,6 +2636,8 @@ impl App {
         if let Some(a) = self.find_mut(id) {
             a.widen_for_edit();
         }
+        self.edit_sel = None;
+        self.typing = None;
         self.editing = Some(id);
         self.edit_needs_focus = true;
         self.selected = vec![id];
@@ -1926,7 +2657,8 @@ impl App {
 
     fn hit(&self, page: usize, p: Pos2) -> Option<u64> {
         let tol = HIT_PX / self.zoom;
-        let mut hits = self.annots.iter().rev().filter(|a| a.page == page && a.distance(p) <= tol);
+        // The box round a markup first: only the few near the pointer are measured.
+        let mut hits = self.annots.iter().rev().filter(|a| a.page == page && a.bounds().expand(tol).contains(p) && a.distance(p) <= tol);
         // Prefer a selected one, then topmost.
         hits.clone().find(|a| self.selected.contains(&a.id)).or_else(|| hits.next()).map(|a| a.id)
     }
@@ -2329,6 +3061,9 @@ impl App {
         }
         if pressed(Key::S) {
             self.show_sidebar = !self.show_sidebar;
+        }
+        if pressed(Key::Backslash) && !self.pages.is_empty() {
+            self.toggle_split();
         }
         if pressed(Key::M) {
             self.toggle_right_panel(false);
@@ -3310,6 +4045,8 @@ impl App {
                     scales_now.push(s);
                 }
                 if let Some(f) = &markups_file {
+                    // After any autosave still on its way, so it can't land on top.
+                    self.saver.flush();
                     sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
                     saved = true;
                 }
@@ -3602,14 +4339,36 @@ impl App {
             .filter(|n| !self.textures.contains_key(*n) && !self.tex_failed.contains(*n))
             .cloned()
             .collect();
+        // Decoded on threads of their own (a photo takes a while); a pale square
+        // stands in meanwhile.
         for name in names {
-            match stamps::decode(&name) {
-                Ok(img) => {
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+            let blank = egui::ColorImage::filled([1, 1], Color32::from_gray(235));
+            self.textures.insert(name.clone(), ctx.load_texture(format!("img-{name}"), blank, TextureOptions::LINEAR));
+            // One decoder thread, in turn: a document with many photos mustn't decode them all at once.
+            let decoder = self.decoder.get_or_insert_with(|| {
+                let (tx, rx) = mpsc::channel::<String>();
+                let (done, ctx) = (self.decoding.0.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    for name in rx {
+                        let img = stamps::decode(&name).map(|img| egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())).map_err(|e| e.to_string());
+                        if done.send((name, img)).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+                tx
+            });
+            let _ = decoder.send(name);
+        }
+        while let Ok((name, img)) = self.decoding.1.try_recv() {
+            match img {
+                Ok(ci) => {
                     let opts = TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
                     self.textures.insert(name.clone(), ctx.load_texture(format!("img-{name}"), ci, opts));
                 }
                 Err(e) => {
+                    self.textures.remove(&name);
                     self.tex_failed.insert(name);
                     self.toast(format!("Stamp image missing: {e}"));
                 }
@@ -3634,6 +4393,7 @@ impl App {
     }
 
     fn paint(&mut self, ui: &mut Ui) {
+        let ppp = ui.ctx().pixels_per_point();
         let painter = ui.painter_at(self.canvas);
         painter.rect_filled(self.canvas, 0.0, crate::theme::canvas(ui.visuals()));
         let k = self.text_metrics(&painter);
@@ -3647,28 +4407,54 @@ impl App {
             let base_scale = self.base.get(&i).map(|t| t.scale).unwrap_or(0.0);
             if let Some(t) = self.base.get(&i) {
                 painter.image(t.tex.id(), sr, uv, Color32::WHITE);
+            } else if let Some(t) = self.thumbs.get(&i) {
+                // Its thumbnail, blown up, until the page itself is rendered.
+                painter.image(t.tex.id(), sr, uv, Color32::WHITE);
             }
-            if let Some(t) = self.patch.get(&i).filter(|t| t.scale > base_scale) {
+            // Tiles over it, any left at an old zoom first and the current ones on top.
+            let mut tiles: Vec<&PageTex> = self.patch.iter().filter(|(k, t)| k.0 == i && t.scale > base_scale).map(|(_, t)| t).collect();
+            tiles.sort_by(|a, b| (a.scale == self.zoom * ppp).cmp(&(b.scale == self.zoom * ppp)).then(a.scale.total_cmp(&b.scale)));
+            for t in tiles {
                 let min = pr.min + vec2(t.origin[0] as f32, t.origin[1] as f32) / t.scale;
                 let max = min + vec2(t.size[0] as f32, t.size[1] as f32) / t.scale;
-                painter.image(t.tex.id(), Rect::from_min_max(self.to_screen(min), self.to_screen(max)), uv, Color32::WHITE);
+                let r = Rect::from_min_max(self.to_screen(min), self.to_screen(max));
+                if r.intersects(self.canvas) {
+                    painter.image(t.tex.id(), r, uv, Color32::WHITE);
+                }
             }
 
             let pp = painter.with_clip_rect(sr.intersect(self.canvas));
+            // The part of the page on screen (page points), with room for strokes
+            // drawn wider than their width when zoomed far out: markups wholly
+            // outside it aren't drawn at all.
+            let shown = Rect::from_min_max(self.screen_to_page(i, self.canvas.min), self.screen_to_page(i, self.canvas.max)).expand(4.0 / self.zoom);
             for a in self.annots.iter().filter(|a| a.page == i) {
-                let mut prims = a.prims();
-                if Some(a.id) == self.editing {
-                    prims = typed_note_prims(a);
+                let g = a.geom();
+                if !g.bounds.intersects(shown) {
+                    continue;
+                }
+                if Some(a.id) == self.editing && !self.inactive {
+                    // The editor draws the text and its underlines.
+                    let mut plain = a.clone();
+                    plain.style.underline = false;
+                    plain.style.runs.iter_mut().for_each(|r| r.fmt.underline = false);
+                    let prims: Vec<Prim> = plain.geom().prims.iter().filter(|p| !matches!(p, Prim::Text { .. })).cloned().collect();
                     if let Kind::Text { .. } = a.kind {
                         let r = a.text_box().unwrap();
                         let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max));
                         pp.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
                     }
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0, &self.textures);
+                    continue;
                 }
-                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &prims, k, 1.0, &self.textures);
+                if speck(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, a, &g, 3.0) {
+                    continue;
+                }
+                paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &g.prims, k, 1.0, &self.textures);
             }
-            // Live preview.
-            match &self.drag {
+            // Live preview (of a gesture in the active pane only).
+            let drag = if self.inactive { &Drag::None } else { &self.drag };
+            match drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
                     let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline) { square(*start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
@@ -3697,13 +4483,13 @@ impl App {
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
                     let hot = self.props_hover.as_ref().is_some_and(|(bid, id)| *bid == b.id && *id == a.id);
                     pp.rect_filled(r, 0.0, PROPOSED.gamma_multiply(if hot { 0.14 } else { 0.08 }));
-                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.prims(), k, 0.85, &self.textures);
+                    paint_prims(&pp, self.page_to_screen(i, Pos2::ZERO), self.zoom, &a.geom().prims, k, 0.85, &self.textures);
                     let pts = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
                     pp.extend(Shape::dashed_line(&pts, Stroke::new(if hot { 2.5 } else { 1.2 }, PROPOSED), 5.0, 3.0));
                 }
             }
             // The measurement being clicked out, running to the pointer.
-            if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i) {
+            if let Some((page, pts)) = self.building.as_ref().filter(|(p, _)| *p == i && !self.inactive) {
                 let mut pts = pts.clone();
                 if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
                     let h = self.screen_to_page(i, h);
@@ -3743,7 +4529,7 @@ impl App {
                 }
             }
             // Where a stamp being placed will land: the drag so far, or centred on the pointer.
-            if let Some(place) = &self.placing {
+            if let Some(place) = self.placing.as_ref().filter(|_| !self.inactive) {
                 let at = match &self.drag {
                     Drag::Place { page, start, cur } => (*page == i).then_some((*start, *cur)),
                     _ => self.hover.filter(|h| self.page_at(*h) == Some(i)).map(|h| self.screen_to_page(i, h)).map(|p| (p, p)),
@@ -3771,7 +4557,7 @@ impl App {
                 }
             }
             // Selection, plus what a marquee in progress would add.
-            let marquee = match &self.drag {
+            let marquee = match drag {
                 Drag::Marquee { page, start, cur } if *page == i => Some(Rect::from_two_pos(*start, *cur)),
                 _ => None,
             };
@@ -3846,29 +4632,28 @@ impl App {
         let width = (r.width() - 2.0 * pad) * z;
         let fs = (size * z * k.0).max(6.0);
         let mut text = text_of(a).to_string();
+        // The note as it was, for carrying each word's formatting through the edit.
+        let (old_text, whole) = (text.clone(), a.style.whole());
+        let old_fmts = a.style.fmts(old_text.chars().count());
+        let typing = self.typing;
         let needs_focus = std::mem::take(&mut self.edit_needs_focus);
         for (i, k) in [Key::B, Key::I, Key::U].into_iter().enumerate() {
             if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::COMMAND, k)) {
                 self.toggle_format(i);
             }
         }
-        // Formatting may have just changed (B / I / U): lay out with it. The sheet
-        // leaves out the note's underline while it's typed, so the editor draws it.
-        let style = self.find(id).map(|a| a.style.clone()).unwrap_or_default();
+        // Formatting may have just changed (B / I / U): lay out with it.
+        let fmts_now = self.find(id).map(|a| a.style.fmts(old_text.chars().count())).unwrap_or(old_fmts);
+        let typing = self.typing.or(typing);
         let ink = Color32::from_rgb(color[0], color[1], color[2]);
-        let font = FontId::new(fs, helv_styled(style.bold, style.italic));
-        let format = egui::TextFormat {
-            font_id: font.clone(),
-            color: ink,
-            underline: if style.underline { Stroke::new((fs * 0.06).max(1.0), ink) } else { Stroke::NONE },
-            ..Default::default()
-        };
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-            let mut job = egui::text::LayoutJob::single_section(buf.as_str().to_owned(), format.clone());
-            job.wrap.max_width = wrap;
-            ui.painter().layout_job(job)
+            let t = buf.as_str();
+            // The cursor isn't known until the edit is shown: a frame laid out
+            // by inference at most, then by what's stored.
+            let f = annot::carry_fmts(&old_text, &fmts_now, t, typing, whole, None);
+            ui.painter().layout_job(note_job(t, &f, fs, ink, wrap))
         };
-        let resp = egui::Area::new(egui::Id::new("greenline-edit"))
+        let out = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
@@ -3876,29 +4661,43 @@ impl App {
                 let w = width.max(20.0);
                 ui.set_min_width(w);
                 ui.set_max_width(w);
-                ui.add(
-                    egui::TextEdit::multiline(&mut text)
-                        .id(egui::Id::new(("greenline-edit", self.generation, id)))
-                        .frame(egui::Frame::NONE)
-                        .margin(egui::Margin::ZERO)
-                        .desired_width(width.max(20.0))
-                        .desired_rows(1)
-                        // Its row height sizes the editor and the caret, even with a layouter.
-                        .font(font)
-                        .layouter(&mut layouter),
-                )
+                egui::TextEdit::multiline(&mut text)
+                    .id(egui::Id::new(("greenline-edit", self.generation, id)))
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::ZERO)
+                    .desired_width(width.max(20.0))
+                    .desired_rows(1)
+                    // Its row height sizes the editor and the caret, even with a layouter
+                    // (which still picks each word's face; the styled faces share this height).
+                    .font(FontId::new(fs, helv()))
+                    .layouter(&mut layouter)
+                    .show(ui)
             })
             .inner;
+        let resp = out.response.response.clone();
         if needs_focus {
             resp.request_focus();
         }
-        if let Some(a) = self.find_mut(id) {
-            if let Some(t) = a.text_mut() {
-                if *t != text {
+        let sel = out.cursor_range.map(|c| c.as_sorted_char_range()).map(|r| r.start.0..r.end.0);
+        if text != old_text {
+            let cursor = out.cursor_range.map(|c| c.primary.index.0);
+            let fmts = annot::carry_fmts(&old_text, &fmts_now, &text, typing, whole, cursor);
+            if let Some(a) = self.find_mut(id) {
+                if let Some(t) = a.text_mut() {
                     *t = text;
-                    self.dirty = true;
                 }
+                if !fmts.is_empty() {
+                    a.style.set_fmts(&fmts);
+                }
+                self.dirty = true;
             }
+        } else if sel.is_some() && self.edit_sel.is_some() && sel != self.edit_sel {
+            // The cursor moved without typing: what's typed next takes its formatting from there.
+            self.typing = None;
+        }
+        // No cursor while a click on B / I / U has the focus for a moment: keep the last.
+        if sel.is_some() {
+            self.edit_sel = sel;
         }
         let done = ctx.input(|i| i.key_pressed(Key::Escape) || (i.modifiers.command && i.key_pressed(Key::Enter)));
         if done || (!needs_focus && resp.lost_focus()) {
@@ -3936,6 +4735,11 @@ impl App {
                         self.export_measurements();
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button("Smaller copy (PDF)").on_hover_text("<name>_smaller.pdf: big scans and photos brought down to 200 dpi and recompressed; the original stays as it is").clicked() {
+                        self.smaller_copy();
+                        ui.close();
+                    }
                 });
             });
             ui.separator();
@@ -3947,6 +4751,10 @@ impl App {
                 }
                 if ui.selectable_label(self.overview, "Overview   (O)").on_hover_text("All pages at a glance").clicked() && !self.pages.is_empty() {
                     self.toggle_overview();
+                    ui.close();
+                }
+                if ui.selectable_label(self.other.is_some(), "Split screen   (\\)").on_hover_text("Two places side by side: click a pane to work in it, and pick a tab to show another document there").clicked() && !self.pages.is_empty() {
+                    self.toggle_split();
                     ui.close();
                 }
                 if ui.selectable_label(self.show_markups, "Markups   (M)").on_hover_text("List of markups").clicked() {
@@ -4340,7 +5148,11 @@ impl App {
         let k = self.text_k.unwrap_or((1.0, 0.8));
         let clip = painter.with_clip_rect(r);
         for a in self.annots.iter().filter(|a| a.page == i) {
-            paint_prims(&clip, r.min, z, &a.prims(), k, 1.0, &self.textures);
+            let g = a.geom();
+            // In a thumbnail markups show where they are, not what they say.
+            if !speck(&clip, r.min, z, a, &g, 6.0) {
+                paint_prims(&clip, r.min, z, &g.prims, k, 1.0, &self.textures);
+            }
         }
         if current {
             painter.rect_stroke(r.expand(2.0), 2.0, Stroke::new(2.5, crate::theme::accent(ui.visuals())), egui::StrokeKind::Outside);
@@ -4676,9 +5488,14 @@ impl App {
         });
         ui.separator();
         let mut order: Vec<&Annot> = self.annots.iter().collect();
-        order.sort_by_key(|a| page_order(a));
-        let items: Vec<(u64, usize, Rgb, &'static str, String)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a).to_string())).collect();
+        order.sort_by_cached_key(|a| page_order(a));
+        let items: Vec<(u64, usize, Rgb, &'static str, &str)> = order.iter().map(|a| (a.id, a.page, a.color, a.kind_name(), note_of(a))).collect();
         let mut clicked = None;
+        let mut heights = std::mem::take(&mut self.list_heights);
+        // Rows of deleted markups linger harmlessly (ids aren't reused); now and then let them go.
+        if heights.len() > 2 * self.annots.len() + 100 {
+            heights.clear();
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut last_page = None;
             for (id, page, color, kind, text) in &items {
@@ -4689,16 +5506,27 @@ impl App {
                 }
                 // Custom row: swatch + note wrapped to the panel width (max 4 lines).
                 let note = text.trim();
+                let width = ui.available_width();
+                // A row scrolled out of sight takes the height it had when last laid
+                // out, without laying out its text again.
+                let key = (sidecar::fnv(note.as_bytes()) ^ width.to_bits() as u64, *kind);
+                if let Some(&(k, h)) = heights.get(id) {
+                    let probe = Rect::from_min_size(ui.cursor().min, vec2(width, h));
+                    if k == key && !ui.is_rect_visible(probe) {
+                        ui.allocate_exact_size(vec2(width, h), Sense::hover());
+                        continue;
+                    }
+                }
                 let (label, colour) = if note.is_empty() {
                     (kind.to_string(), ui.visuals().weak_text_color())
                 } else {
                     (note.replace('\n', " "), ui.visuals().text_color())
                 };
-                let width = ui.available_width();
                 let mut job = egui::text::LayoutJob::simple(label, FontId::proportional(13.0), colour, (width - 26.0).max(40.0));
                 job.wrap.max_rows = 4;
                 job.wrap.overflow_character = Some('…');
                 let galley = ui.painter().layout_job(job);
+                heights.insert(*id, (key, galley.size().y + 6.0));
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y + 6.0), Sense::click());
                 let selected = self.selected.contains(id);
                 if selected || resp.hovered() {
@@ -4720,6 +5548,7 @@ impl App {
                 ui.weak("No markups yet.");
             }
         });
+        self.list_heights = heights;
         if let Some(id) = clicked {
             if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
                 self.commit_edit();
@@ -4772,7 +5601,7 @@ impl App {
                     ("Ctrl+click, callout selected", "Add another leader, arrowhead at the click; its tail meets the first leader's bend"),
                     ("Drag on empty page", "Select every markup the box crosses (Ctrl/Shift adds)   ·   Ctrl+A all on page"),
                     ("Esc / Ctrl+Enter", "Finish typing"),
-                    ("Ctrl+B / I / U", "Bold / italic / underline the note being typed or the selected notes (also the B I U buttons)"),
+                    ("Ctrl+B / I / U", "Bold / italic / underline: while typing, the words selected (or what you type next); otherwise the selected notes (also the B I U buttons)"),
                     ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill, opacity and hatch"),
                     ("Line sample beside the width", "Line type: dashed, dotted, or one from the pattern library (set its folder below)"),
                     ("[ ]", "Line width   ·   { } text size"),
@@ -4788,6 +5617,7 @@ impl App {
                     ("W / F / G", "Fit width / fit page / go to page"),
                     ("Z", "Zoom to the selected markups"),
                     ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab; drag a tab to move it"),
+                    ("\\", "Split screen: two places side by side; click a pane to work in it, pick a tab to show another document there"),
                     ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
                     ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
@@ -4856,6 +5686,8 @@ impl eframe::App for App {
         let now = ctx.input(|i| i.time);
         self.poll_worker(&ctx);
         self.poll_dialog();
+        self.poll_patterns();
+        self.poll_cli();
         while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
             self.picture_ready(stored, target, generation);
         }
@@ -4863,6 +5695,9 @@ impl eframe::App for App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() {
             let at = ctx.input(|i| i.pointer.hover_pos());
+            if let Some(pos) = at {
+                self.activate_pane_at(pos);
+            }
             for p in dropped {
                 // An image dropped on a sheet is placed there; each PDF opens in a tab.
                 if stamps::is_picture(&p) && !self.pages.is_empty() {
@@ -4912,7 +5747,25 @@ impl eframe::App for App {
             egui::CentralPanel::default().frame(egui::Frame::central_panel(ui.style()).fill(sheets)).show(ui, |ui| self.overview_grid(ui));
         } else {
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            let rect = ui.max_rect();
+            let full = ui.max_rect();
+            // Split screen: the active pane and the other, each with an id by its side.
+            let (left, right) = if self.other.is_some() {
+                let mid = (full.center().x).round();
+                (Rect::from_min_max(full.min, pos2(mid - 1.0, full.max.y)), Some(Rect::from_min_max(pos2(mid + 1.0, full.min.y), full.max)))
+            } else {
+                (full, None)
+            };
+            let pane_id = |left: bool| egui::Id::new(("greenline-pane", left));
+            // Pointing into the other pane (a press, a scroll or a zoom) makes it the active one.
+            if let Some(right) = right {
+                let other_rect = if self.active_left { right } else { left };
+                let r = ui.interact(other_rect, pane_id(!self.active_left), Sense::click_and_drag());
+                let wheel = r.hovered() && ui.input(|i| i.smooth_scroll_delta != Vec2::ZERO || i.zoom_delta() != 1.0);
+                if (r.is_pointer_button_down_on() || wheel) && matches!(self.drag, Drag::None | Drag::Ignore) {
+                    self.activate_other();
+                }
+            }
+            let rect = if self.active_left { left } else { right.unwrap_or(full) };
             if rect != self.canvas {
                 self.canvas = rect;
             }
@@ -4920,17 +5773,25 @@ impl eframe::App for App {
                 self.fit_pending = false;
                 self.fit_width();
             }
-            let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+            let resp = ui.interact(rect, pane_id(self.active_left), Sense::click_and_drag());
             self.shortcuts(&ctx);
             self.canvas_input(ui, &resp);
             self.clamp_offset();
-            if (self.zoom, self.offset) != self.view_key {
-                self.view_key = (self.zoom, self.offset);
+            if self.zoom != self.view_key.0 {
                 self.last_view_change = now;
             }
+            self.view_key = (self.zoom, self.offset);
             self.paint(ui);
             if self.pages.is_empty() {
                 ui.painter().text(rect.center(), Align2::CENTER_CENTER, &self.status, FontId::proportional(18.0), ui.visuals().text_color());
+            }
+            if let Some(right) = right {
+                let other_rect = if self.active_left { right } else { left };
+                self.paint_other(ui, other_rect, now);
+                // The active pane outlined, so it's clear where keys and tools go.
+                let accent = crate::theme::accent(ui.visuals());
+                ui.painter().rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, accent), egui::StrokeKind::Inside);
+                ui.painter().line_segment([pos2(full.center().x.round(), full.min.y), pos2(full.center().x.round(), full.max.y)], Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
             }
         });
         }
@@ -4940,7 +5801,7 @@ impl eframe::App for App {
         self.find_bar(&ctx);
         self.new_doc_window(&ctx);
         self.help(&ctx);
-        self.request_renders(&ctx, now);
+        self.request_all_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
 
         let shown = (self.show_sidebar, self.show_markups, self.show_stamps);
@@ -4952,8 +5813,9 @@ impl eframe::App for App {
             sidecar::save_prefs(&self.prefs);
         }
         self.now = now;
+        self.poll_saves();
         if !matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) && self.editing.is_none() && now >= self.save_retry_at {
-            self.save_sidecar();
+            self.autosave();
         }
         self.save_parked(now);
         // Background tabs still unsaved: keep retrying even when nothing else wakes the window.
@@ -4971,6 +5833,8 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.commit_edit();
+        // Background saves finish (the process mustn't end mid-write), and any that failed get another go.
+        self.settle_saves();
         self.save_sidecar();
         // Background tabs were saved when parked; one whose save failed then gets another go.
         for i in 0..self.tabs.len() {
@@ -5072,6 +5936,43 @@ fn square(from: Pos2, p: Pos2) -> Pos2 {
     if d.x.abs() >= d.y.abs() { pos2(p.x, from.y) } else { pos2(from.x, p.y) }
 }
 
+/// A markup too small on screen to make out (under `below` pixels across, zoomed
+/// far out or in a thumbnail) drawn as a mark of its colour, and true; drawing all
+/// its lines, text and hatching there would cost far more and show nothing more.
+fn speck(painter: &Painter, origin: Pos2, z: f32, a: &Annot, g: &annot::Geom, below: f32) -> bool {
+    let size = g.bounds.size() * z;
+    if size.x.max(size.y) >= below || matches!(a.kind, Kind::Image { .. }) {
+        return false;
+    }
+    let c = origin + g.bounds.center().to_vec2() * z;
+    let alpha = if matches!(a.kind, Kind::Highlight { .. }) { 90 } else { 230 };
+    painter.rect_filled(Rect::from_center_size(c, size.max(Vec2::splat(1.5))), 0.0, Color32::from_rgba_unmultiplied(a.color[0], a.color[1], a.color[2], alpha));
+    true
+}
+
+/// Drops points of a screen polyline closer than half a pixel to the last one
+/// kept (a cloud's or pen stroke's when zoomed out): fewer to tessellate, and
+/// no visible change. The ends always stay.
+fn thin(pts: Vec<Pos2>) -> Vec<Pos2> {
+    if pts.len() <= 3 {
+        return pts;
+    }
+    let last = pts[pts.len() - 1];
+    let mut out = Vec::with_capacity(pts.len());
+    for p in pts {
+        if out.last().is_none_or(|q: &Pos2| (p - *q).length_sq() >= 0.25) {
+            out.push(p);
+        }
+    }
+    if out.last() != Some(&last) {
+        if out.len() > 1 && (last - out[out.len() - 1]).length_sq() < 0.25 {
+            out.pop();
+        }
+        out.push(last);
+    }
+    out
+}
+
 /// Paints prims for a page whose top-left is at `origin` on screen, drawn at
 /// `z` screen points per PDF point. `k` is the text calibration from `text_metrics`.
 fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32, f32), alpha_mul: f32, images: &HashMap<String, TextureHandle>) {
@@ -5126,7 +6027,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
-                let pts = map(pts);
+                let pts = thin(map(pts));
                 if *closed {
                     painter.add(Shape::closed_line(pts, s));
                 } else {
@@ -5297,25 +6198,32 @@ fn label_size(a: &Annot) -> Option<f32> {
     }
 }
 
-/// What the sheet draws of a note being typed: its box and leaders, but not its
-/// text or underline, which the editor draws where they now fall.
-fn typed_note_prims(a: &Annot) -> Vec<Prim> {
-    let mut prims = if a.style.underline {
-        let mut plain = a.clone();
-        plain.style.underline = false;
-        plain.prims()
-    } else {
-        a.prims()
-    };
-    prims.retain(|p| !matches!(p, Prim::Text { .. }));
-    prims
-}
-
 fn text_of(a: &Annot) -> &str {
     match &a.kind {
         Kind::Callout { text, .. } | Kind::Text { text, .. } => text,
         _ => "",
     }
+}
+
+/// A note's text for the editor, each stretch in its own face and underlined where it is.
+fn note_job(text: &str, fmts: &[annot::Fmt], size: f32, color: Color32, wrap: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    while start < chars.len() {
+        let f = fmts.get(start).copied().unwrap_or_default();
+        let end = (start..chars.len()).find(|&j| fmts.get(j).copied().unwrap_or_default() != f).unwrap_or(chars.len());
+        let (b0, b1) = (chars[start].0, chars.get(end).map_or(text.len(), |c| c.0));
+        let underline = if f.underline { Stroke::new((size * 0.06).max(1.0), color) } else { Stroke::NONE };
+        job.append(&text[b0..b1], 0.0, egui::TextFormat { font_id: FontId::new(size, helv_styled(f.bold, f.italic)), color, underline, ..Default::default() });
+        start = end;
+    }
+    if text.is_empty() {
+        // An empty note still needs a line's height for the cursor.
+        job.append("", 0.0, egui::TextFormat { font_id: FontId::new(size, helv()), color, ..Default::default() });
+    }
+    job
 }
 
 fn helv() -> FontFamily {
@@ -5548,6 +6456,56 @@ mod tests {
         app.nudge(vec2(1.0, 0.0), 21.5);
         app.undo();
         assert_eq!(app.find(a).unwrap().bounds().min, pos2(99.0, 98.0), "a pause starts a new step");
+    }
+
+    /// Zoomed in past the whole-page render, tiles cover the view (nearest the
+    /// middle first) and a ring round it; a small pan keeps nearly all of them.
+    #[test]
+    fn tiles_cover_the_view_and_survive_a_pan() {
+        let mut app = busy_app();
+        app.set_zoom(4.0, app.canvas.center());
+        let need = app.zoom;
+        let vis = app.visible_pages();
+        let tiles = app.wanted_tiles(need, &vis);
+        assert!(!tiles.is_empty() && tiles[0].3, "the middle first");
+        assert!(tiles.windows(2).all(|w| w[0].2 <= w[1].2));
+        // Every point of the view is under a tile that's in view.
+        let pr = app.page_doc_rect(vis[0]);
+        let view = Rect::from_min_size(app.offset.to_pos2(), app.canvas.size() / app.zoom).intersect(pr);
+        for (fx, fy) in [(0.01, 0.01), (0.5, 0.5), (0.99, 0.99), (0.99, 0.01)] {
+            let p = view.min + view.size() * vec2(fx, fy) - pr.min.to_vec2();
+            let px = [(p.x * need) as i32, (p.y * need) as i32];
+            assert!(tiles.iter().any(|((pg, o, _), s, _, inside)| *inside && *pg == vis[0] && (o[0]..o[0] + s[0] as i32).contains(&px[0]) && (o[1]..o[1] + s[1] as i32).contains(&px[1])), "{fx},{fy}");
+        }
+        assert!(tiles.iter().any(|t| !t.3), "a ring round the view");
+        let before: HashSet<TileKey> = tiles.iter().map(|t| t.0).collect();
+        app.offset += vec2(40.0, 25.0);
+        let after: HashSet<TileKey> = app.wanted_tiles(need, &app.visible_pages()).iter().map(|t| t.0).collect();
+        assert!(after.intersection(&before).count() * 10 >= before.len() * 7, "{} of {} kept", after.intersection(&before).count(), before.len());
+        // A whole-page render sharp enough needs no tiles.
+        app.set_zoom(0.3, app.canvas.center());
+        assert!(app.wanted_tiles(0.3, &app.visible_pages()).iter().all(|t| !app.base.contains_key(&t.0.0)));
+    }
+
+    /// While zooming, a page already rendered waits for zooming to pause before
+    /// it's rendered again at the new scale; one not yet rendered doesn't wait.
+    #[test]
+    fn whole_page_renders_wait_for_zooming_to_pause() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.pages = vec![vec2(600.0, 800.0); 2];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.zoom = 0.5;
+        app.base.insert(0, PageTex { tex: ctx.load_texture("t", egui::ColorImage::filled([4, 4], Color32::WHITE), TextureOptions::LINEAR), scale: 0.5, origin: [0, 0], size: [4, 4] });
+        app.set_zoom(1.0, app.canvas.center());
+        app.last_view_change = 10.0;
+        let bases = |w: &Wanted| w.reqs.iter().filter_map(|r| if let Req::Render { page, layer: Layer::Base, .. } = r { Some(*page) } else { None }).collect::<Vec<_>>();
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 10.05, &mut w, false);
+        assert_eq!(bases(&w), [1], "page 0 keeps its render for now; page 1 has none");
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 10.5, &mut w, false);
+        assert_eq!(bases(&w), [0], "zooming paused: page 0 at the new scale");
     }
 
     #[test]
@@ -5894,18 +6852,34 @@ mod tests {
         assert!(app.edit_needs_focus);
     }
 
+    /// While typing, B / I / U format the words selected, or else what's typed
+    /// next; the toolbar shows the selection's formatting. A whole note toggled
+    /// keeps its words' other formatting.
     #[test]
-    fn a_typed_notes_underline_is_the_editors_not_the_sheets() {
+    fn bold_on_the_words_selected_while_typing() {
         let mut app = app();
-        let c = callout(&mut app, pos2(100.0, 100.0), pos2(200.0, 200.0));
-        let a = app.find(c).unwrap().clone();
-        let mut under = a.clone();
-        under.style.underline = true;
-        assert!(under.prims().len() > a.prims().len(), "the sheet underlines it");
-        // While it's typed, the sheet keeps the box and leader, and leaves the text and underline to the editor.
-        let typed = typed_note_prims(&under);
-        assert_eq!(typed.len(), typed_note_prims(&a).len());
-        assert!(!typed.is_empty() && typed.iter().all(|p| !matches!(p, Prim::Text { .. })));
+        let t = app.add(0, Kind::Text { pos: pos2(100.0, 100.0), box_w: 300.0, text: "Seal the sill".into(), size: 12.0 });
+        app.start_edit(t);
+        app.edit_sel = Some(5..8);
+        app.toggle_format(0);
+        let fmts = app.find(t).unwrap().style.fmts(13);
+        assert!(fmts[5..8].iter().all(|f| f.bold) && !fmts[4].bold && !fmts[8].bold);
+        assert_eq!(app.shown_format(), [true, false, false]);
+        app.edit_sel = Some(4..9);
+        assert_eq!(app.shown_format(), [false, false, false], "not all of it bold");
+        // Nothing selected: for what's typed next.
+        app.edit_sel = Some(13..13);
+        app.toggle_format(1);
+        assert_eq!(app.typing, Some(annot::Fmt { italic: true, ..Default::default() }));
+        assert_eq!(app.shown_format(), [false, true, false]);
+        assert!(app.find(t).unwrap().style.fmts(13).iter().all(|f| !f.italic), "nothing typed yet");
+        app.commit_edit();
+        // The whole note underlined: the bold word stays bold.
+        app.selected = vec![t];
+        app.toggle_format(2);
+        let fmts = app.find(t).unwrap().style.fmts(13);
+        assert!(fmts.iter().all(|f| f.underline) && fmts[5].bold && !fmts[0].bold);
+        assert_eq!(app.shown_format(), [false, false, true]);
     }
 
     #[test]
@@ -6036,6 +7010,151 @@ mod tests {
         assert!(app.path.is_none() && app.annots.is_empty() && app.tabs.len() == 1);
     }
 
+    /// A tab switched back to shows the pages it had rendered; only the latest
+    /// few background tabs keep theirs.
+    #[test]
+    fn background_tabs_keep_their_rendered_pages() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| PageTex { tex: ctx.load_texture(name, egui::ColorImage::filled([4, 4], Color32::WHITE), TextureOptions::LINEAR), scale: 1.0, origin: [0, 0], size: [4, 4] };
+        let mut app = app();
+        for (i, name) in ["/a.pdf", "/b.pdf", "/c.pdf", "/d.pdf"].iter().enumerate() {
+            if i > 0 {
+                let parked = app.park();
+                app.tabs[app.cur_tab].parked = Some(parked);
+                app.trim_parked_tex();
+                app.tabs.push(Tab { parked: None });
+                app.cur_tab = i;
+                app.pages = vec![vec2(600.0, 800.0)];
+                app.page_y = vec![0.0];
+            }
+            app.path = Some(PathBuf::from(name));
+            app.base.insert(0, tex(name));
+            app.thumbs.insert(0, tex(name));
+        }
+        let kept: Vec<bool> = app.tabs[..3].iter().map(|t| !t.parked.as_ref().unwrap().view.base.is_empty()).collect();
+        assert_eq!(kept, [false, true, true], "the two latest background tabs keep theirs");
+        app.switch_tab(2);
+        assert!(app.base.contains_key(&0) && app.thumbs.contains_key(&0), "shown at once");
+        app.switch_tab(0);
+        assert!(app.base.is_empty(), "rendered again");
+    }
+
+    /// Split screen: a second view of the document, each pane with its own
+    /// place and renders; picking another tab in the active pane leaves the
+    /// first document in the other; clicking its tab (or pane) swaps them.
+    #[test]
+    fn split_screen_shows_two_places_or_two_documents() {
+        let ctx = egui::Context::default();
+        let img = || Arc::new(egui::ColorImage::filled([4, 4], Color32::WHITE));
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        let a = rect(&mut app, 100.0, 100.0);
+        app.zoom = 2.0;
+        app.toggle_split();
+        let (ga, va) = (app.generation, app.view_id);
+        let vb = app.other.as_ref().unwrap().view.id;
+        assert_ne!(va, vb, "two views, told apart");
+        assert_eq!(app.with_other(|o| (o.zoom, o.annots.len())), Some((2.0, 1)), "the same document, where this one is");
+        // Each pane's renders go to it.
+        app.route_render(&ctx, ga, vb, 0, 1.0, [0, 0], Layer::Base, img());
+        assert!(app.base.is_empty());
+        assert_eq!(app.with_other(|o| o.base.len()), Some(1));
+        app.route_render(&ctx, ga, va, 0, 1.0, [0, 0], Layer::Base, img());
+        assert_eq!(app.base.len(), 1);
+        // The other pane becomes the active one: views trade places, the document stays.
+        app.with_other(|o| o.zoom = 0.5);
+        app.activate_other();
+        assert!(!app.active_left);
+        assert_eq!((app.zoom, app.view_id), (0.5, vb));
+        assert_eq!(app.with_other(|o| (o.zoom, o.view_id)), Some((2.0, va)));
+        // A second document in the active pane: the first stays in the other, at its place.
+        let parked = app.park();
+        let mut parked = parked;
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 300.0, 300.0);
+        rect(&mut app, 400.0, 300.0);
+        assert_eq!(app.other.as_ref().unwrap().doc, Some(ga));
+        assert_eq!(app.with_other(|o| (o.path.clone(), o.annots.len(), o.zoom, o.view_id)), Some((Some(PathBuf::from("/a.pdf")), 1, 2.0, va)));
+        assert_eq!(app.annots.len(), 2, "b's markups here");
+        // Renders for a's view reach it in the other pane.
+        app.route_render(&ctx, ga, va, 0, 2.0, [0, 0], Layer::Base, img());
+        assert_eq!(app.with_other(|o| o.base.get(&0).map(|t| t.scale)), Some(Some(2.0)));
+        // Clicking a's tab makes its pane the active one; b goes to the other,
+        // its thumbnails on their way forgotten (the worker drops them) so
+        // they're asked for again when it's back.
+        app.req_thumb.insert(0);
+        app.switch_tab(0);
+        assert_eq!(app.with_other(|o| o.req_thumb.len()), Some(0));
+        assert_eq!((app.cur_tab, app.path.clone(), app.annots.len()), (0, Some(PathBuf::from("/a.pdf")), 1));
+        assert!(app.find(a).is_some());
+        assert_eq!(app.other.as_ref().unwrap().doc, Some(2));
+        assert_eq!(app.with_other(|o| o.annots.len()), Some(2));
+        // Closing b, shown in the other pane: that pane shows a again.
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.other.as_ref().unwrap().doc, None);
+        assert_eq!(app.with_other(|o| o.annots.len()), Some(1));
+        app.toggle_split();
+        assert!(app.other.is_none() && app.active_left);
+    }
+
+    /// An image dropped on split screen goes to the pane it was dropped on,
+    /// and lands on a sheet only where that pane shows it.
+    #[test]
+    fn images_dropped_go_to_the_pane_under_them() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.pages = vec![vec2(2000.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.toggle_split();
+        let (left, right) = (Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 800.0)), Rect::from_min_max(pos2(402.0, 0.0), pos2(800.0, 800.0)));
+        app.canvas = left;
+        app.other.as_mut().unwrap().view.canvas = right;
+        let vb = app.other.as_ref().unwrap().view.id;
+        // On the active pane: stays.
+        app.activate_pane_at(pos2(100.0, 100.0));
+        assert!(app.active_left);
+        // On the other: it becomes the active one.
+        app.activate_pane_at(pos2(500.0, 100.0));
+        assert!(!app.active_left);
+        assert_eq!(app.view_id, vb);
+        // A wide sheet reaches past its pane: dropped beyond the pane, it's not placed on it.
+        app.canvas = left;
+        let target = |app: &mut App, at: Pos2| {
+            app.place_picture(std::path::Path::new("/nowhere/missing.png"), Some(at));
+            app.pictures.1.recv_timeout(std::time::Duration::from_secs(5)).unwrap().1
+        };
+        assert!(target(&mut app, pos2(100.0, 100.0)).is_some());
+        assert!(target(&mut app, pos2(600.0, 100.0)).is_none());
+        // Two documents: b here on the left, a in the other pane on the right.
+        app.activate_other();
+        assert!(app.active_left);
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.canvas = left;
+        app.with_other(|o| o.canvas = right);
+        app.activate_pane_at(pos2(100.0, 100.0));
+        assert_eq!(app.path, Some(PathBuf::from("/b.pdf")));
+        app.activate_pane_at(pos2(500.0, 100.0));
+        assert_eq!((app.path.clone(), app.active_left), (Some(PathBuf::from("/a.pdf")), false), "dropped on a: a is the active one");
+    }
+
     #[test]
     fn a_move_under_way_is_finished_before_its_tab_is_parked() {
         let mut app = app();
@@ -6069,7 +7188,7 @@ mod tests {
         if let Some(p) = app.tabs[0].parked.as_mut() {
             (p.page_y, p.doc_w, p.doc_h) = layout(&[vec2(612.0, 792.0), vec2(1224.0, 792.0)]);
             p.pages = vec![vec2(612.0, 792.0), vec2(1224.0, 792.0)];
-            p.fit_pending = true;
+            p.view.fit_pending = true;
         }
         app.switch_tab(0);
         assert_eq!(app.pages.len(), 2);
@@ -6305,6 +7424,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Autosave writes in the background; a failure comes back and leaves the
+    /// markups unsaved, and a save that waits sees every background one land first.
+    #[test]
+    fn autosave_writes_in_the_background_and_reports_failures() {
+        let (mut app, dir) = reviewing("autosave");
+        let file = dir.join("doc.json");
+        for i in 0..20 {
+            rect(&mut app, 10.0 * i as f32, 10.0);
+            app.changed();
+            app.autosave();
+            assert!(!app.dirty);
+        }
+        app.saver.flush();
+        assert_eq!(sidecar::load_file(&file).unwrap().annots.len(), 20, "the last background save landed");
+        app.poll_saves();
+        assert!(!app.dirty && !app.status.contains("FAILED"));
+
+        // The file's folder is a file: the background save fails, and says so.
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        app.markups_file = Some(dir.join("blocker").join("doc.json"));
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave();
+        app.saver.flush();
+        app.poll_saves();
+        assert!(app.dirty && app.status.contains("AUTOSAVE FAILED"), "{}", app.status);
+
+        // Back to a good place: a waiting save goes after the background ones.
+        app.markups_file = Some(file.clone());
+        rect(&mut app, 400.0, 400.0);
+        app.changed();
+        app.autosave();
+        rect(&mut app, 500.0, 400.0);
+        app.changed();
+        app.save_sidecar();
+        assert!(!app.dirty);
+        assert_eq!(sidecar::load_file(&file).unwrap().annots.len(), 23);
+        app.poll_saves();
+        assert!(!app.dirty, "an older background result doesn't undo the newer save");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Long jobs handed to greenline-cli: the markups are saved first (or the
+    /// job stays in the app), and its answers read as the worker's would be.
+    #[test]
+    fn jobs_for_the_command_line_save_first_and_report_back() {
+        let (mut app, dir) = reviewing("cli");
+        rect(&mut app, 10.0, 10.0);
+        assert!(app.markups_saved());
+        assert_eq!(sidecar::load_file(&dir.join("doc.json")).unwrap().annots.len(), 1, "on disk for the command line to read");
+        app.read_only = true;
+        assert!(!app.markups_saved(), "not saving: the app exports what it has");
+        app.cli_done.0.send((CliJob::Export, Ok(serde_json::json!({"file": "/x/doc_markup.pdf", "markups": 1, "characters_without_font": 0})))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("Exported → /x/doc_markup.pdf"), "{}", app.status);
+        app.cli_done.0.send((CliJob::Shrink, Ok(serde_json::json!({"file": "/x/doc_smaller.pdf", "bytes_before": 10_485_760, "bytes_after": 2_097_152, "images_recompressed": 3, "images_kept": 1, "check_pages": [2]})))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("10.0 MB → 2.0 MB (3 images); check page 2"), "{}", app.status);
+        app.cli_done.0.send((CliJob::Export, Err("disk full".into()))).unwrap();
+        app.poll_cli();
+        assert!(app.status.contains("Export failed: disk full"), "{}", app.status);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_retried_accept_doesnt_add_twice_and_scales_match_by_value() {
         let (mut app, dir) = reviewing("retry");
@@ -6398,4 +7581,229 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A busy review sheet: about 400 markups of every kind on an ARCH D page.
+    fn busy_app() -> App {
+        busy_app_with(400)
+    }
+
+    fn busy_app_with(n: usize) -> App {
+        let mut app = App::with(None, String::new(), sidecar::Prefs::default());
+        app.pages = vec![vec2(2592.0, 1728.0); 3];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0));
+        app.fit_width();
+        let dashed = Arc::new(patterns::builtin_line_types()[0].clone());
+        let hatch = HatchFill { pattern: Arc::new(patterns::builtin_hatches()[0].clone()), scale: 1.0 };
+        for i in 0..n {
+            let (x, y) = (40.0 + (i % 20) as f32 * 125.0, 40.0 + (i / 20 % 20) as f32 * 80.0);
+            let r = Rect::from_min_size(pos2(x, y), vec2(100.0, 60.0));
+            let kind = match i % 8 {
+                0 => Kind::Callout { anchor: pos2(x + 110.0, y + 70.0), pos: pos2(x, y), box_w: 100.0, text: "Confirm flashing lap at sill and jamb, typ.".into(), size: 10.0, leaders: vec![] },
+                1 => Kind::Cloud { rect: r },
+                2 => Kind::Rect { rect: r },
+                3 => Kind::Poly { pts: vec![pos2(x, y), pos2(x + 100.0, y), pos2(x + 100.0, y + 60.0), pos2(x + 50.0, y + 30.0), pos2(x, y + 60.0)], closed: true },
+                4 => Kind::Measure { pts: vec![pos2(x, y), pos2(x + 100.0, y + 40.0)], area: false, name: String::new(), value: String::new(), size: 10.0 },
+                5 => Kind::Pen { pts: (0..120).map(|k| pos2(x + k as f32 * 0.8, y + 30.0 + (k as f32 * 0.3).sin() * 20.0)).collect() },
+                6 => Kind::Text { pos: pos2(x, y), box_w: 110.0, text: "Provide backer rod and sealant at all control joints".into(), size: 10.0 },
+                _ => Kind::Arrow { a: pos2(x, y), b: pos2(x + 90.0, y + 50.0) },
+            };
+            let id = app.add(0, kind);
+            let a = app.find_mut(id).unwrap();
+            match i % 8 {
+                1 if i % 16 == 1 => a.style.fill = Some(Fill { color: [228, 0, 0], alpha: 60 }),
+                2 => a.style.line = Some(dashed.clone()),
+                3 => a.style.hatch = Some(hatch.clone()),
+                _ => {}
+            }
+        }
+        app.scales = vec![Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
+        app.show_markups = true;
+        app
+    }
+
+    /// The note editor is a line of the note's own text high, caret and all,
+    /// zoomed out or in: not a line of menu text.
+    #[test]
+    fn note_editor_is_sized_to_the_note() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        for zoom in [0.5, 3.0] {
+            let mut app = app();
+            app.zoom = zoom;
+            let id = callout(&mut app, pos2(50.0, 50.0), pos2(200.0, 200.0));
+            app.start_edit(id);
+            let generation = app.generation;
+            for _ in 0..2 {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 900.0))), ..Default::default() };
+                ctx.run_ui(input, |ui| app.text_editor(ui.ctx())).textures_delta.clear();
+            }
+            let fs = (12.0 * zoom * app.text_k.unwrap_or((1.0, 0.8)).0).max(6.0);
+            let row = ctx.fonts_mut(|f| f.row_height(&FontId::new(fs, helv())));
+            let r = ctx.read_response(egui::Id::new(("greenline-edit", generation, id))).expect("the editor").rect;
+            assert!((r.height() - row).abs() < 1.0, "at {zoom}x: {} high for a {row} line", r.height());
+        }
+    }
+
+    /// cargo test --release --lib bench_frames -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_frames() {
+        let n = std::env::var("GREENLINE_BENCH_MARKUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+        let mut app = busy_app_with(n);
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let frames = 60;
+        let (mut ui_t, mut tess_t, mut prims) = (std::time::Duration::ZERO, std::time::Duration::ZERO, 0usize);
+        let mut parts = [std::time::Duration::ZERO; 5];
+        for f in 0..frames {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1900.0, 1000.0))), ..Default::default() };
+            let t = std::time::Instant::now();
+            let out = ctx.run_ui(input, |ui| {
+                let t = std::time::Instant::now();
+                egui::Panel::left("thumbs").default_size(170.0).show(ui, |ui| app.sidebar(ui));
+                parts[0] += t.elapsed();
+                let t = std::time::Instant::now();
+                egui::Panel::right("markups").default_size(280.0).show(ui, |ui| app.markup_list(ui));
+                parts[1] += t.elapsed();
+                egui::CentralPanel::no_frame().show(ui, |ui| {
+                    app.canvas = ui.max_rect();
+                    // Hovering in Select runs the hit test, as moving the pointer does.
+                    let t = std::time::Instant::now();
+                    let h = pos2(300.0 + f as f32, 300.0);
+                    let over = app.page_at(h).map(|pg| (pg, app.screen_to_page(pg, h)));
+                    if let Some((pg, p)) = over {
+                        std::hint::black_box(app.hit(pg, p));
+                    }
+                    parts[2] += t.elapsed();
+                    let t = std::time::Instant::now();
+                    app.paint(ui);
+                    parts[3] += t.elapsed();
+                });
+                let t = std::time::Instant::now();
+                measure::relabel(&mut app.annots, &app.scales, app.prefs.units);
+                parts[4] += t.elapsed();
+            });
+            ui_t += t.elapsed();
+            let t = std::time::Instant::now();
+            let prim = ctx.tessellate(out.shapes, 1.0);
+            tess_t += t.elapsed();
+            prims = prim.len();
+            // Pan a little each frame, as scrolling does.
+            app.offset.y += 1.0;
+        }
+        eprintln!("{} markups: ui {:?}/frame, tessellate {:?}/frame ({prims} clipped prims)", app.annots.len(), ui_t / frames, tess_t / frames);
+        let names = ["thumbnails", "markup list", "hover hit test", "paint", "relabel"];
+        for (n, t) in names.iter().zip(parts) {
+            eprintln!("  {n}: {:?}/frame", t / frames);
+        }
+    }
+
+    #[test]
+    fn a_document_left_in_the_other_pane_renders_when_shown_again() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.toggle_split();
+        // B in the active pane, A in the other.
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.doc_w = 600.0;
+        app.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0));
+        // The other pane (A) asks for its page.
+        let mut w = Wanted::default();
+        app.with_other(|o| { o.canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 1000.0)); o.request_renders(&ctx, 100.0, &mut w, false) });
+        let n_other = w.reqs.len();
+        assert!(n_other > 0);
+        // Unsplit before the render arrives; the worker drops it (not in keep any more).
+        app.toggle_split();
+        app.switch_tab(0);
+        assert_eq!(app.path, Some(PathBuf::from("/a.pdf")));
+        let mut w = Wanted::default();
+        app.request_renders(&ctx, 200.0, &mut w, true);
+        assert!(w.reqs.iter().any(|r| matches!(r, Req::Render { layer: Layer::Base, .. })), "page never re-requested");
+    }
+
+    #[test]
+    fn a_failed_save_still_counts_after_another_documents_save() {
+        let (mut app, dir) = reviewing("seq");
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        app.markups_file = Some(dir.join("blocker").join("a.json"));
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave(); // seq 1, will fail
+        app.saver.flush(); // (stands for a slow write: result not yet polled)
+        // Switch to B, edit, autosave, switch back to A before polling.
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(dir.join("b.pdf"));
+        app.markups_file = Some(dir.join("b.json"));
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 100.0, 100.0);
+        app.changed();
+        app.autosave(); // seq 2
+        app.switch_tab(0);
+        app.poll_saves();
+        assert!(app.dirty, "A's failed save was silently taken as saved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_tab_whose_background_save_failed_stays_open() {
+        let (mut app, dir) = reviewing("close");
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        // B open in another tab, A shown.
+        let mut parked = app.park();
+        parked.path = Some(dir.join("b.pdf"));
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(dir.join("a.pdf"));
+        app.markups_file = Some(dir.join("blocker").join("a.json"));
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        rect(&mut app, 300.0, 300.0);
+        app.changed();
+        app.autosave();
+        app.saver.flush();
+        app.close_tab(1);
+        app.poll_saves();
+        assert_eq!(app.tabs.len(), 2, "tab closed with its only save failed");
+        assert!(app.dirty && app.status.contains("Autosave failed"), "{}", app.status);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_calibration_line_stays_with_its_document() {
+        let mut app = app();
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 1;
+        app.toggle_split();
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab { parked: None });
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0); 3];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app.scale_win.open = true;
+        app.scale_win.calib = Some((2, pos2(0.0, 0.0), pos2(300.0, 0.0)));
+        app.activate_other();
+        assert_eq!(app.path, Some(PathBuf::from("/b.pdf")));
+        assert!(app.scale_win.calib.is_none(), "a's line isn't b's");
+        assert!(app.scale_page() < app.pages.len(), "scale window would index pages[{}]", app.scale_page());
+    }
 }

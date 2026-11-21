@@ -61,6 +61,10 @@ For a window takeoff:
 
 The person accepts the markups in Greenline, and the CSV is ready for a spreadsheet.
 
+## Smaller files
+
+`shrink <pdf> [--dpi 200] [--out F.pdf]` writes a smaller copy (`<name>_smaller.pdf` by default): big colour and grey images, such as scans and photos, are brought down to the resolution given and recompressed. Vector drawing, text, 1-bit scans and annotations are left as they are, and the original is never changed. The result gives the sizes before and after, and `check_pages` lists any page that looks noticeably different afterwards. Look at those pages before sending the copy on.
+
 ## Limits
 
 - Check scales against a dimension.

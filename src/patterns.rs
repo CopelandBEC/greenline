@@ -329,11 +329,17 @@ pub fn own_dir() -> PathBuf {
 }
 
 impl Library {
-    /// Built-ins, the user's own library, then the shared folder (if set).
-    pub fn load(shared: Option<&Path>) -> Self {
+    /// Just the built-ins (while the rest is read).
+    pub fn builtins() -> Self {
         let mut lib = Library::default();
         lib.line_types.extend(builtin_line_types().into_iter().map(|l| (String::new(), Arc::new(l))));
         lib.hatches.extend(builtin_hatches().into_iter().map(|h| (String::new(), Arc::new(h))));
+        lib
+    }
+
+    /// Built-ins, the user's own library, then the shared folder (if set).
+    pub fn load(shared: Option<&Path>) -> Self {
+        let mut lib = Self::builtins();
         let mut dirs = vec![(own_dir(), "")];
         dirs.extend(shared.map(|p| (p.to_path_buf(), " (shared)")));
         for (dir, tag) in dirs {

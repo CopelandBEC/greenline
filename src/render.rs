@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 
-/// What a render is for: the whole page, a sharp patch of the visible area, or a thumbnail.
+/// What a render is for: the whole page, a sharp tile of the view zoomed in, or a thumbnail.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Layer {
     Base,
@@ -18,10 +18,19 @@ pub enum Layer {
 }
 
 /// Pages the viewer still wants; queued renders for other pages are dropped.
+/// Whole-page renders and tiles are by view (`Req::Render::view`): split
+/// screen shows two, maybe of one document.
 #[derive(Default)]
 pub struct Keep {
-    pub base: HashSet<usize>,
+    pub base: HashSet<(u64, usize)>,
+    /// Thumbnails, of the document `thumbs_generation`.
     pub thumbs: HashSet<usize>,
+    pub thumbs_generation: u64,
+    /// Of those, the ones the viewer has no thumbnail for yet: a whole-page
+    /// render of one is shrunk into its thumbnail.
+    pub thumbs_missing: HashSet<usize>,
+    /// Sharp tiles over the view (view, page, top-left pixel); others queued are dropped.
+    pub tiles: HashSet<(u64, usize, [i32; 2])>,
     /// The search still wanted; page searches for older ones are dropped.
     pub search: u64,
 }
@@ -30,13 +39,15 @@ pub enum Req {
     Open { generation: u64, path: PathBuf },
     /// A tab closed: let its document go.
     Close { generation: u64 },
-    /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt.
-    Render { generation: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
+    /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt, for view `view`.
+    Render { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
     Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
     /// Write a new PDF of `pages` blank pages, `size` points each.
     Create { path: PathBuf, size: Vec2, pages: usize },
+    /// Write a smaller copy of `src` to `out` (`shrink`).
+    Shrink { src: PathBuf, out: PathBuf, dpi: f32 },
     /// Find `query` on `pages` in turn, for search `id`. The worker searches one
     /// page per turn and queues the rest behind other work, so renders stay live.
     Search { generation: u64, id: u64, pages: VecDeque<usize>, query: String },
@@ -45,13 +56,15 @@ pub enum Req {
 pub enum Resp {
     Opened { generation: u64, pages: Vec<Vec2> },
     OpenFailed { generation: u64, error: String },
-    Rendered { generation: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: egui::ColorImage },
-    RenderFailed { generation: u64, page: usize, layer: Layer, error: String },
+    Rendered { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage> },
+    RenderFailed { generation: u64, view: u64, page: usize, layer: Layer, error: String },
     /// Output path and the number of characters that had no font.
     Exported(Result<(PathBuf, usize), String>),
     PageText { generation: u64, page: usize, text: String },
     /// A blank PDF written (its path), or why not.
     Created(Result<PathBuf, String>),
+    /// A smaller copy written (its path and what was done), or why not.
+    Shrunk(Result<(PathBuf, Shrunk), String>),
     /// Matches on one page for search `id`: per match, a box per line it spans;
     /// `more` when the page had more than were reported.
     Found { generation: u64, id: u64, page: usize, hits: Vec<Vec<egui::Rect>>, more: bool },
@@ -122,6 +135,9 @@ fn run(
 ) {
     // One open document per tab, by the generation it was opened as.
     let mut docs: HashMap<u64, PdfDocument> = HashMap::new();
+    // Declared after `docs`, so dropped before them: a page must close before its document.
+    let mut loaded = Loaded::default();
+    let mut thumbs = Thumbs::default();
     let mut queue: VecDeque<Req> = VecDeque::new();
     // Thumbnails and a search take turns.
     let mut thumb_turn = false;
@@ -138,30 +154,63 @@ fn run(
         let Some(req) = next_request(&mut queue, &keep, &mut thumb_turn) else { continue };
         let resp = match req {
             Req::Open { generation, path } => {
-                match pdfium.load_pdf_from_file(&path, None) {
-                    Ok(d) => {
-                        let pages = d.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
+                match pdfium.load_pdf_from_file(&path, None).and_then(|d| page_sizes(&d).map(|s| (d, s))) {
+                    Ok((d, pages)) => {
                         docs.insert(generation, d);
                         Resp::Opened { generation, pages }
                     }
                     Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
                 }
             }
-            Req::Render { generation, page, scale, origin, size, layer } => {
+            Req::Render { generation, view, page, scale, origin, size, layer } => {
                 let Some(d) = docs.get(&generation) else { continue };
-                match render_region(d, page, scale, origin, size) {
-                    Ok(image) => Resp::Rendered { generation, page, scale, origin, layer, image },
-                    Err(e) => Resp::RenderFailed { generation, page, layer, error: e.to_string() },
+                // A thumbnail made from this page's last whole-page render costs nothing.
+                if layer == Layer::Thumb {
+                    if let Some(image) = thumbs.get(generation, page, size) {
+                        if tx.send(Resp::Rendered { generation, view, page, scale, origin, layer, image }).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                        continue;
+                    }
+                }
+                let rendered = loaded.get(d, generation, page).and_then(|p| Ok((render_page_region(p, scale, origin, size)?, vec2(p.width().value, p.height().value))));
+                match rendered {
+                    Ok((image, page_size)) => {
+                        let image = Arc::new(image);
+                        if tx.send(Resp::Rendered { generation, view, page, scale, origin, layer, image: image.clone() }).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                        // A thumbnail the sidebar or overview is waiting for, from this
+                        // whole-page render (after sending it, so the view isn't kept waiting).
+                        let wanted = {
+                            let k = keep.lock().unwrap();
+                            k.thumbs_generation == generation && k.thumbs_missing.contains(&page)
+                        };
+                        if layer == Layer::Base && wanted {
+                            let (thumb_scale, thumb_size) = thumb_size(page_size);
+                            if let Some(thumb) = thumbs.add(generation, page, &image, thumb_size) {
+                                if tx.send(Resp::Rendered { generation, view, page, scale: thumb_scale, origin: [0, 0], layer: Layer::Thumb, image: thumb }).is_err() {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
+                        continue;
+                    }
+                    Err(e) => Resp::RenderFailed { generation, view, page, layer, error: e.to_string() },
                 }
             }
             Req::PageText { generation, page } => {
                 let Some(d) = docs.get(&generation) else { continue };
-                let text = d.pages().get(page as PdfPageIndex).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
+                let text = loaded.get(d, generation, page).ok().and_then(|p| p.text().ok().map(|t| t.all())).unwrap_or_default();
                 Resp::PageText { generation, page, text }
             }
             Req::Search { generation, id, mut pages, query } => {
                 let Some(d) = docs.get(&generation) else { continue };
                 let Some(page) = pages.pop_front() else { continue };
+                // Searching every page goes past the loaded-page cache: load each one just for this.
                 let (hits, more) = d.pages().get(page as PdfPageIndex).ok().and_then(|p| crate::pdf::search_page(&p, &query).ok()).unwrap_or_default();
                 if !pages.is_empty() {
                     queue.push_back(Req::Search { generation, id, pages, query });
@@ -169,10 +218,14 @@ fn run(
                 Resp::Found { generation, id, page, hits, more }
             }
             Req::Close { generation } => {
+                // Its pages before the document they belong to.
+                loaded.forget(generation);
+                thumbs.forget(generation);
                 docs.remove(&generation);
                 continue;
             }
             Req::Create { path, size, pages } => Resp::Created(create_blank(pdfium, &path, size, pages).map(|_| path).map_err(|e| e.to_string())),
+            Req::Shrink { src, out, dpi } => Resp::Shrunk(shrink(pdfium, &src, &out, dpi).map(|r| (out, r)).map_err(|e| e.to_string())),
             Req::Export { src, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
                     .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
@@ -187,33 +240,35 @@ fn run(
     }
 }
 
-/// Open/Export first, then the newest patch, then base renders the viewer still
+/// Open/Export first, then wanted tiles, then base renders the viewer still
 /// wants, then wanted thumbnails and the current search page by page, in turn.
 fn next_request(queue: &mut VecDeque<Req>, keep: &Mutex<Keep>, thumb_turn: &mut bool) -> Option<Req> {
     if let Some(i) = queue.iter().position(|r| !matches!(r, Req::Render { .. } | Req::Search { .. })) {
         return queue.remove(i);
     }
-    // Drop renders superseded by a newer request for the same page and layer.
+    // Drop renders superseded by a newer request for the same page, layer and tile.
     let mut seen = HashSet::new();
     let mut kept = VecDeque::new();
     while let Some(r) = queue.pop_back() {
-        if let Req::Render { page, layer, .. } = &r {
-            if !seen.insert((*page, *layer)) {
+        if let Req::Render { view, page, layer, origin, .. } = &r {
+            if !seen.insert((*view, *page, *layer, *origin)) {
                 continue;
             }
         }
         kept.push_front(r);
     }
     *queue = kept;
-    if let Some(i) = queue.iter().rposition(|r| matches!(r, Req::Render { layer: Layer::Patch, .. })) {
-        return queue.remove(i);
-    }
     let keep = keep.lock().unwrap();
     queue.retain(|r| match r {
-        Req::Render { page, layer: Layer::Base, .. } => keep.base.contains(page),
-        Req::Render { page, layer: Layer::Thumb, .. } => keep.thumbs.contains(page),
+        Req::Render { view, page, layer: Layer::Base, .. } => keep.base.contains(&(*view, *page)),
+        Req::Render { generation, page, layer: Layer::Thumb, .. } => *generation == keep.thumbs_generation && keep.thumbs.contains(page),
+        Req::Render { view, page, layer: Layer::Patch, origin, .. } => keep.tiles.contains(&(*view, *page, *origin)),
         _ => true,
     });
+    // Tiles in the order asked for: the viewer asks for the middle of the view first.
+    if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Patch, .. })) {
+        return queue.remove(i);
+    }
     if let Some(i) = queue.iter().position(|r| matches!(r, Req::Render { layer: Layer::Base, .. })) {
         return queue.remove(i);
     }
@@ -251,18 +306,165 @@ pub fn create_blank(pdfium: &Pdfium, path: &Path, size: Vec2, pages: usize) -> a
     Ok(())
 }
 
+/// Every page's displayed size (after /Rotate and the CropBox) in points, read
+/// from the page tree without loading the pages: loading one parses all its
+/// content, which for a big drawing set took most of the time to open it.
+pub fn page_sizes(doc: &PdfDocument) -> Result<Vec<Vec2>, PdfiumError> {
+    Ok(doc.pages().page_sizes()?.iter().map(|r| vec2(r.width().value, r.height().value)).collect())
+}
+
 pub fn render_region(doc: &PdfDocument, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
-    let p = doc.pages().get(page as PdfPageIndex)?;
+    render_page_region(&doc.pages().get(page as PdfPageIndex)?, scale, origin, size)
+}
+
+/// Renders the region `origin..origin+size` (pixels) of `p` drawn at `scale` px/pt.
+pub fn render_page_region(p: &PdfPage, scale: f32, origin: [i32; 2], size: [usize; 2]) -> anyhow::Result<egui::ColorImage> {
     let full_w = (p.width().value * scale).round().max(1.0) as Pixels;
     let full_h = (p.height().value * scale).round().max(1.0) as Pixels;
+    // PDFium writes RGBA straight away (no swizzle afterwards), onto white.
     let cfg = PdfRenderConfig::new()
         .set_fixed_size(full_w, full_h)
         .set_origin(-origin[0] as Pixels, -origin[1] as Pixels)
+        .set_reverse_byte_order(true)
         .render_annotations(true);
     let mut bmp = PdfBitmap::empty(size[0] as Pixels, size[1] as Pixels, PdfBitmapFormat::BGRA)?;
     p.render_into_bitmap_with_config(&mut bmp, &cfg)?;
-    let rgba = bmp.as_rgba_bytes();
-    Ok(egui::ColorImage::from_rgba_unmultiplied(size, &rgba))
+    Ok(opaque_image(&bmp.as_raw_bytes(), size))
+}
+
+/// A rendered page (RGBA rows, maybe padded) as an image. Pages are opaque, so
+/// the pixels need no unpremultiplying: each is taken as it is, fully opaque.
+fn opaque_image(raw: &[u8], size: [usize; 2]) -> egui::ColorImage {
+    let [w, h] = size;
+    let stride = raw.len().checked_div(h).unwrap_or(0);
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in raw.chunks_exact(stride.max(1)).take(h) {
+        pixels.extend(row[..w * 4].as_chunks::<4>().0.iter().map(|c| egui::Color32::from_rgba_premultiplied(c[0], c[1], c[2], 255)));
+    }
+    egui::ColorImage::new(size, pixels)
+}
+
+/// Pages loaded lately, kept so the next render of one (a sharper patch after
+/// panning, a re-render after zooming) needn't parse its content again or
+/// decode its images again: PDFium keeps decoded images with the page.
+#[derive(Default)]
+struct Loaded<'a> {
+    /// Most recently used last.
+    pages: Vec<((u64, usize), PdfPage<'a>)>,
+}
+
+/// Loaded pages kept: a scanned sheet's decoded image can be large.
+const LOADED_PAGES: usize = 4;
+
+impl<'a> Loaded<'a> {
+    fn get(&mut self, doc: &PdfDocument<'a>, generation: u64, page: usize) -> anyhow::Result<&PdfPage<'a>> {
+        let key = (generation, page);
+        if let Some(i) = self.pages.iter().position(|(k, _)| *k == key) {
+            let e = self.pages.remove(i);
+            self.pages.push(e);
+        } else {
+            let p = doc.pages().get(page as PdfPageIndex)?;
+            if self.pages.len() >= LOADED_PAGES {
+                self.pages.remove(0);
+            }
+            self.pages.push((key, p));
+        }
+        Ok(&self.pages.last().unwrap().1)
+    }
+
+    fn forget(&mut self, generation: u64) {
+        self.pages.retain(|((g, _), _)| *g != generation);
+    }
+}
+
+/// Thumbnail size: physical pixels on the long side.
+const THUMB_PX: f32 = 420.0;
+
+/// The scale (px/pt) and pixel size of the thumbnail of a page `s` points in size.
+pub fn thumb_size(s: Vec2) -> (f32, [usize; 2]) {
+    let scale = THUMB_PX / s.x.max(s.y);
+    (scale, [(s.x * scale).round().max(1.0) as usize, (s.y * scale).round().max(1.0) as usize])
+}
+
+/// Thumbnails shrunk from whole-page renders, so a page seen in the main view
+/// needn't be rendered again for the sidebar or overview.
+#[derive(Default)]
+struct Thumbs {
+    /// Most recently made last.
+    made: VecDeque<((u64, usize), Arc<egui::ColorImage>)>,
+}
+
+impl Thumbs {
+    /// A thumbnail of `size` from a whole-page render, unless the render is smaller.
+    fn add(&mut self, generation: u64, page: usize, image: &egui::ColorImage, size: [usize; 2]) -> Option<Arc<egui::ColorImage>> {
+        if image.size[0] < size[0] || image.size[1] < size[1] {
+            return None;
+        }
+        let thumb = Arc::new(shrink_image(image, size));
+        self.made.retain(|(key, _)| *key != (generation, page));
+        if self.made.len() >= 64 {
+            self.made.pop_front();
+        }
+        self.made.push_back(((generation, page), thumb.clone()));
+        Some(thumb)
+    }
+
+    /// The page's thumbnail if one was made at `size`.
+    fn get(&self, generation: u64, page: usize, size: [usize; 2]) -> Option<Arc<egui::ColorImage>> {
+        self.made.iter().find(|(k, t)| *k == (generation, page) && t.size == size).map(|(_, t)| t.clone())
+    }
+
+    fn forget(&mut self, generation: u64) {
+        self.made.retain(|((g, _), _)| *g != generation);
+    }
+}
+
+/// `image` shrunk to `size`. Each pixel covers a block of the original and is
+/// halfway between the block's average and its darkest: a thin dark line keeps
+/// showing as a line (a plain average would fade it to nearly white, where a
+/// direct small render draws it a pixel wide). One pass over the rows, in order.
+fn shrink_image(image: &egui::ColorImage, size: [usize; 2]) -> egui::ColorImage {
+    let [sw, sh] = image.size;
+    let [w, h] = size;
+    debug_assert!(sw >= w && sh >= h, "shrink only");
+    let raw = image.as_raw();
+    // Source columns where each output column starts (and one past the end).
+    let cols: Vec<usize> = (0..=w).map(|x| x * sw / w).collect();
+    let mut pixels = Vec::with_capacity(w * h);
+    let mut sum = vec![0u32; 3 * w];
+    let mut min = vec![255u8; 3 * w];
+    for y in 0..h {
+        let (y0, y1) = (y * sh / h, (y + 1) * sh / h);
+        sum.fill(0);
+        min.fill(255);
+        for row in raw[y0 * sw * 4..y1 * sw * 4].chunks_exact(sw * 4) {
+            for x in 0..w {
+                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                let (mut mr, mut mg, mut mb) = (255u8, 255u8, 255u8);
+                for p in row[cols[x] * 4..cols[x + 1] * 4].as_chunks::<4>().0 {
+                    r += p[0] as u32;
+                    g += p[1] as u32;
+                    b += p[2] as u32;
+                    mr = mr.min(p[0]);
+                    mg = mg.min(p[1]);
+                    mb = mb.min(p[2]);
+                }
+                let (s, m) = (&mut sum[3 * x..3 * x + 3], &mut min[3 * x..3 * x + 3]);
+                s[0] += r;
+                s[1] += g;
+                s[2] += b;
+                m[0] = m[0].min(mr);
+                m[1] = m[1].min(mg);
+                m[2] = m[2].min(mb);
+            }
+        }
+        for x in 0..w {
+            let n = ((y1 - y0) * (cols[x + 1] - cols[x])).max(1) as u32;
+            let v = |i: usize| ((sum[3 * x + i] / n + min[3 * x + i] as u32) / 2) as u8;
+            pixels.push(egui::Color32::from_rgb(v(0), v(1), v(2)));
+        }
+    }
+    egui::ColorImage::new(size, pixels)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,22 +600,49 @@ pub fn load_images(annots: &[Annot]) -> anyhow::Result<HashMap<String, image::Rg
     Ok(out)
 }
 
-/// Images for image prims, downsampled to `IMAGE_DPI` at their placed size
-/// (cached, since a stamp copied to every sheet has the same size on each).
+/// Highest resolution a photo (an image with no transparency) is embedded at:
+/// plenty for print, and as a JPEG a fraction of the size.
+const PHOTO_DPI: f32 = 300.0;
+
+/// JPEG quality for photos embedded on export.
+const PHOTO_QUALITY: u8 = 88;
+
+/// An image ready to embed: a seal or signature with transparency as pixels
+/// (kept lossless, with its alpha), or a photo as a JPEG.
+enum Embed {
+    Pixels(image::DynamicImage),
+    Jpeg(Vec<u8>),
+}
+
+/// Images for image prims, scaled for their placed size (cached, since a stamp
+/// copied to every sheet has the same size on each).
 struct Images<'i> {
     src: &'i HashMap<String, image::RgbaImage>,
-    scaled: HashMap<(String, u32, u32), image::DynamicImage>,
+    scaled: HashMap<(String, u32, u32), Embed>,
+    opaque: HashMap<String, bool>,
 }
 
 impl Images<'_> {
-    fn get(&mut self, name: &str, size_pt: Vec2) -> anyhow::Result<&image::DynamicImage> {
+    fn get(&mut self, name: &str, size_pt: Vec2) -> anyhow::Result<&Embed> {
         let img = self.src.get(name).ok_or_else(|| anyhow::anyhow!("image {name} not loaded"))?;
-        let k = (size_pt.x.max(size_pt.y) / 72.0 * IMAGE_DPI / img.width().max(img.height()) as f32).min(1.0);
+        let photo = *self.opaque.entry(name.to_string()).or_insert_with(|| img.pixels().all(|p| p[3] == 255));
+        let dpi = if photo { PHOTO_DPI } else { IMAGE_DPI };
+        let k = (size_pt.x.max(size_pt.y) / 72.0 * dpi / img.width().max(img.height()) as f32).min(1.0);
         let (w, h) = (((img.width() as f32 * k).round() as u32).max(1), ((img.height() as f32 * k).round() as u32).max(1));
-        Ok(self.scaled.entry((name.to_string(), w, h)).or_insert_with(|| {
-            let img = if (w, h) == img.dimensions() { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3) };
-            image::DynamicImage::ImageRgba8(img)
-        }))
+        let key = (name.to_string(), w, h);
+        if !self.scaled.contains_key(&key) {
+            let scaled = if (w, h) == img.dimensions() { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3) };
+            let embed = if photo {
+                let rgb = image::DynamicImage::ImageRgba8(scaled).to_rgb8();
+                let mut jpeg = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, PHOTO_QUALITY).encode_image(&rgb)?;
+                Embed::Jpeg(jpeg)
+            } else {
+                Embed::Pixels(image::DynamicImage::ImageRgba8(scaled))
+            };
+            self.scaled.insert(key.clone(), embed);
+        }
+        Ok(&self.scaled[&key])
     }
 }
 
@@ -519,8 +748,10 @@ fn emit_prims<'a>(
             Prim::Image { rect, image } => {
                 // Image space is the unit square with the picture's top edge at y = 1.
                 let (bl, br, tl) = (m.map(rect.left_bottom()), m.map(rect.right_bottom()), m.map(rect.left_top()));
-                let img = images.get(&image, rect.size() * k)?;
-                let mut obj = PdfPageImageObject::new(doc, img)?;
+                let mut obj = match images.get(&image, rect.size() * k)? {
+                    Embed::Pixels(img) => PdfPageImageObject::new(doc, img)?,
+                    Embed::Jpeg(jpeg) => PdfPageImageObject::new_from_jpeg_reader(doc, std::io::Cursor::new(jpeg.clone()))?,
+                };
                 obj.apply_matrix(PdfMatrix::new(br.x - bl.x, br.y - bl.y, tl.x - bl.x, tl.y - bl.y, bl.x, bl.y))?;
                 objects.add_image_object(obj)?;
             }
@@ -552,7 +783,7 @@ pub fn export(
     let f = doc.fonts_mut();
     let helvetica = [f.helvetica(), f.helvetica_bold(), f.helvetica_oblique(), f.helvetica_bold_oblique()];
     let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
-    let mut images = Images { src: images, scaled: HashMap::new() };
+    let mut images = Images { src: images, scaled: HashMap::new(), opaque: HashMap::new() };
     let n = doc.pages().len();
 
     let mut pages: Vec<usize> = annots.iter().map(|a| a.page).collect();
@@ -599,6 +830,264 @@ pub fn export(
     }
     saved?;
     Ok(fonts.missing)
+}
+
+// ---------------------------------------------------------------------------
+// Smaller copies
+
+/// Resolution scanned and photo images are brought down to by default.
+pub const SHRINK_DPI: f32 = 200.0;
+
+/// JPEG quality for recompressed images.
+const SHRINK_QUALITY: u8 = 80;
+
+/// What making a smaller copy did.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Shrunk {
+    /// File sizes, in bytes.
+    pub before: u64,
+    pub after: u64,
+    /// Images brought down and recompressed, and those left as they were.
+    pub recompressed: usize,
+    pub kept: usize,
+    /// Pages (from 1) that look noticeably different afterwards: worth a look.
+    pub check_pages: Vec<usize>,
+}
+
+/// A key for an image's stored data, to tell when pages share one.
+fn data_key(raw: &[u8]) -> u64 {
+    crate::sidecar::fnv(&raw[..raw.len().min(1 << 16)]) ^ raw.len() as u64
+}
+
+/// The new JPEG for an image object, if it's worth replacing: colour or grey
+/// (not a 1-bit scan, which is stored compactly already), without
+/// transparency, big, placed at more than `dpi`, and coming out at least a
+/// fifth smaller (all its uses together, when pages share it).
+fn recompress(doc: &PdfDocument, obj: &mut PdfPageObject, dpi: f32, uses: &HashMap<u64, usize>) -> Option<(Vec<u8>, PdfMatrix)> {
+    let m = obj.matrix().ok()?;
+    // Looking at the image as drawn moves it for a moment (pdfium-render's
+    // workaround for PDFium's rendered bitmaps), and not always back exactly.
+    let plan = recompress_plan(doc, obj, m, dpi, uses);
+    if obj.matrix().ok() != Some(m) {
+        let _ = obj.reset_matrix(m);
+    }
+    plan
+}
+
+fn recompress_plan(doc: &PdfDocument, obj: &PdfPageObject, m: PdfMatrix, dpi: f32, uses: &HashMap<u64, usize>) -> Option<(Vec<u8>, PdfMatrix)> {
+    let im = obj.as_image_object()?;
+    let (w, h) = (im.width().ok()? as u32, im.height().ok()? as u32);
+    if (w as u64) * (h as u64) < 250_000 || im.bits_per_pixel().ok()? <= 1 {
+        return None;
+    }
+    if im.filters().iter().any(|f| matches!(f.name(), "JBIG2Decode" | "CCITTFaxDecode")) {
+        return None;
+    }
+    let (wpt, hpt) = ((m.a() * m.a() + m.b() * m.b()).sqrt(), (m.c() * m.c() + m.d() * m.d()).sqrt());
+    if wpt < 1.0 || hpt < 1.0 {
+        return None;
+    }
+    // The new image is a new object: the old one's graphics state doesn't come
+    // with it. A blend mode, opacity or soft mask would be lost, so those stay;
+    // so do clipped ones, unless the clip leaves the image whole.
+    if obj.has_transparency() || !clip_leaves_whole(obj, m) {
+        return None;
+    }
+    // Pixels per inch as placed; the finer direction is brought down to `dpi`.
+    let placed = (w as f32 / (wpt / 72.0)).min(h as f32 / (hpt / 72.0));
+    let k = (dpi / placed).min(1.0);
+    // Transparency (a soft mask) would be lost in a JPEG: leave those be. A
+    // rotated placement shows transparent corners here too, and is left be.
+    let probe = im.get_processed_image_with_size(doc, 24, 24).ok()?.to_rgba8();
+    if probe.pixels().any(|p| p[3] < 250) {
+        return None;
+    }
+    let raw_data = im.get_raw_image_data().ok()?;
+    let raw = im.get_raw_image().ok()?;
+    let (nw, nh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+    let img = if k < 0.99 { raw.resize_exact(nw, nh, image::imageops::FilterType::Triangle) } else { raw };
+    let rgb = img.to_rgb8();
+    let mut jpeg = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, SHRINK_QUALITY);
+    if rgb.pixels().all(|p| p[0] == p[1] && p[1] == p[2]) {
+        enc.encode_image(&image::DynamicImage::ImageRgb8(rgb).to_luma8()).ok()?;
+    } else {
+        enc.encode_image(&rgb).ok()?;
+    }
+    let n = uses.get(&data_key(&raw_data)).copied().unwrap_or(1).max(1);
+    (jpeg.len() * n * 5 < raw_data.len() * 4).then_some((jpeg, m))
+}
+
+/// Whether an object's clip, if it has one, leaves an image placed by `m`
+/// whole: no paths (PDFium drops a rectangle that takes in all it clips), or
+/// each a rectangle around the image. One that can't be read counts as cutting.
+fn clip_leaves_whole(obj: &PdfPageObject, m: PdfMatrix) -> bool {
+    let Some(clip) = obj.get_clip_path() else { return true };
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(u, v)| (m.a() * u + m.c() * v + m.e(), m.b() * u + m.d() * v + m.f()));
+    let fold = |f: fn(f32, f32) -> f32, i: usize| corners.iter().map(|c| if i == 0 { c.0 } else { c.1 }).reduce(f).unwrap_or(0.0);
+    let image = [fold(f32::min, 0), fold(f32::min, 1), fold(f32::max, 0), fold(f32::max, 1)];
+    (0..clip.len()).all(|i| {
+            let Ok(path) = clip.get(i) else { return false };
+            let mut points = Vec::new();
+            for j in 0..path.len() {
+                match path.get(j) {
+                    Ok(seg) if matches!(seg.segment_type(), PdfPathSegmentType::MoveTo | PdfPathSegmentType::LineTo) => points.push((seg.x().value, seg.y().value)),
+                    _ => return false,
+                }
+            }
+            rect_around(&points, image)
+        })
+}
+
+/// Whether a closed outline through `points` is a rectangle (upright, all
+/// four corners) taking in `[x0, y0, x1, y1]`, give or take half a point.
+fn rect_around(points: &[(f32, f32)], b: [f32; 4]) -> bool {
+    const E: f32 = 0.01;
+    let near = |p: (f32, f32), q: (f32, f32)| (p.0 - q.0).abs() < E && (p.1 - q.1).abs() < E;
+    let mut corners: Vec<(f32, f32)> = Vec::new();
+    for &p in points {
+        if !corners.last().is_some_and(|&q| near(p, q)) {
+            corners.push(p);
+        }
+    }
+    if corners.len() > 1 && near(corners[0], corners[corners.len() - 1]) {
+        corners.pop();
+    }
+    if corners.len() != 4 {
+        return false;
+    }
+    // Each side upright, and no corner twice: around the rectangle once.
+    let upright = (0..4).all(|i| {
+        let (p, q) = (corners[i], corners[(i + 1) % 4]);
+        (p.0 - q.0).abs() < E || (p.1 - q.1).abs() < E
+    });
+    let distinct = (0..4).all(|i| (i + 1..4).all(|j| !near(corners[i], corners[j])));
+    let (x0, x1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, z), p| (a.min(p.0), z.max(p.0)));
+    let (y0, y1) = corners.iter().fold((f32::MAX, f32::MIN), |(a, z), p| (a.min(p.1), z.max(p.1)));
+    let on_box = corners.iter().all(|p| ((p.0 - x0).abs() < E || (p.0 - x1).abs() < E) && ((p.1 - y0).abs() < E || (p.1 - y1).abs() < E));
+    upright && distinct && on_box && x0 <= b[0] + 0.5 && y0 <= b[1] + 0.5 && x1 >= b[2] - 0.5 && y1 >= b[3] - 0.5
+}
+
+/// A small render of a page, to compare before and after.
+fn page_look(page: &PdfPage) -> Option<egui::ColorImage> {
+    let s = vec2(page.width().value, page.height().value);
+    let k = 300.0 / s.x.max(s.y).max(1.0);
+    render_page_region(page, k, [0, 0], [((s.x * k).round() as usize).max(1), ((s.y * k).round() as usize).max(1)]).ok()
+}
+
+/// Whether two looks of a page differ beyond recompression's slight blur.
+/// They're compared in blocks of 6x6 pixels, averaged: fine detail sampled
+/// from a coarser image can alias differently pixel by pixel, while what
+/// matters (something missing, moved or the wrong colour) shows in the blocks.
+fn looks_different(a: &egui::ColorImage, b: &egui::ColorImage) -> bool {
+    if a.size != b.size {
+        return true;
+    }
+    const B: usize = 6;
+    let [w, h] = a.size;
+    let block = |img: &egui::ColorImage, bx: usize, by: usize| {
+        let mut s = [0u32; 3];
+        let mut n = 0;
+        for y in by * B..((by + 1) * B).min(h) {
+            for x in bx * B..((bx + 1) * B).min(w) {
+                let p = img.pixels[y * w + x];
+                s[0] += p.r() as u32;
+                s[1] += p.g() as u32;
+                s[2] += p.b() as u32;
+                n += 1;
+            }
+        }
+        s.map(|v| v / n.max(1))
+    };
+    let (mut total, mut big, mut blocks) = (0u64, 0usize, 0usize);
+    for by in 0..h.div_ceil(B) {
+        for bx in 0..w.div_ceil(B) {
+            let (p, q) = (block(a, bx, by), block(b, bx, by));
+            let d = (0..3).map(|i| (p[i] as i32 - q[i] as i32).unsigned_abs()).max().unwrap_or(0);
+            total += d as u64;
+            big += (d > 40) as usize;
+            blocks += 1;
+        }
+    }
+    total as f64 / blocks.max(1) as f64 > 4.0 || big * 200 > blocks
+}
+
+/// Writes a copy of `src` to `out` with its big colour and grey images brought
+/// down to `dpi` and recompressed as JPEGs. Everything else (vector drawing,
+/// text, 1-bit scans, annotations) is left as it is; `src` is never changed.
+pub fn shrink(pdfium: &Pdfium, src: &Path, out: &Path, dpi: f32) -> anyhow::Result<Shrunk> {
+    let before = std::fs::metadata(src)?.len();
+    let doc = pdfium.load_pdf_from_file(src, None)?;
+    let n = doc.pages().len();
+    // How many times each image's data is used: pages can share one.
+    let mut uses: HashMap<u64, usize> = HashMap::new();
+    for pi in 0..n {
+        let page = doc.pages().get(pi)?;
+        for o in page.objects().iter() {
+            if let Some(raw) = o.as_image_object().and_then(|im| im.get_raw_image_data().ok()) {
+                *uses.entry(data_key(&raw)).or_default() += 1;
+            }
+        }
+    }
+    let (mut recompressed, mut kept) = (0, 0);
+    let mut looks = Vec::new();
+    for pi in 0..n {
+        let mut page = doc.pages().get(pi)?;
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+        let look = page_look(&page);
+        let mut plans = Vec::new();
+        for (i, mut o) in page.objects().iter().enumerate() {
+            if o.as_image_object().is_none() {
+                continue;
+            }
+            match recompress(&doc, &mut o, dpi, &uses) {
+                Some(p) => plans.push((i, p)),
+                None => kept += 1,
+            }
+        }
+        if plans.is_empty() {
+            continue;
+        }
+        // From the last down, so the indices still to come stay right; each new
+        // image goes where the old one was, keeping what's drawn over it on top.
+        for (i, (jpeg, m)) in plans.into_iter().rev() {
+            let mut img = PdfPageImageObject::new_from_jpeg_reader(&doc, std::io::Cursor::new(jpeg))?;
+            img.apply_matrix(m)?;
+            page.objects_mut().remove_object_at_index(i as PdfPageObjectIndex)?;
+            page.objects_mut().insert_object_at_index(i as PdfPageObjectIndex, PdfPageObject::Image(img))?;
+            recompressed += 1;
+        }
+        page.regenerate_content()?;
+        looks.push((pi as usize, look));
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = out.with_extension(format!("pdf.{}-{seq}.part", std::process::id()));
+    let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| {
+        // Never bigger: with nothing gained, the copy is the original, byte for byte.
+        if recompressed == 0 || std::fs::metadata(&tmp)?.len() >= before {
+            std::fs::copy(src, &tmp)?;
+            kept += recompressed;
+            recompressed = 0;
+            looks.clear();
+        }
+        Ok(std::fs::rename(&tmp, out)?)
+    });
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved?;
+    drop(doc);
+    // Each changed page, rendered again from the copy, against how it looked.
+    let copy = pdfium.load_pdf_from_file(out, None)?;
+    let mut check_pages = Vec::new();
+    for (pi, look) in looks {
+        let after = copy.pages().get(pi as PdfPageIndex).ok().and_then(|p| page_look(&p));
+        if look.zip(after).is_none_or(|(a, b)| looks_different(&a, &b)) {
+            check_pages.push(pi + 1);
+        }
+    }
+    Ok(Shrunk { before, after: std::fs::metadata(out)?.len(), recompressed, kept, check_pages })
 }
 
 #[cfg(test)]
@@ -739,6 +1228,174 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A photo (no transparency) is embedded as a JPEG at up to 300 dpi: a
+    /// fraction of the size, the right way up and in the right colours.
+    #[test]
+    fn export_photos_compactly() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(612.0), PdfPoints::new(792.0))).unwrap();
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+        // A 3000x2000 photo: blue sky over green grass, a little grain.
+        let mut seed = 7u32;
+        let photo = image::RgbaImage::from_fn(3000, 2000, |_, y| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n = (seed >> 28) as u8;
+            if y < 1000 { image::Rgba([60 + n, 120 + n, 230, 255]) } else { image::Rgba([40 + n, 160 + n, 50, 255]) }
+        });
+        let images = HashMap::from([("photo.jpg".to_string(), photo)]);
+        let rect = Rect::from_min_max(pos2(50.0, 100.0), pos2(350.0, 300.0));
+        let a = annot(0, Kind::Image { rect, image: "photo.jpg".into(), name: "Site photo".into() });
+        export(pdfium, &src, &out, &[a], &images, ExportMode::Flatten, "test").unwrap();
+        let size = std::fs::metadata(&out).unwrap().len();
+        assert!(size < 400_000, "a photo stored as pixels? {size} bytes");
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let obj = page.objects().iter().find_map(|o| o.as_image_object().map(|i| (i.width().unwrap(), i.filters().iter().map(|f| f.name().to_string()).collect::<Vec<_>>()))).unwrap();
+        assert_eq!(obj.0, 1250, "300 dpi over its 300 points");
+        assert!(obj.1.iter().any(|f| f == "DCTDecode"), "{:?}", obj.1);
+        let img = render_region(&doc, 0, 1.0, [0, 0], [612, 792]).unwrap();
+        let px = |x: usize, y: usize| img.pixels[y * 612 + x];
+        assert!(px(200, 150).b() > 200 && px(200, 150).g() < 160, "sky at the top: {:?}", px(200, 150));
+        assert!(px(200, 260).g() > 140 && px(200, 260).b() < 90, "grass below: {:?}", px(200, 260));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A smaller copy brings a big scan down to 200 dpi as a JPEG, keeps what's
+    /// drawn over it on top, and leaves small and transparent images alone.
+    #[test]
+    fn smaller_copies_recompress_big_scans() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("scan.pdf"), dir.join("scan_smaller.pdf"));
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(612.0), PdfPoints::new(792.0))).unwrap();
+        // A 400 dpi grey "scan" over most of the page.
+        let mut seed = 3u32;
+        let scan = image::RgbaImage::from_fn(2400, 3000, |x, y| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = 200 + ((x / 40 + y / 40) % 2) as u8 * 40 + (seed >> 29) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        let mut obj = PdfPageImageObject::new(&doc, &image::DynamicImage::ImageRgba8(scan)).unwrap();
+        obj.apply_matrix(PdfMatrix::new(432.0, 0.0, 0.0, 540.0, 90.0, 126.0)).unwrap();
+        page.objects_mut().add_image_object(obj).unwrap();
+        // A small logo, and a transparent seal: both left as they are.
+        let logo = image::RgbaImage::from_pixel(100, 100, image::Rgba([200, 0, 0, 255]));
+        let mut obj = PdfPageImageObject::new(&doc, &image::DynamicImage::ImageRgba8(logo)).unwrap();
+        obj.apply_matrix(PdfMatrix::new(36.0, 0.0, 0.0, 36.0, 20.0, 740.0)).unwrap();
+        page.objects_mut().add_image_object(obj).unwrap();
+        let seal = image::RgbaImage::from_fn(800, 800, |x, _| image::Rgba([0, 0, 200, if x < 400 { 255 } else { 0 }]));
+        let mut obj = PdfPageImageObject::new(&doc, &image::DynamicImage::ImageRgba8(seal)).unwrap();
+        obj.apply_matrix(PdfMatrix::new(144.0, 0.0, 0.0, 144.0, 400.0, 20.0)).unwrap();
+        page.objects_mut().add_image_object(obj).unwrap();
+        // A red line drawn over the scan.
+        page.objects_mut().create_path_object_line(PdfPoints::new(100.0), PdfPoints::new(400.0), PdfPoints::new(500.0), PdfPoints::new(400.0), PdfColor::new(255, 0, 0, 255), PdfPoints::new(4.0)).unwrap();
+        drop(page);
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+
+        let r = shrink(pdfium, &src, &out, SHRINK_DPI).unwrap();
+        assert_eq!((r.recompressed, r.kept), (1, 2), "{r:?}");
+        assert!(r.after * 4 < r.before, "{r:?}");
+        assert!(r.check_pages.is_empty(), "{r:?}");
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let widths: Vec<u32> = page.objects().iter().filter_map(|o| o.as_image_object().map(|i| i.width().unwrap() as u32)).collect();
+        assert!(widths.contains(&1200) && widths.contains(&100) && widths.contains(&800), "{widths:?}");
+        let img = render_region(&doc, 0, 1.0, [0, 0], [612, 792]).unwrap();
+        let px = |x: usize, y: usize| img.pixels[y * 612 + x];
+        assert!(px(300, 392).r() > 200 && px(300, 392).g() < 80, "the line stays on top of the scan: {:?}", px(300, 392));
+        assert!(px(300, 300).r() > 180 && px(300, 300).r() == px(300, 300).b(), "the scan, grey: {:?}", px(300, 300));
+        // Nothing worth doing: an honest report, and still a copy.
+        let again = dir.join("again.pdf");
+        let r = shrink(pdfium, &out, &again, SHRINK_DPI).unwrap();
+        assert_eq!(r.recompressed, 0);
+        assert_eq!(std::fs::read(&again).unwrap(), std::fs::read(&out).unwrap(), "never bigger: the original as it was");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Images whose look depends on more than their pixels and placement are
+    /// left as they are: a clip that cuts them, or a blend mode. A clip that
+    /// only takes in the whole image (CAD's viewports) doesn't stop it.
+    #[test]
+    fn smaller_copies_keep_clipped_and_blended_images() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test11-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("clipped.pdf"), dir.join("clipped_smaller.pdf"));
+        // A 400 dpi grey scan, stored as a fine JPEG (one of its own on each page).
+        let scan = |mut seed: u32| {
+            let img = image::GrayImage::from_fn(2400, 3000, |x, y| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                image::Luma([200 + ((x / 40 + y / 40) % 2) as u8 * 40 + (seed >> 29) as u8])
+            });
+            let mut jpeg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&img).unwrap();
+            jpeg
+        };
+        // Three pages showing one: clipped to a box around it, clipped short, multiplied.
+        let place = "q 432 0 0 540 90 126 cm /Im0 Do Q";
+        let contents = [format!("q 80 116 452 560 re W n {place} Q"), format!("q 90 126 200 200 re W n {place} Q"), format!("q /GS0 gs {place} Q")];
+        let mut objs: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(), b"<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>".to_vec()];
+        for (i, c) in contents.iter().enumerate() {
+            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 {} 0 R >> /ExtGState << /GS0 12 0 R >> >> /Contents {} 0 R >>", 9 + i, 4 + 2 * i).into_bytes());
+            objs.push([format!("<< /Length {} >>\nstream\n", c.len()).into_bytes(), c.clone().into_bytes(), b"\nendstream".to_vec()].concat());
+        }
+        for seed in 1..=3 {
+            let jpeg = scan(seed);
+            objs.push([format!("<< /Type /XObject /Subtype /Image /Width 2400 /Height 3000 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n", jpeg.len()).into_bytes(), jpeg, b"\nendstream".to_vec()].concat());
+        }
+        objs.push(b"<< /Type /ExtGState /BM /Multiply >>".to_vec());
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n", i + 1).into_bytes());
+            pdf.extend(o);
+            pdf.extend(b"\nendobj\n");
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).into_bytes());
+        for o in offsets {
+            pdf.extend(format!("{o:010} 00000 n \n").into_bytes());
+        }
+        pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).into_bytes());
+        std::fs::write(&src, pdf).unwrap();
+
+        let r = shrink(pdfium, &src, &out, SHRINK_DPI).unwrap();
+        assert_eq!((r.recompressed, r.kept), (1, 2), "{r:?}");
+        assert!(r.check_pages.is_empty(), "{r:?}");
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let widths: Vec<u32> = doc.pages().iter().map(|p| p.objects().iter().find_map(|o| o.as_image_object().map(|i| i.width().unwrap() as u32)).unwrap()).collect();
+        assert_eq!(widths, [1200, 2400, 2400]);
+        // The clip short still cuts: white beyond it.
+        let img = render_region(&doc, 1, 1.0, [0, 0], [612, 792]).unwrap();
+        assert_eq!(img.pixels[(792 - 500) * 612 + 400], egui::Color32::WHITE);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rectangles_around_images() {
+        let b = [10.0, 10.0, 20.0, 20.0];
+        let sq = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)];
+        assert!(rect_around(&sq, b));
+        assert!(rect_around(&[sq[0], sq[1], sq[2], sq[3], sq[0]], b), "closed back to the start");
+        assert!(!rect_around(&sq, [10.0, 10.0, 40.0, 20.0]), "cuts it");
+        assert!(!rect_around(&[sq[0], sq[2], sq[1], sq[3]], b), "a bow tie");
+        assert!(!rect_around(&[sq[0], sq[1], sq[0], sq[3]], b), "folded back on itself");
+        assert!(!rect_around(&[(0.0, 0.0), (30.0, 0.0), (30.0, 30.0)], b), "a triangle");
+        assert!(!rect_around(&[(15.0, 0.0), (30.0, 15.0), (15.0, 30.0), (0.0, 15.0)], b), "a diamond");
+    }
+
     /// An L-shaped area exports filled inside the L only, with its value text,
     /// and a length with its ticks: measurements go through prims like any markup.
     #[test]
@@ -814,13 +1471,59 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Sizes read from the page tree match the loaded pages', /Rotate and CropBox included.
+    #[test]
+    fn page_sizes_match_loaded_pages() {
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-test8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.pdf");
+        let mut doc = pdfium.create_new_pdf().unwrap();
+        for (i, r) in [PdfPageRenderRotation::None, PdfPageRenderRotation::Degrees90, PdfPageRenderRotation::Degrees270].into_iter().enumerate() {
+            let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::new_custom(PdfPoints::new(400.0 + i as f32), PdfPoints::new(600.0))).unwrap();
+            page.set_rotation(r);
+            if i == 2 {
+                page.boundaries_mut().set_crop(PdfRect::new(PdfPoints::new(50.0), PdfPoints::new(30.0), PdfPoints::new(560.0), PdfPoints::new(380.0))).unwrap();
+            }
+        }
+        doc.save_to_file(&src).unwrap();
+        drop(doc);
+        let doc = pdfium.load_pdf_from_file(&src, None).unwrap();
+        let loaded: Vec<Vec2> = doc.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
+        assert_eq!(page_sizes(&doc).unwrap(), loaded);
+        assert_eq!(loaded[1], vec2(600.0, 401.0), "rotated a quarter turn: width and height swap");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Rendered rows (padded or not) become opaque pixels as they were; a
+    /// thumbnail shrunk from a render averages what it covers.
+    #[test]
+    fn rendered_pixels_and_shrunk_thumbnails() {
+        // 2x2 pixels in rows padded to 12 bytes.
+        let raw = [10, 20, 30, 0, 40, 50, 60, 128, 9, 9, 9, 9, 70, 80, 90, 255, 1, 2, 3, 4, 9, 9, 9, 9];
+        let img = opaque_image(&raw, [2, 2]);
+        assert_eq!(img.pixels, [egui::Color32::from_rgb(10, 20, 30), egui::Color32::from_rgb(40, 50, 60), egui::Color32::from_rgb(70, 80, 90), egui::Color32::from_rgb(1, 2, 3)]);
+        // A one-pixel line on white shrinks to a clear grey line, not to nothing;
+        // black and white stripes to a dark grey; a white page stays white.
+        let line = egui::ColorImage::new([80, 80], (0..80 * 80).map(|i| if i % 80 == 33 { egui::Color32::BLACK } else { egui::Color32::WHITE }).collect());
+        let t = shrink_image(&line, [8, 8]);
+        assert!(t.pixels[3].r() < 140 && t.pixels[2].r() == 255 && t.pixels[4].r() == 255, "{:?}", &t.pixels[..8]);
+        let stripes = egui::ColorImage::new([64, 64], (0..64 * 64).map(|i| if i % 2 == 0 { egui::Color32::BLACK } else { egui::Color32::WHITE }).collect());
+        let t = shrink_image(&stripes, [8, 8]);
+        assert!(t.pixels.iter().all(|c| (55..=70).contains(&c.r())), "{:?}", t.pixels[0]);
+        let white = shrink_image(&egui::ColorImage::filled([300, 200], egui::Color32::WHITE), [42, 28]);
+        assert!(white.pixels.iter().all(|c| *c == egui::Color32::WHITE) && white.size == [42, 28]);
+        assert_eq!(thumb_size(vec2(2592.0, 1728.0)).1, [420, 280]);
+    }
+
     /// A search takes turns with thumbnails, behind base renders; a stale one is dropped.
     #[test]
     fn searches_share_the_worker() {
-        let keep = Mutex::new(Keep { base: HashSet::from([0]), thumbs: HashSet::from([1, 2]), search: 7 });
-        let thumb = |page| Req::Render { generation: 1, page, scale: 0.1, origin: [0, 0], size: [10, 10], layer: Layer::Thumb };
+        let keep = Mutex::new(Keep { base: HashSet::from([(1, 0)]), thumbs: HashSet::from([1, 2]), thumbs_generation: 1, search: 7, ..Default::default() });
+        let thumb = |page| Req::Render { generation: 1, view: 0, page, scale: 0.1, origin: [0, 0], size: [10, 10], layer: Layer::Thumb };
         let search = |id| Req::Search { generation: 1, id, pages: VecDeque::from([0, 1, 2]), query: "x".into() };
-        let mut q = VecDeque::from([search(6), thumb(1), thumb(2), search(7), Req::Render { generation: 1, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base }]);
+        let mut q = VecDeque::from([search(6), thumb(1), thumb(2), search(7), Req::Render { generation: 1, view: 1, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base }]);
         let mut turn = false;
         let mut order = Vec::new();
         while let Some(r) = next_request(&mut q, &keep, &mut turn) {
@@ -855,6 +1558,20 @@ pub(crate) mod tests {
         let page = doc.pages().get(0).unwrap();
         let fonts: Vec<String> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| t.font().name())).collect();
         assert!(fonts.iter().any(|f| f.contains("Bold")) && fonts.iter().any(|f| f.contains("Oblique")), "{fonts:?}");
+        drop(page);
+        drop(doc);
+        // One word bold: that word in Helvetica-Bold, the rest plain.
+        let mut w = annot(0, Kind::Text { pos: pos2(40.0, 40.0), box_w: 300.0, text: "Seal the sill".into(), size: 14.0 });
+        let mut f = vec![crate::annot::Fmt::default(); 13];
+        f[5..8].iter_mut().for_each(|x| x.bold = true);
+        w.style.set_fmts(&f);
+        export(pdfium, &src, &out, &[w], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+        let page = doc.pages().get(0).unwrap();
+        let runs: Vec<(String, String)> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| (t.text(), t.font().name()))).collect();
+        assert!(runs.iter().any(|(t, f)| t.trim() == "the" && f.contains("Bold")), "{runs:?}");
+        assert!(runs.iter().any(|(t, f)| t.contains("Seal") && !f.contains("Bold")), "{runs:?}");
+        assert!(page.text().unwrap().all().contains("Seal the sill"), "reads as one line: {:?}", page.text().unwrap().all());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -972,3 +1689,96 @@ mod sample {
         }
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::tests::{test_pdfium, PDFIUM_TESTS};
+    use super::*;
+    use std::time::Instant;
+
+    /// Rendering a 1900x1000 view at 4 px/pt as one region against tiles of a few sizes.
+    #[test]
+    #[ignore]
+    fn bench_tiles() {
+        let src = PathBuf::from(std::env::var("GREENLINE_SAMPLE").unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let doc = test_pdfium().load_pdf_from_file(&src, None).unwrap();
+        for pi in [0usize, 10] {
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            let scale = 4.0;
+            let view = [3000i32, 2000, 1900, 1000];
+            let t = Instant::now();
+            render_page_region(&p, scale, [view[0], view[1]], [view[2] as usize, view[3] as usize]).unwrap();
+            eprintln!("page {pi}: one region {:?}", t.elapsed());
+            for ts in [256i32, 512, 768, 1024] {
+                let t = Instant::now();
+                let mut n = 0;
+                for ty in view[1] / ts..=(view[1] + view[3]) / ts {
+                    for tx in view[0] / ts..=(view[0] + view[2]) / ts {
+                        render_page_region(&p, scale, [tx * ts, ty * ts], [ts as usize, ts as usize]).unwrap();
+                        n += 1;
+                    }
+                }
+                eprintln!("  {ts}px tiles: {n} in {:?}", t.elapsed());
+            }
+        }
+    }
+
+    /// GREENLINE_SAMPLE=/path/to.pdf cargo test --release bench_ -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_worker_steps() {
+        let src = PathBuf::from(std::env::var("GREENLINE_SAMPLE").unwrap());
+        let _guard = PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = test_pdfium();
+        let t = Instant::now();
+        let doc = pdfium.load_pdf_from_file(&src, None).unwrap();
+        eprintln!("load: {:?}", t.elapsed());
+        let t = Instant::now();
+        let a: Vec<Vec2> = doc.pages().iter().map(|p| vec2(p.width().value, p.height().value)).collect();
+        eprintln!("sizes by loading every page ({}): {:?}", a.len(), t.elapsed());
+        let t = Instant::now();
+        let b: Vec<Vec2> = doc.pages().page_sizes().unwrap().iter().map(|r| vec2(r.width().value, r.height().value)).collect();
+        eprintln!("sizes by index: {:?} same={}", t.elapsed(), a == b);
+        for pi in [0usize, 5, 10] {
+            let t = Instant::now();
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            let load = t.elapsed();
+            let s = vec2(p.width().value, p.height().value);
+            let scale = 4096.0 / s.x.max(s.y);
+            let size = [(s.x * scale).round() as usize, (s.y * scale).round() as usize];
+            let cfg = PdfRenderConfig::new().set_fixed_size(size[0] as Pixels, size[1] as Pixels).render_annotations(true);
+            let mut bmp = PdfBitmap::empty(size[0] as Pixels, size[1] as Pixels, PdfBitmapFormat::BGRA).unwrap();
+            let t = Instant::now();
+            p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+            let r1 = t.elapsed();
+            let t = Instant::now();
+            p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+            let r2 = t.elapsed();
+            let t = Instant::now();
+            let rgba = bmp.as_rgba_bytes();
+            let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+            let conv = t.elapsed();
+            drop(img);
+            drop(p);
+            let t = Instant::now();
+            let image = render_region(&doc, pi, scale, [0, 0], size).unwrap();
+            let full = t.elapsed();
+            let t = Instant::now();
+            let _ = shrink_image(&image, thumb_size(s).1);
+            eprintln!("  thumbnail shrunk from it: {:?}", t.elapsed());
+            eprintln!("page {pi} {size:?}: load {load:?}, render {r1:?}, again on loaded page {r2:?}, convert {conv:?}; render_region {full:?}");
+            let p = doc.pages().get(pi as PdfPageIndex).unwrap();
+            for px in [512.0f32, 1024.0, 1448.0, 2048.0, 2896.0, 4096.0] {
+                let scale = px / s.x.max(s.y);
+                let size = [(s.x * scale).round() as usize, (s.y * scale).round() as usize];
+                let cfg = PdfRenderConfig::new().set_fixed_size(size[0] as Pixels, size[1] as Pixels).render_annotations(true);
+                let mut bmp = PdfBitmap::empty(size[0] as Pixels, size[1] as Pixels, PdfBitmapFormat::BGRA).unwrap();
+                let t = Instant::now();
+                p.render_into_bitmap_with_config(&mut bmp, &cfg).unwrap();
+                eprintln!("   {px}px: {:?}", t.elapsed());
+            }
+        }
+    }
+}
+

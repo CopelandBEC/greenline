@@ -18,7 +18,8 @@ Common fields: "color" (green, red, blue, black, orange, yellow or "#rrggbb";
 default green, highlight yellow), "width" (line width in points, default 2),
 "size" (text size in points, default 12; 10 for measurement labels),
 "group" (any string: ops on one page with the same group select and move together),
-"bold", "italic", "underline" (true: the whole note of a callout or text box),
+"bold", "italic", "underline" (true: the whole note of a callout or text box; or a list of
+words or phrases in the note, ["NOT", "air barrier"], for just those, wherever they appear),
 "fill" (a colour as for "color", or "white": fills a cloud, rect, polygon, area, callout or
 text box) with "opacity" (0 to 100, default 50),
 "line" (a line type: dashed, dotted, dash-dot, or a name from the pattern library; for
@@ -138,15 +139,37 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
             }
         };
         let mut a = Annot { id: first_id + batch.annots.len() as u64, page, color, width, kind, wrap_w: None, group, style: Default::default() };
-        for (key, flag) in [("bold", &mut a.style.bold), ("italic", &mut a.style.italic), ("underline", &mut a.style.underline)] {
-            match o.get(key) {
-                None | Some(Value::Null) => {}
-                Some(Value::Bool(b)) => *flag = *b,
-                Some(_) => return Err(ctx(format!("\"{key}\" must be true or false"))),
+        let is_note = matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. });
+        let chars: Vec<char> = a.text().chars().collect();
+        let mut fmts = vec![annot::Fmt::default(); chars.len()];
+        for (which, key) in ["bold", "italic", "underline"].into_iter().enumerate() {
+            let words = match o.get(key) {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => continue,
+                Some(_) if !is_note => return Err(ctx("\"bold\", \"italic\" and \"underline\" are for callouts and text boxes".into())),
+                Some(Value::Bool(true)) => {
+                    fmts.iter_mut().for_each(|f| f.set(which, true));
+                    if chars.is_empty() {
+                        a.style.set_fmts(&[annot::Fmt { bold: which == 0, italic: which == 1, underline: which == 2 }]);
+                    }
+                    continue;
+                }
+                Some(Value::Array(w)) => w,
+                Some(_) => return Err(ctx(format!("\"{key}\" must be true, false or a list of words in the note"))),
+            };
+            // Just these words (each place they appear).
+            for w in words {
+                let w: Vec<char> = w.as_str().filter(|w| !w.is_empty()).ok_or(ctx(format!("\"{key}\" words must be text")))?.chars().collect();
+                let at: Vec<usize> = (0..chars.len().saturating_sub(w.len() - 1)).filter(|&i| chars[i..i + w.len()] == w[..]).collect();
+                if at.is_empty() {
+                    return Err(ctx(format!("\"{key}\": \"{}\" isn't in the note", w.iter().collect::<String>())));
+                }
+                for i in at {
+                    fmts[i..i + w.len()].iter_mut().for_each(|f| f.set(which, true));
+                }
             }
         }
-        if (a.style.bold || a.style.italic || a.style.underline) && !matches!(a.kind, Kind::Callout { .. } | Kind::Text { .. }) {
-            return Err(ctx("\"bold\", \"italic\" and \"underline\" are for callouts and text boxes".into()));
+        if !chars.is_empty() {
+            a.style.set_fmts(&fmts);
         }
         a.style.fill = f.fill().map_err(ctx)?;
         if a.style.fill.is_some() && !a.fillable() {
@@ -439,6 +462,24 @@ mod tests {
 
     fn pages() -> Vec<Vec2> {
         vec![vec2(792.0, 612.0), vec2(1224.0, 792.0)]
+    }
+
+    #[test]
+    fn formats_whole_notes_or_just_some_words() {
+        let pages = [egui::vec2(612.0, 792.0)];
+        let ops = serde_json::json!([
+            {"op": "text", "page": 1, "at": [50, 50], "text": "Do NOT seal the air barrier", "bold": ["NOT"], "underline": ["air barrier"]},
+            {"op": "text", "page": 1, "at": [50, 150], "text": "All of it", "italic": true},
+        ]);
+        let b = parse(&ops, &pages, 1, 1).unwrap();
+        let f = b.annots[0].style.fmts(27);
+        assert!(f[3..6].iter().all(|x| x.bold) && !f[2].bold && !f[6].bold);
+        assert!(f[16..27].iter().all(|x| x.underline) && !f[15].underline);
+        assert!(b.annots[1].style.italic && b.annots[1].style.runs.is_empty());
+        let bad = serde_json::json!([{"op": "text", "page": 1, "at": [50, 50], "text": "Seal it", "bold": ["sill"]}]);
+        assert!(parse(&bad, &pages, 1, 1).unwrap_err().contains("isn't in the note"));
+        let bad = serde_json::json!([{"op": "cloud", "page": 1, "rect": [0, 0, 10, 10], "bold": true}]);
+        assert!(parse(&bad, &pages, 1, 1).unwrap_err().contains("callouts and text boxes"));
     }
 
     #[test]
