@@ -1600,7 +1600,7 @@ impl App {
                         if ui.add_enabled(any, egui::Button::new("⏷")).on_hover_text("Next (Enter, F3)").clicked() {
                             self.step_hit(1);
                         }
-                        if ui.button("✕").on_hover_text("Close (Esc)").clicked() {
+                        if ui.button("×").on_hover_text("Close (Esc)").clicked() {
                             close = true;
                         }
                     });
@@ -3658,7 +3658,7 @@ impl App {
             for a in self.annots.iter().filter(|a| a.page == i) {
                 let mut prims = a.prims();
                 if Some(a.id) == self.editing {
-                    prims.retain(|p| !matches!(p, Prim::Text { .. }));
+                    prims = typed_note_prims(a);
                     if let Kind::Text { .. } = a.kind {
                         let r = a.text_box().unwrap();
                         let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max));
@@ -3844,7 +3844,7 @@ impl App {
         let pad = annot::pad(size);
         let pos = self.page_to_screen(page, r.min + vec2(pad, pad));
         let width = (r.width() - 2.0 * pad) * z;
-        let font = FontId::new((size * z * k.0).max(6.0), helv_styled(a.style.bold, a.style.italic));
+        let fs = (size * z * k.0).max(6.0);
         let mut text = text_of(a).to_string();
         let needs_focus = std::mem::take(&mut self.edit_needs_focus);
         for (i, k) in [Key::B, Key::I, Key::U].into_iter().enumerate() {
@@ -3852,7 +3852,22 @@ impl App {
                 self.toggle_format(i);
             }
         }
-        
+        // Formatting may have just changed (B / I / U): lay out with it. The sheet
+        // leaves out the note's underline while it's typed, so the editor draws it.
+        let style = self.find(id).map(|a| a.style.clone()).unwrap_or_default();
+        let ink = Color32::from_rgb(color[0], color[1], color[2]);
+        let font = FontId::new(fs, helv_styled(style.bold, style.italic));
+        let format = egui::TextFormat {
+            font_id: font.clone(),
+            color: ink,
+            underline: if style.underline { Stroke::new((fs * 0.06).max(1.0), ink) } else { Stroke::NONE },
+            ..Default::default()
+        };
+        let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+            let mut job = egui::text::LayoutJob::single_section(buf.as_str().to_owned(), format.clone());
+            job.wrap.max_width = wrap;
+            ui.painter().layout_job(job)
+        };
         let resp = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
             .order(egui::Order::Foreground)
@@ -3868,8 +3883,9 @@ impl App {
                         .margin(egui::Margin::ZERO)
                         .desired_width(width.max(20.0))
                         .desired_rows(1)
+                        // Its row height sizes the editor and the caret, even with a layouter.
                         .font(font)
-                        .text_color(Color32::from_rgb(color[0], color[1], color[2])),
+                        .layouter(&mut layouter),
                 )
             })
             .inner;
@@ -5281,6 +5297,20 @@ fn label_size(a: &Annot) -> Option<f32> {
     }
 }
 
+/// What the sheet draws of a note being typed: its box and leaders, but not its
+/// text or underline, which the editor draws where they now fall.
+fn typed_note_prims(a: &Annot) -> Vec<Prim> {
+    let mut prims = if a.style.underline {
+        let mut plain = a.clone();
+        plain.style.underline = false;
+        plain.prims()
+    } else {
+        a.prims()
+    };
+    prims.retain(|p| !matches!(p, Prim::Text { .. }));
+    prims
+}
+
 fn text_of(a: &Annot) -> &str {
     match &a.kind {
         Kind::Callout { text, .. } | Kind::Text { text, .. } => text,
@@ -5862,6 +5892,20 @@ mod tests {
         assert!(app.find(t).unwrap().style.italic);
         assert_eq!(app.undo.len(), steps);
         assert!(app.edit_needs_focus);
+    }
+
+    #[test]
+    fn a_typed_notes_underline_is_the_editors_not_the_sheets() {
+        let mut app = app();
+        let c = callout(&mut app, pos2(100.0, 100.0), pos2(200.0, 200.0));
+        let a = app.find(c).unwrap().clone();
+        let mut under = a.clone();
+        under.style.underline = true;
+        assert!(under.prims().len() > a.prims().len(), "the sheet underlines it");
+        // While it's typed, the sheet keeps the box and leader, and leaves the text and underline to the editor.
+        let typed = typed_note_prims(&under);
+        assert_eq!(typed.len(), typed_note_prims(&a).len());
+        assert!(!typed.is_empty() && typed.iter().all(|p| !matches!(p, Prim::Text { .. })));
     }
 
     #[test]
