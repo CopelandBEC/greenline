@@ -6,6 +6,7 @@ use crate::proposals::{self, Proposals};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
 use crate::stamps;
+use egui::emath::GuiRounding;
 use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, FontFamily, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke,
     TextureHandle, TextureOptions, Ui, Vec2,
@@ -1106,6 +1107,9 @@ impl App {
                         Some(s) => s.left() - 3.0,
                         None => spans[spans.len() - 1].right() + 3.0,
                     };
+                    // Kept inside the strip: before the first tab, 3 px left of it would be clipped away.
+                    let clip = ui.clip_rect();
+                    let x = x.clamp(clip.left() + 1.0, clip.right() - 1.0);
                     let y = spans[from].y_range();
                     ui.painter().vline(x, y, Stroke::new(2.0, ui.visuals().selection.stroke.color));
                 }
@@ -4397,11 +4401,11 @@ impl App {
         let painter = ui.painter_at(self.canvas);
         painter.rect_filled(self.canvas, 0.0, crate::theme::canvas(ui.visuals()));
         let k = self.text_metrics(&painter);
-        let shadow = Color32::from_black_alpha(90);
+        let shadow = crate::theme::page_shadow(ui.visuals());
         for i in self.visible_pages() {
             let pr = self.page_doc_rect(i);
             let sr = Rect::from_min_max(self.to_screen(pr.min), self.to_screen(pr.max));
-            painter.rect_filled(sr.translate(vec2(2.0, 3.0)), 0.0, shadow);
+            painter.add(shadow.as_shape(sr, 0.0));
             painter.rect_filled(sr, 0.0, Color32::WHITE);
             let uv = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
             let base_scale = self.base.get(&i).map(|t| t.scale).unwrap_or(0.0);
@@ -4806,10 +4810,11 @@ impl App {
             for (i, (c, name)) in COLORS.iter().enumerate() {
                 let col = Color32::from_rgb(c[0], c[1], c[2]);
                 let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                ui.painter().rect_filled(rect.shrink(2.0), 3.0, col);
+                let rect = rect.round_to_pixels(ui.pixels_per_point());
                 if *c == cur {
                     swatch_ring(ui, rect);
                 }
+                ui.painter().rect_filled(rect.shrink(2.0), 3.0, col);
                 if resp.on_hover_text(format!("{name} ({})", i + 1)).clicked() {
                     self.set_color(i);
                 }
@@ -4859,20 +4864,25 @@ impl App {
             ui.label("Fill");
             ui.horizontal(|ui| {
                 let (r, none) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                paint_swatch(ui.painter(), r.shrink(2.0), None);
+                let r = r.round_to_pixels(ui.pixels_per_point());
                 if shown.is_none() {
                     swatch_ring(ui, r);
                 }
+                paint_swatch(ui.painter(), r.shrink(2.0), None);
                 if none.on_hover_text("None").clicked() {
                     self.set_fill(None);
                 }
                 for i in 0..=COLORS.len() {
                     let c = fill_color(i);
                     let (r, sw) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-                    paint_swatch(ui.painter(), r.shrink(2.0), Some(Fill { color: c, alpha: 255 }));
-                    ui.painter().rect_stroke(r.shrink(2.0), 3.0, Stroke::new(1.0, edge.gamma_multiply(0.5)), egui::StrokeKind::Inside);
-                    if shown.is_some_and(|f| f.color == c) {
+                    let r = r.round_to_pixels(ui.pixels_per_point());
+                    let chosen = shown.is_some_and(|f| f.color == c);
+                    if chosen {
                         swatch_ring(ui, r);
+                    }
+                    paint_swatch(ui.painter(), r.shrink(2.0), Some(Fill { color: c, alpha: 255 }));
+                    if !chosen {
+                        ui.painter().rect_stroke(r.shrink(2.0), 3.0, Stroke::new(1.0, edge.gamma_multiply(0.5)), egui::StrokeKind::Inside);
                     }
                     if sw.on_hover_text(fill_name(c)).clicked() {
                         self.set_fill(Some(i));
@@ -5139,8 +5149,10 @@ impl App {
         let s = self.pages[i];
         let z = (slot.width() / s.x).min(slot.height() / s.y);
         let r = Rect::from_center_size(slot.center(), s * z);
-        let painter = ui.painter_at(slot.expand(4.0));
-        painter.rect_filled(r.translate(vec2(1.5, 2.0)), 0.0, Color32::from_black_alpha(80));
+        let painter = ui.painter_at(slot.expand(6.0));
+        let mut shadow = crate::theme::page_shadow(ui.visuals());
+        (shadow.offset, shadow.blur) = ([0, 1], 6);
+        painter.add(shadow.as_shape(r, 0.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);
         if let Some(t) = self.thumbs.get(&i) {
             painter.image(t.tex.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
@@ -5793,6 +5805,8 @@ impl eframe::App for App {
                 ui.painter().rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, accent), egui::StrokeKind::Inside);
                 ui.painter().line_segment([pos2(full.center().x.round(), full.min.y), pos2(full.center().x.round(), full.max.y)], Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
             }
+            // Over the pages too: the bars and panes sit a little above the canvas.
+            crate::theme::canvas_inset(ui.painter(), full, ui.visuals());
         });
         }
         self.text_editor(&ctx);
@@ -6123,14 +6137,15 @@ fn fill_name(c: Rgb) -> &'static str {
     COLORS.iter().find(|x| x.0 == c).map_or(if c == WHITE { "White" } else { "Custom" }, |x| x.1)
 }
 
-/// A fill swatch: the colour at its opacity over a light checker, or a red slash for none.
-/// The ring round the chosen swatch (drawn `rect.shrink(2.0)` with corner radius
-/// 3): 2 px wide, its corners rounded 2 px more, so it hugs the swatch's corners
-/// with no gaps.
+/// The ring round the chosen swatch, drawn first: a pixel-aligned rounded block
+/// that the swatch (`rect.shrink(2.0)`, corner radius 3) is then painted over,
+/// leaving a 2 px ring whose corners round 2 px more. Filling under the swatch,
+/// rather than stroking round it, leaves no anti-aliased seam or corner gap.
 fn swatch_ring(ui: &Ui, rect: Rect) {
-    ui.painter().rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+    ui.painter().rect_filled(rect, 5.0, ui.visuals().strong_text_color());
 }
 
+/// A fill swatch: the colour at its opacity over a light checker, or a red slash for none.
 fn paint_swatch(p: &Painter, r: Rect, fill: Option<Fill>) {
     p.rect_filled(r, 3.0, Color32::WHITE);
     match fill {
