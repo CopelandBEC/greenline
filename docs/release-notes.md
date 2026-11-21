@@ -14,7 +14,7 @@ Because the installer isn't code-signed yet, Windows may show "Windows protected
 - **Bold, italic, underline.** The **B I U** buttons or `Ctrl+B/I/U`, also while typing, for the whole note.
 - **New blank document (`Ctrl+N`).** Letter to ARCH E or A4 to A1, portrait or landscape, up to 200 pages.
 - **Images as markups.** Drop a PNG or JPEG on a sheet, or tool menu ▸ **Insert image…**: full colour, sized to fit, resizable by its corners.
-- **Tabs.** Opening another PDF opens it in a tab. `Ctrl+Tab`/`Ctrl+Shift+Tab` switch, `Ctrl+W` or middle-click closes; each keeps its own markups, view and undo.
+- **Tabs.** Opening another PDF opens it in a tab. `Ctrl+Tab`/`Ctrl+Shift+Tab` switch, `Ctrl+W` or middle-click closes, drag a tab to move it; each keeps its own markups, view and undo.
 - For agents: `greenline-cli` ops gain `polyline`, `polygon`, `fill`, `line`, `hatch`, `bold`/`italic`/`underline`, and `greenline-cli patterns` lists the library.
 
 **Coming in 2.1:** split screen, per-word formatting, and smaller files.
