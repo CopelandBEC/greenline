@@ -4808,7 +4808,7 @@ impl App {
                 let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                 ui.painter().rect_filled(rect.shrink(2.0), 3.0, col);
                 if *c == cur {
-                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+                    swatch_ring(ui, rect);
                 }
                 if resp.on_hover_text(format!("{name} ({})", i + 1)).clicked() {
                     self.set_color(i);
@@ -4861,7 +4861,7 @@ impl App {
                 let (r, none) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
                 paint_swatch(ui.painter(), r.shrink(2.0), None);
                 if shown.is_none() {
-                    ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+                    swatch_ring(ui, r);
                 }
                 if none.on_hover_text("None").clicked() {
                     self.set_fill(None);
@@ -4872,7 +4872,7 @@ impl App {
                     paint_swatch(ui.painter(), r.shrink(2.0), Some(Fill { color: c, alpha: 255 }));
                     ui.painter().rect_stroke(r.shrink(2.0), 3.0, Stroke::new(1.0, edge.gamma_multiply(0.5)), egui::StrokeKind::Inside);
                     if shown.is_some_and(|f| f.color == c) {
-                        ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+                        swatch_ring(ui, r);
                     }
                     if sw.on_hover_text(fill_name(c)).clicked() {
                         self.set_fill(Some(i));
@@ -6124,6 +6124,13 @@ fn fill_name(c: Rgb) -> &'static str {
 }
 
 /// A fill swatch: the colour at its opacity over a light checker, or a red slash for none.
+/// The ring round the chosen swatch (drawn `rect.shrink(2.0)` with corner radius
+/// 3): 2 px wide, its corners rounded 2 px more, so it hugs the swatch's corners
+/// with no gaps.
+fn swatch_ring(ui: &Ui, rect: Rect) {
+    ui.painter().rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().strong_text_color()), egui::StrokeKind::Inside);
+}
+
 fn paint_swatch(p: &Painter, r: Rect, fill: Option<Fill>) {
     p.rect_filled(r, 3.0, Color32::WHITE);
     match fill {
