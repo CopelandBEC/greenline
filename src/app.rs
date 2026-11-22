@@ -6020,6 +6020,31 @@ fn thin(pts: Vec<Pos2>) -> Vec<Pos2> {
     out
 }
 
+/// Fill of a convex outline. egui anti-aliases a fill's edge with unlimited
+/// mitres too, so a sliver (say, a polygon just begun, its third point by the
+/// second) would shoot out far past its corners: one with a corner sharper
+/// than 30° is filled without that, its edge left to the outline drawn over it.
+fn convex_fill(pts: Vec<Pos2>, color: Color32) -> Shape {
+    let n = pts.len();
+    let sharp = n >= 3
+        && (0..n).any(|i| {
+            let (a, p, b) = (pts[(i + n - 1) % n], pts[i], pts[(i + 1) % n]);
+            let (u, v) = ((a - p).normalized(), (b - p).normalized());
+            u.dot(v) > 30.0_f32.to_radians().cos()
+        });
+    if !sharp {
+        return Shape::convex_polygon(pts, color, Stroke::NONE);
+    }
+    let mut mesh = egui::Mesh::default();
+    for p in &pts {
+        mesh.colored_vertex(*p, color);
+    }
+    for i in 1..n.saturating_sub(1) {
+        mesh.add_triangle(0, i as u32, i as u32 + 1);
+    }
+    Shape::mesh(mesh)
+}
+
 /// egui joins a stroke's segments with unlimited mitres, so a sharp corner
 /// spikes far past its point. A sharp turn gets a tiny arc instead (points
 /// within a pixel of the corner), which egui draws as a round join, as the
@@ -6093,7 +6118,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                         let pts = map(outline);
                         let c = col(*color, *alpha);
                         if convex(&pts) {
-                            painter.add(Shape::convex_polygon(pts, c, Stroke::NONE));
+                            painter.add(convex_fill(pts, c));
                         } else if let Some(tris) = cached_triangles(outline) {
                             let mut mesh = egui::Mesh::default();
                             for p in &pts {
@@ -6137,7 +6162,10 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                 let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
                 let pts = map(page_pts);
                 if convex(&pts) {
-                    painter.add(Shape::convex_polygon(pts, col(*color, *alpha), stroke));
+                    painter.add(convex_fill(pts.clone(), col(*color, *alpha)));
+                    if stroke != Stroke::NONE {
+                        painter.add(Shape::closed_line(round_corners(pts, true), stroke));
+                    }
                 } else {
                     // An L- or U-shaped area or a cloud: egui fills convex outlines only, so fill triangles.
                     if let Some(tris) = cached_triangles(page_pts) {
@@ -6793,8 +6821,37 @@ mod tests {
         assert!(thin_reach(sliver.clone()) > 310.0, "egui alone mitres past the tip");
         let r = thin_reach(round_corners(sliver, true));
         assert!(r < 300.0 + 3.0, "rounded: at the tip, got {r}");
+        // A polygon just begun, the pointer a pixel or two off its second point:
+        // nothing reaches past its two points.
+        for off in [vec2(0.6, 0.0), vec2(1.0, 0.3), vec2(2.0, -1.0), vec2(0.3, 0.8), vec2(3.0, 0.2)] {
+            let (a, b) = (pos2(160.0, 395.0), pos2(183.0, 262.0));
+            let tri = vec![a, b, b + off];
+            let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+            let mut mesh = egui::Mesh::default();
+            t.tessellate_shape(convex_fill(tri.clone(), Color32::BLACK), &mut mesh);
+            t.tessellate_shape(Shape::closed_line(round_corners(thin(tri), true), Stroke::new(2.0, Color32::BLACK)), &mut mesh);
+            let bounds = Rect::from_two_pos(a, b + off).expand(4.0);
+            assert!(mesh.vertices.iter().all(|v| bounds.contains(v.pos)), "{off:?}: reaches past its points");
+        }
         let back = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 0.0)];
         assert!(reach(round_corners(back, false)) < 100.0 + 5.0 + 2.0);
+    }
+
+    /// A sliver's fill stays on the sliver: egui's anti-aliased fill would
+    /// mitre its sharp corners hundreds of pixels out.
+    #[test]
+    fn a_slivers_fill_stays_put() {
+        let reach = |shape: Shape| {
+            let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+            let mut mesh = egui::Mesh::default();
+            t.tessellate_shape(shape, &mut mesh);
+            mesh.vertices.iter().map(|v| v.pos.x.abs()).fold(0.0, f32::max)
+        };
+        let sliver = vec![pos2(0.0, 0.0), pos2(300.0, 0.0), pos2(301.0, 0.5)];
+        assert!(reach(Shape::convex_polygon(sliver.clone(), Color32::BLACK, Stroke::NONE)) > 400.0, "egui alone");
+        assert!(reach(convex_fill(sliver, Color32::BLACK)) <= 301.0);
+        let square = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0), pos2(0.0, 100.0)];
+        assert!(matches!(convex_fill(square, Color32::BLACK), Shape::Path(_)), "ordinary shapes keep anti-aliasing");
     }
 
     #[test]
