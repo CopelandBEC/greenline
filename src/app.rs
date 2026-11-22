@@ -6045,11 +6045,31 @@ fn convex_fill(pts: Vec<Pos2>, color: Color32) -> Shape {
     Shape::mesh(mesh)
 }
 
+/// A stroke through screen points `pts`, its sharp corners rounded
+/// (`round_corners`). Closed with only two points left, it's the line between them:
+/// egui would mitre the loop's two reversals into spikes.
+fn stroke_shape(pts: Vec<Pos2>, closed: bool, stroke: Stroke) -> Shape {
+    let pts = round_corners(pts, closed);
+    if closed && pts.len() > 2 {
+        Shape::closed_line(pts, stroke)
+    } else {
+        Shape::line(pts, stroke)
+    }
+}
+
 /// egui joins a stroke's segments with unlimited mitres, so a sharp corner
 /// spikes far past its point. A sharp turn gets a tiny arc instead (points
 /// within a pixel of the corner), which egui draws as a round join, as the
 /// export does (PDF line join round).
 fn round_corners(pts: Vec<Pos2>, closed: bool) -> Vec<Pos2> {
+    // Points under half a pixel apart first become one: such a stub (the
+    // pointer by the point just placed) turns the line back on itself, and
+    // egui mitres that reversal into a spike across the sheet.
+    let mut pts = pts;
+    pts.dedup_by(|b, a| (*b - *a).length_sq() < 0.25);
+    while closed && pts.len() > 1 && (pts[pts.len() - 1] - pts[0]).length_sq() < 0.25 {
+        pts.pop();
+    }
     let n = pts.len();
     // Thin lines too: zoomed out, a 1 px line's mitre on a sliver still runs
     // many pixels past the point.
@@ -6151,12 +6171,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
-                let pts = round_corners(thin(map(pts)), *closed);
-                if *closed {
-                    painter.add(Shape::closed_line(pts, s));
-                } else {
-                    painter.add(Shape::line(pts, s));
-                }
+                painter.add(stroke_shape(thin(map(pts)), *closed, s));
             }
             Prim::Fill { pts: page_pts, color, alpha, outline } => {
                 let stroke = outline.map(|(c, w)| Stroke::new((w * z).max(min_w), col(c, 255))).unwrap_or(Stroke::NONE);
@@ -6164,7 +6179,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                 if convex(&pts) {
                     painter.add(convex_fill(pts.clone(), col(*color, *alpha)));
                     if stroke != Stroke::NONE {
-                        painter.add(Shape::closed_line(round_corners(pts, true), stroke));
+                        painter.add(stroke_shape(pts, true, stroke));
                     }
                 } else {
                     // An L- or U-shaped area or a cloud: egui fills convex outlines only, so fill triangles.
@@ -6179,7 +6194,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                         painter.add(Shape::mesh(mesh));
                     }
                     if stroke != Stroke::NONE {
-                        painter.add(Shape::closed_line(round_corners(pts, true), stroke));
+                        painter.add(stroke_shape(pts, true, stroke));
                     }
                 }
             }
@@ -6852,6 +6867,34 @@ mod tests {
         assert!(reach(convex_fill(sliver, Color32::BLACK)) <= 301.0);
         let square = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0), pos2(0.0, 100.0)];
         assert!(matches!(convex_fill(square, Color32::BLACK), Shape::Path(_)), "ordinary shapes keep anti-aliasing");
+    }
+
+    /// A polygon just begun, the pointer anywhere from on its second point to a
+    /// few pixels off: neither outline nor fill reaches past its points.
+    #[test]
+    fn a_polygon_just_begun_stays_on_its_points() {
+        for (a, b) in [(pos2(160.0, 395.0), pos2(183.0, 262.0)), (pos2(10.0, 10.0), pos2(300.0, 10.0)), (pos2(10.0, 10.0), pos2(10.0, 300.0))] {
+            for r in [0.0, 0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 0.45, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0] {
+                for k in 0..16 {
+                    let c = b + Vec2::angled(k as f32 * std::f32::consts::TAU / 16.0) * r;
+                    let tri = vec![a, b, c];
+                    let within = |mesh: &egui::Mesh, pad: f32| {
+                        let bounds = Rect::from_points(&tri).expand(pad);
+                        mesh.vertices.iter().all(|v| bounds.contains(v.pos))
+                    };
+                    for w in [1.0, 2.0, 4.0] {
+                        let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+                        let mut mesh = egui::Mesh::default();
+                        t.tessellate_shape(stroke_shape(thin(tri.clone()), true, Stroke::new(w, Color32::BLACK)), &mut mesh);
+                        assert!(within(&mesh, w + 2.0), "outline, {r} px off at {k}/16, {w} wide");
+                    }
+                    let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+                    let mut mesh = egui::Mesh::default();
+                    t.tessellate_shape(convex_fill(tri.clone(), Color32::BLACK), &mut mesh);
+                    assert!(within(&mesh, 2.0), "fill, {r} px off at {k}/16");
+                }
+            }
+        }
     }
 
     #[test]
