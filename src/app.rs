@@ -3618,6 +3618,10 @@ impl App {
         }
         let last = *pts.last().unwrap();
         let p = if shift { square(last, p) } else { p };
+        // egui counts any two clicks within 0.3 s as a double-click, wherever they
+        // land: clicking corners out quickly would finish the line and start
+        // another. Only a second click on the point just placed finishes it.
+        let double = double && (p - last).length() <= tol;
         // Back on the first point: an area or polygon closes, and so does a
         // polyline, which becomes a polygon.
         let closes = (area || self.tool == Tool::Polyline) && pts.len() >= 3 && (pts[0] - p).length() <= tol;
@@ -6020,9 +6024,11 @@ fn thin(pts: Vec<Pos2>) -> Vec<Pos2> {
 /// spikes far past its point. A sharp turn gets a tiny arc instead (points
 /// within a pixel of the corner), which egui draws as a round join, as the
 /// export does (PDF line join round).
-fn round_corners(pts: Vec<Pos2>, closed: bool, width: f32) -> Vec<Pos2> {
+fn round_corners(pts: Vec<Pos2>, closed: bool) -> Vec<Pos2> {
     let n = pts.len();
-    if n < 3 || width < 2.0 {
+    // Thin lines too: zoomed out, a 1 px line's mitre on a sliver still runs
+    // many pixels past the point.
+    if n < 3 {
         return pts;
     }
     // Sharper than this turn, round the corner (mitres up to about 1.3 × the half-width).
@@ -6120,7 +6126,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
             }
             Prim::Stroke { pts, closed, width, color } => {
                 let s = Stroke::new((width * z).max(min_w), col(*color, 255));
-                let pts = round_corners(thin(map(pts)), *closed, s.width);
+                let pts = round_corners(thin(map(pts)), *closed);
                 if *closed {
                     painter.add(Shape::closed_line(pts, s));
                 } else {
@@ -6145,7 +6151,7 @@ fn paint_prims(painter: &Painter, origin: Pos2, z: f32, prims: &[Prim], k: (f32,
                         painter.add(Shape::mesh(mesh));
                     }
                     if stroke != Stroke::NONE {
-                        painter.add(Shape::closed_line(round_corners(pts, true, stroke.width), stroke));
+                        painter.add(Shape::closed_line(round_corners(pts, true), stroke));
                     }
                 }
             }
@@ -6769,15 +6775,26 @@ mod tests {
         // A sliver: its tip at x = 300, the width 10.
         let sliver = vec![pos2(0.0, 0.0), pos2(300.0, 10.0), pos2(0.0, 20.0)];
         assert!(reach(sliver.clone()) > 400.0, "egui alone mitres far past the tip");
-        let r = reach(round_corners(sliver, true, 10.0));
+        let r = reach(round_corners(sliver, true));
         assert!(r < 300.0 + 5.0 + 2.0, "rounded: within the half-width of the tip, got {r}");
         // Gentle corners are left alone; so is a full reversal's neighbourhood.
         let square = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(100.0, 100.0), pos2(0.0, 100.0)];
-        assert_eq!(round_corners(square.clone(), true, 10.0).len(), 4 + 4 * 8);
+        assert_eq!(round_corners(square.clone(), true).len(), 4 + 4 * 8);
         let gentle = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(200.0, 30.0)];
-        assert_eq!(round_corners(gentle.clone(), false, 10.0), gentle);
+        assert_eq!(round_corners(gentle.clone(), false), gentle);
+        // Zoomed out, a 1 px outline on a sliver too.
+        let thin_reach = |pts: Vec<Pos2>| {
+            let mut t = egui::epaint::Tessellator::new(1.0, Default::default(), [1, 1], vec![]);
+            let mut mesh = egui::Mesh::default();
+            t.tessellate_shape(Shape::closed_line(pts, Stroke::new(1.2, Color32::BLACK)), &mut mesh);
+            mesh.vertices.iter().map(|v| v.pos.x).fold(f32::MIN, f32::max)
+        };
+        let sliver = vec![pos2(0.0, 0.0), pos2(300.0, 2.0), pos2(0.0, 4.0)];
+        assert!(thin_reach(sliver.clone()) > 310.0, "egui alone mitres past the tip");
+        let r = thin_reach(round_corners(sliver, true));
+        assert!(r < 300.0 + 3.0, "rounded: at the tip, got {r}");
         let back = vec![pos2(0.0, 0.0), pos2(100.0, 0.0), pos2(0.0, 0.0)];
-        assert!(reach(round_corners(back, false, 10.0)) < 100.0 + 5.0 + 2.0);
+        assert!(reach(round_corners(back, false)) < 100.0 + 5.0 + 2.0);
     }
 
     #[test]
@@ -6790,6 +6807,16 @@ mod tests {
         app.click(pos2(200.0, 200.0), true, PLAIN);
         assert!(app.building.is_none());
         assert_eq!(polys(&app), vec![(vec![pos2(100.0, 100.0), pos2(200.0, 100.0), pos2(200.0, 200.0)], false)]);
+        // Quick clicks on different corners (egui calls the second a double-click)
+        // keep the line going: only a double-click on the last point finishes it.
+        app.click(pos2(100.0, 500.0), false, PLAIN);
+        app.click(pos2(200.0, 500.0), true, PLAIN);
+        app.click(pos2(200.0, 600.0), true, PLAIN);
+        assert_eq!(app.building.as_ref().map(|(_, p)| p.len()), Some(3), "still one line");
+        app.click(pos2(200.0, 600.0), true, PLAIN);
+        assert!(app.building.is_none());
+        assert_eq!(polys(&app)[1], (vec![pos2(100.0, 500.0), pos2(200.0, 500.0), pos2(200.0, 600.0)], false));
+        app.annots.pop();
         // A polyline clicked back to its first point closes, as a polygon.
         for p in [pos2(100.0, 300.0), pos2(150.0, 300.0), pos2(150.0, 350.0), pos2(101.0, 301.0)] {
             app.click(p, false, PLAIN);
