@@ -194,6 +194,11 @@ impl Doc {
         };
         Ok(Self { path, annots, scales, pages })
     }
+
+    /// Whether a proposal's pages count in this document's arrangement.
+    pub fn current(&self, b: &proposals::Proposal) -> bool {
+        b.layout == crate::pages::fingerprint(self.pages.as_ref())
+    }
 }
 
 /// Refuses an output path that is the source PDF (by its real path, so
@@ -247,7 +252,8 @@ fn markups(doc: &Doc, with_proposals: bool, units: Units) -> anyhow::Result<(Vec
     let mut all: Vec<Tagged> = doc.annots.iter().cloned().map(|a| (a, None)).collect();
     let mut scales = doc.scales.clone();
     if with_proposals {
-        for b in proposals::load(&doc.path)?.batches {
+        // Only batches made for the pages as arranged now: another order's would land on the wrong sheets.
+        for b in proposals::load(&doc.path)?.batches.into_iter().filter(|b| doc.current(b)) {
             scales = ops::merged_scales(&scales, &b.scales);
             all.extend(b.annots.into_iter().map(|a| (a, Some(b.id.clone()))));
         }
@@ -361,7 +367,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                     "scale_regions": doc.scales.iter().filter(|x| x.page == i && x.region.is_some()).count(),
                     "scales_written": found.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
                     "markups": doc.annots.iter().filter(|x| x.page == i).count(),
-                    "proposed": props.batches.iter().flat_map(|b| &b.annots).filter(|x| x.page == i).count(),
+                    "proposed": props.batches.iter().filter(|b| doc.current(b)).flat_map(|b| &b.annots).filter(|x| x.page == i).count(),
                 }));
                 // Arranged by the reviewer: where the page came from.
                 if let Some(p) = doc.pages.as_ref().and_then(|l| l.pages.get(i)) {
@@ -523,7 +529,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                 let (id, group) = p.next_ids();
                 let mut b = ops::parse(&ops_json, &pages, id, group).map_err(anyhow::Error::msg)?;
                 let mut scales = doc.scales.clone();
-                for x in &p.batches {
+                for x in p.batches.iter().filter(|x| doc.current(x)) {
                     scales = ops::merged_scales(&scales, &x.scales);
                 }
                 ops::relabel(&mut b, &scales, units);
@@ -565,6 +571,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                     json!({
                         "id": b.id, "agent": b.agent, "summary": b.summary, "created": b.created,
                         "markups": b.annots.len(), "scales": b.scales.len(), "pages": pages,
+                        "stale": !doc.current(b),
                     })
                 })
                 .collect();

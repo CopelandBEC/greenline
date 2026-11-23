@@ -201,6 +201,15 @@ fn pages_count_in_the_order_the_reviewer_arranged() {
     env.run(&["apply", pdf, ops.to_str().unwrap()]);
     let props: Value = serde_json::from_slice(&std::fs::read(env.dir.join("data/greenline").read_dir().unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".proposals.json")).unwrap()).unwrap()).unwrap();
     assert_ne!(props["batches"][0]["layout"], Value::Null, "marked with the order its pages count in");
+    assert_eq!(env.run(&["list", pdf, "--proposals"])["count"], 1);
+    // One made for another order (the reviewer moved pages meanwhile) is left out, and listed as stale.
+    let pfile = env.dir.join("data/greenline").read_dir().unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".proposals.json")).unwrap();
+    let mut stale = props.clone();
+    stale["batches"][0]["layout"] = serde_json::json!(12345);
+    std::fs::write(&pfile, serde_json::to_vec(&stale).unwrap()).unwrap();
+    assert_eq!(env.run(&["list", pdf, "--proposals"])["count"], 0);
+    assert_eq!(env.run(&["proposals", pdf])["batches"][0]["stale"], true);
+    std::fs::write(&pfile, serde_json::to_vec(&props).unwrap()).unwrap();
 
     let out = env.dir.join("out.pdf");
     env.run(&["export", pdf, "--proposals", "--out", out.to_str().unwrap()]);

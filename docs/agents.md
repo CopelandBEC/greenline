@@ -10,7 +10,7 @@ In a chat client without a shell, the same commands are MCP tools: add a server 
 
 Everything uses **page points** on the page as displayed: the origin is at the top-left, y runs down, and there are 72 points per paper inch. Pages count from 1. `text`, `paths`, `snap`, `render` and `list` all report in these coordinates, and ops take them.
 
-**Pages count in the reviewer's order.** In Greenline the reviewer can move, delete and insert pages (blank ones, or pages from another PDF) without changing the PDF. Every command reads that arrangement, so page N is the page they see as page N. `info` says `"pages_arranged": true` and gives each page's `from` (`"page 3 of the PDF"`, `"blank page"`, `"page 2 of other.pdf"`). If the pages are rearranged after you read them, anything you proposed for the old order can't be accepted: run `info` again and propose again.
+**Pages count in the reviewer's order.** In Greenline the reviewer can move, delete and insert pages (blank ones, or pages from another PDF) without changing the PDF. Every command reads that arrangement, so page N is the page they see as page N. `info` says `"pages_arranged": true` and gives each page's `from` (`"page 3 of the PDF"`, `"blank page"`, `"page 2 of other.pdf"`). If the pages are rearranged after you read them, anything you proposed for the old order can't be accepted: `proposals` marks it `"stale": true`, and `list`, `measurements`, `render` and `export` leave it out of `--proposals`. Withdraw it, run `info` again and propose again.
 
 A render's pixels map back to page points as `x = region[0] + px / px_per_pt`, `y = region[1] + py / px_per_pt`. The render prints both values.
 

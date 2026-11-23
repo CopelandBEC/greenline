@@ -299,6 +299,14 @@ struct PageDrag {
     to: Option<usize>,
 }
 
+/// A change asked for from a page's menu, made once the thumbnails are drawn
+/// (they're drawn from the page list it changes).
+enum PageOp {
+    Blank(usize, bool),
+    FromFile(usize, bool),
+    Delete(Vec<usize>),
+}
+
 /// The window for picking which pages of another PDF to insert.
 struct InsertWin {
     /// The document they go into.
@@ -314,7 +322,23 @@ struct InsertWin {
 
 /// An undo step: the markups and scales before a change, and the pages'
 /// arrangement and sizes when it rearranged them.
-type Step = (Vec<Annot>, Vec<Scale>, Option<(Layout, Vec<Vec2>)>);
+type Step = (Vec<Annot>, Vec<Scale>, Option<PageStep>);
+
+/// What an undo step that rearranged pages puts back: the arrangement and page
+/// sizes, and the proposed markups and scales the change took out of the
+/// proposals (on pages it deleted), to go back in.
+struct PageStep {
+    layout: Layout,
+    sizes: Vec<Vec2>,
+    proposals: Vec<proposals::Proposal>,
+}
+
+/// Where page `p` goes, by `map` (old index to new, `None`: deleted), with the
+/// arrangement then `len` pages long. Markups on pages past the end (a PDF
+/// that has lost pages) stay past it, so they never land on a page put there.
+fn moved_to(map: &[Option<usize>], len: usize, p: usize) -> Option<usize> {
+    if p < map.len() { map[p] } else { Some(len + (p - map.len())) }
+}
 
 /// Background tabs that keep their rendered pages.
 const TEX_TABS: usize = 2;
@@ -481,6 +505,8 @@ pub struct App {
     page_sel: BTreeSet<usize>,
     /// Pages being dragged to a new place in the sidebar or overview.
     page_drag: Option<PageDrag>,
+    /// A page menu's choice, made after the thumbnails are drawn.
+    page_op: Option<PageOp>,
     /// A PDF being read to insert pages from: the document, and where they go.
     inserting: Option<(PathBuf, Anchor)>,
     /// The window for choosing which of its pages to insert.
@@ -686,6 +712,7 @@ impl App {
             layout: None,
             page_sel: BTreeSet::new(),
             page_drag: None,
+            page_op: None,
             inserting: None,
             insert_win: None,
             building: None,
@@ -878,6 +905,7 @@ impl App {
         self.overview = false;
         self.page_sel.clear();
         self.page_drag = None;
+        self.page_op = None;
         self.sidebar_synced = None;
         self.editing = None;
         self.drag = Drag::None;
@@ -2936,10 +2964,11 @@ impl App {
         let scales = std::mem::replace(&mut self.scales, scales);
         self.selected.clear();
         self.changed();
-        let pages = pages.map(|(layout, sizes)| {
-            let now = (self.layout_now(), self.pages.clone());
-            self.set_layout(layout, sizes);
-            now
+        let pages = pages.map(|step| {
+            let (layout, sizes) = (self.layout_now(), self.pages.clone());
+            let taken = self.set_layout(step.layout, step.sizes);
+            self.put_back_proposals(step.proposals);
+            PageStep { layout, sizes, proposals: taken }
         });
         (annots, scales, pages)
     }
@@ -4093,7 +4122,13 @@ impl App {
 
     /// Accepted scales with every batch's scales over them, as the proposals would leave things.
     fn proposed_scales(&self) -> Vec<Scale> {
-        self.props.batches.iter().fold(self.scales.clone(), |acc, b| crate::ops::merged_scales(&acc, &b.scales))
+        self.props.batches.iter().filter(|b| self.proposed_now(b)).fold(self.scales.clone(), |acc, b| crate::ops::merged_scales(&acc, &b.scales))
+    }
+
+    /// Whether a batch's pages count in the arrangement shown (one made for
+    /// another can't be accepted, and isn't drawn on the sheets).
+    fn proposed_now(&self, b: &proposals::Proposal) -> bool {
+        b.layout == crate::pages::fingerprint(self.layout.as_ref())
     }
 
     fn relabel_proposals(&mut self) {
@@ -4260,8 +4295,13 @@ impl App {
                 if !b.summary.is_empty() {
                     ui.label(&b.summary);
                 }
+                let now = self.proposed_now(b);
+                if !now {
+                    ui.colored_label(Color32::from_rgb(230, 80, 60), "Made for the pages in an earlier order: reject it and ask again.");
+                }
+                let can_accept = !self.read_only && now;
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.read_only, egui::Button::new("Accept all")).clicked() {
+                    if ui.add_enabled(can_accept, egui::Button::new("Accept all")).clicked() {
                         action = Some((b.id.clone(), None, None, true));
                     }
                     if ui.button("Reject all").clicked() {
@@ -4276,7 +4316,7 @@ impl App {
                             if ui.small_button("Reject").clicked() {
                                 action = Some((b.id.clone(), None, Some(s.clone()), false));
                             }
-                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                            if ui.add_enabled(can_accept, egui::Button::new("Accept").small()).clicked() {
                                 action = Some((b.id.clone(), None, Some(s.clone()), true));
                             }
                         });
@@ -4294,7 +4334,7 @@ impl App {
                             if ui.small_button("Reject").clicked() {
                                 action = Some((b.id.clone(), Some(a.id), None, false));
                             }
-                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                            if ui.add_enabled(can_accept, egui::Button::new("Accept").small()).clicked() {
                                 action = Some((b.id.clone(), Some(a.id), None, true));
                             }
                         });
@@ -4610,7 +4650,7 @@ impl App {
             }
             // Proposed markups: drawn as they'd be accepted, each over a faint orange
             // wash and in a dashed orange outline.
-            for b in &self.props.batches {
+            for b in self.props.batches.iter().filter(|b| self.proposed_now(b)) {
                 for a in b.annots.iter().filter(|a| a.page == i) {
                     let r = a.bounds();
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
@@ -5319,19 +5359,21 @@ impl App {
         }
         let old = self.layout_now();
         let map = crate::pages::remap(&old.pages, &new.pages);
-        self.undo.push((self.annots.clone(), self.scales.clone(), Some((old, self.pages.clone()))));
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
-        // Markups on pages past the end (a PDF that lost pages) stay as they are.
-        let to = |p: usize| if p < map.len() { map[p] } else { Some(p) };
+        let before = (self.annots.clone(), self.scales.clone(), old, self.pages.clone());
+        let len = new.pages.len();
+        let to = |p: usize| moved_to(&map, len, p);
         self.annots.retain_mut(|a| to(a.page).map(|n| a.page = n).is_some());
         self.scales.retain_mut(|x| to(x.page).map(|n| x.page = n).is_some());
         let ids: HashSet<u64> = self.annots.iter().map(|a| a.id).collect();
         self.selected.retain(|id| ids.contains(id));
         self.changed();
-        self.set_layout(new, sizes);
+        let taken = self.set_layout(new, sizes);
+        let (annots, scales, layout, sizes) = before;
+        self.undo.push((annots, scales, Some(PageStep { layout, sizes, proposals: taken })));
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
         self.toast(format!("{done} · Ctrl+Z to undo"));
     }
 
@@ -5340,8 +5382,9 @@ impl App {
     /// showed, and the worker arranges its copy anew (as a new generation, so
     /// renders still on their way for the old order are dropped). The markups
     /// and scales must count in `new` already. Saves, and carries proposals
-    /// made for the old order over.
-    fn set_layout(&mut self, new: Layout, sizes: Vec<Vec2>) {
+    /// made for the old order over; those on deleted pages are taken out and
+    /// returned (for undo to put back).
+    fn set_layout(&mut self, new: Layout, sizes: Vec<Vec2>) -> Vec<proposals::Proposal> {
         let old = self.layout_now();
         let map = crate::pages::remap(&old.pages, &new.pages);
         let to = |p: usize| map.get(p).copied().flatten();
@@ -5349,6 +5392,15 @@ impl App {
             let c = self.current_page();
             (c, self.offset.y - self.page_y[c])
         });
+        // Split screen's other view of this document stays on its page too.
+        let keep_other = if self.other.as_ref().is_some_and(|o| o.doc.is_none()) && !self.pages.is_empty() {
+            self.with_other(|app| {
+                let c = app.current_page();
+                (c, app.offset.y - app.page_y[c])
+            })
+        } else {
+            None
+        };
         follow(&mut self.base, |k| to(*k));
         follow(&mut self.patch, |k| to(k.0).map(|p| (p, k.1, k.2)));
         follow(&mut self.thumbs, |k| to(*k));
@@ -5385,6 +5437,11 @@ impl App {
                 self.offset.y = self.page_y[n] + dy;
             }
         }
+        if let (Some((c, dy)), Some(o)) = (keep_other, self.other.as_mut()) {
+            if let Some(n) = to(c) {
+                o.view.offset.y = self.page_y[n] + dy;
+            }
+        }
         // Found again on the new pages (the old search's answers are dropped with its generation).
         if self.find.open {
             self.start_search();
@@ -5394,30 +5451,71 @@ impl App {
         }
         self.dirty = true;
         self.save_sidecar();
-        self.carry_proposals(crate::pages::fingerprint(Some(&old)), &map);
+        self.carry_proposals(crate::pages::fingerprint(Some(&old)), &map)
     }
 
     /// Proposals made for the arrangement `old` follow their pages to the
     /// current one, once it's saved (agents read the arrangement from the
     /// markups file, and mark what they propose with it).
-    fn carry_proposals(&mut self, old: u64, map: &[Option<usize>]) {
+    /// Those on pages deleted are taken out and returned, as partial batches
+    /// (with their old page numbers).
+    fn carry_proposals(&mut self, old: u64, map: &[Option<usize>]) -> Vec<proposals::Proposal> {
         let new = crate::pages::fingerprint(self.layout.as_ref());
-        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return };
+        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return Vec::new() };
         if old == new || self.dirty || !file.exists() {
-            return;
+            return Vec::new();
         }
-        let to = |p: usize| map.get(p).copied().flatten();
+        let len = self.pages.len();
+        let to = |p: usize| moved_to(map, len, p);
         let carried = proposals::update_file(&file, &path, |p| {
+            let mut taken = Vec::new();
             for b in p.batches.iter_mut().filter(|b| b.layout == old) {
-                b.annots.retain_mut(|a| to(a.page).map(|n| a.page = n).is_some());
-                b.scales.retain_mut(|x| to(x.page).map(|n| x.page = n).is_some());
+                let (annots, gone_annots): (Vec<Annot>, Vec<Annot>) = std::mem::take(&mut b.annots).into_iter().partition(|a| to(a.page).is_some());
+                let (scales, gone_scales): (Vec<Scale>, Vec<Scale>) = std::mem::take(&mut b.scales).into_iter().partition(|x| to(x.page).is_some());
+                b.annots = annots.into_iter().map(|a| Annot { page: to(a.page).unwrap(), ..a }).collect();
+                b.scales = scales.into_iter().map(|x| Scale { page: to(x.page).unwrap(), ..x }).collect();
+                if !gone_annots.is_empty() || !gone_scales.is_empty() {
+                    taken.push(proposals::Proposal { annots: gone_annots, scales: gone_scales, ..b.clone() });
+                }
                 b.layout = new;
             }
             p.batches.retain(|b| !b.annots.is_empty() || !b.scales.is_empty());
+            Ok(taken)
+        });
+        let taken = carried.unwrap_or_else(|e| {
+            self.toast(format!("Couldn't carry the proposals over to the new page order: {e}"));
+            Vec::new()
+        });
+        self.reload_proposals();
+        taken
+    }
+
+    /// Puts proposed markups and scales a page change took out back into their
+    /// batches (undoing it brought their pages back), counting in the arrangement now.
+    fn put_back_proposals(&mut self, back: Vec<proposals::Proposal>) {
+        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return };
+        if back.is_empty() {
+            return;
+        }
+        let now = crate::pages::fingerprint(self.layout.as_ref());
+        let put = proposals::update_file(&file, &path, |p| {
+            for mut d in back {
+                d.layout = now;
+                match p.batches.iter_mut().find(|b| b.id == d.id) {
+                    Some(b) if b.layout == now => {
+                        b.annots.extend(d.annots);
+                        b.scales.extend(d.scales);
+                    }
+                    // Since made for another order: these can't join it.
+                    Some(_) => {}
+                    // Emptied by the change (or since rejected or withdrawn whole): back as it was.
+                    None => p.batches.push(d),
+                }
+            }
             Ok(())
         });
-        if let Err(e) = carried {
-            self.toast(format!("Couldn't carry the proposals over to the new page order: {e}"));
+        if let Err(e) = put {
+            self.toast(format!("Couldn't put the proposals back: {e}"));
         }
         self.reload_proposals();
     }
@@ -5583,27 +5681,37 @@ impl App {
     /// The right-click menu on page `i`'s thumbnail.
     fn page_menu(&mut self, ui: &mut Ui, i: usize) {
         let pages = self.pages_for(i);
+        let mut op = None;
         if ui.button("Insert blank page before").clicked() {
-            self.insert_blank(i, false);
-            ui.close();
+            op = Some(PageOp::Blank(i, false));
         }
         if ui.button("Insert blank page after").clicked() {
-            self.insert_blank(i, true);
-            ui.close();
+            op = Some(PageOp::Blank(i, true));
         }
         if ui.button("Insert pages from file before…").clicked() {
-            self.ask_insert(i, false);
-            ui.close();
+            op = Some(PageOp::FromFile(i, false));
         }
         if ui.button("Insert pages from file after…").clicked() {
-            self.ask_insert(i, true);
-            ui.close();
+            op = Some(PageOp::FromFile(i, true));
         }
         ui.separator();
         let label = if pages.len() == 1 { format!("Delete page {}", i + 1) } else { format!("Delete {} pages", pages.len()) };
         if ui.button(label).clicked() {
-            self.delete_pages(&pages);
+            op = Some(PageOp::Delete(pages));
+        }
+        if op.is_some() {
+            self.page_op = op;
             ui.close();
+        }
+    }
+
+    /// Makes the change a page menu asked for (after the thumbnails are drawn).
+    fn page_op(&mut self) {
+        match self.page_op.take() {
+            Some(PageOp::Blank(i, after)) => self.insert_blank(i, after),
+            Some(PageOp::FromFile(i, after)) => self.ask_insert(i, after),
+            Some(PageOp::Delete(pages)) => self.delete_pages(&pages),
+            None => {}
         }
     }
 
@@ -6420,6 +6528,7 @@ impl eframe::App for App {
         self.find_bar(&ctx);
         self.new_doc_window(&ctx);
         self.insert_window(&ctx);
+        self.page_op();
         self.finish_page_drag(&ctx);
         self.help(&ctx);
         self.request_all_renders(&ctx, now);
@@ -8303,6 +8412,48 @@ mod tests {
         let props = proposals::load_file(&dir.join("doc.proposals.json")).unwrap();
         assert_eq!(props.batches[0].layout, 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_page_with_proposals_on_it_undoes_with_them() {
+        let (app, dir) = reviewing("delete");
+        let mut app = with_pages(app, &[vec2(600.0, 800.0); 2]);
+        app.poll_proposals(10.0);
+        let before = app.props.count();
+        app.delete_pages(&[0]);
+        assert_eq!(app.props.count(), 0, "their page is gone");
+        app.undo();
+        assert_eq!(app.props.count(), before, "and back with it");
+        assert!(app.props.batches.iter().all(|b| b.layout == 0 && b.annots.iter().all(|a| a.page == 0)));
+        app.redo();
+        assert_eq!(app.props.count(), 0);
+        app.undo();
+        assert_eq!(app.props.count(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn markups_past_the_last_page_stay_past_it() {
+        // Markups for page 3 of a PDF that now has two.
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        let lost = app.add(2, Kind::Rect { rect: Rect::from_min_size(pos2(5.0, 5.0), vec2(20.0, 20.0)) });
+        app.insert_blank(1, true);
+        assert_eq!(app.pages.len(), 3);
+        assert_eq!(app.find(lost).map(|a| a.page), Some(3), "not on the page just added");
+        app.delete_pages(&[0]);
+        assert_eq!(app.find(lost).map(|a| a.page), Some(2));
+    }
+
+    #[test]
+    fn a_page_menu_choice_waits_for_the_thumbnails() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.page_op = Some(PageOp::Delete(vec![0]));
+        assert_eq!(app.pages.len(), 2);
+        app.page_op();
+        assert_eq!(app.pages.len(), 1);
+        assert!(app.page_op.is_none());
     }
 
     #[test]
