@@ -5,7 +5,7 @@
 ; that install; [InstallDelete] and the deletekey entries clear its leftovers.
 
 #ifndef AppVersion
-  #define AppVersion "2.0.0-rc.1"
+  #define AppVersion "2.0.0"
 #endif
 ; Windows file versions are numbers only: the version without a pre-release tag.
 #ifndef AppNumVersion
