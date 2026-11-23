@@ -58,9 +58,12 @@ impl Layout {
         self.pages.len() == self.source && self.pages.iter().enumerate().all(|(i, p)| p.src == Src::Source { page: i })
     }
 
-    /// An id no page here has.
+    /// An id no page here has, nor any page added before (deleted since, or
+    /// undone): ids go up with the clock, so a proposal made for a page that's
+    /// gone can't pass for one made for a page added in its place.
     pub fn next_id(&self) -> u64 {
-        self.pages.iter().map(|p| p.id + 1).max().unwrap_or(0).max(ADDED_IDS)
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+        self.pages.iter().map(|p| p.id + 1).max().unwrap_or(0).max(ADDED_IDS + now)
     }
 
     /// Adds pages the source has gained since it was arranged (`n` pages now)
@@ -274,6 +277,146 @@ fn open_in<'a>(pdfium: &'a Pdfium, src: &Path, layout: Option<&Layout>, files_di
     Ok(doc)
 }
 
+/// PDFium's own functions, for arranging a file to write (`arrange_file`):
+/// the wrapper has no way to move a page.
+static RAW: std::sync::OnceLock<Box<dyn PdfiumLibraryBindings>> = std::sync::OnceLock::new();
+
+/// Binds PDFium at `lib` for this process (it can be only once): the wrapper,
+/// and PDFium's functions as they are for `arrange_file`.
+pub fn bind(lib: &Path) -> Result<Pdfium, PdfiumError> {
+    let raw = Pdfium::bind_to_library(lib)?;
+    let bindings = Pdfium::bind_to_library(lib)?;
+    let _ = RAW.set(raw);
+    Ok(Pdfium::new(bindings))
+}
+
+/// The source PDF arranged as `layout`, for writing out (an export, a smaller
+/// copy): pages are moved, not copied as `open` does, so the PDF's own links
+/// and bookmarks to them still lead there. Arranged, it's read from a file
+/// written at `tmp`, returned for removing once the document is let go.
+pub fn open_to_write<'a>(pdfium: &'a Pdfium, src: &Path, layout: Option<&Layout>, tmp: &Path) -> anyhow::Result<(PdfDocument<'a>, Option<PathBuf>)> {
+    match layout.filter(|l| fingerprint(Some(l)) != 0) {
+        None => Ok((open(pdfium, src, None)?, None)),
+        Some(l) => {
+            arrange_file(src, l, tmp, &dir()).inspect_err(|_| {
+                let _ = std::fs::remove_file(tmp);
+            })?;
+            let doc = pdfium.load_pdf_from_file(tmp, None).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            Ok((doc, Some(tmp.to_path_buf())))
+        }
+    }
+}
+
+/// A document opened through PDFium's own functions, closed when dropped.
+struct RawDoc<'a>(&'a dyn PdfiumLibraryBindings, FPDF_DOCUMENT);
+
+impl Drop for RawDoc<'_> {
+    fn drop(&mut self) {
+        unsafe { self.0.FPDF_CloseDocument(self.1) }
+    }
+}
+
+fn raw_open<'a>(b: &'a dyn PdfiumLibraryBindings, path: &Path) -> Option<RawDoc<'a>> {
+    let doc = unsafe { b.FPDF_LoadDocument(path.to_str()?, None) };
+    (!doc.is_null()).then(|| RawDoc(b, doc))
+}
+
+/// Where PDFium writes a document: a file.
+#[repr(C)]
+struct Sink {
+    // First, so PDFium's pointer to it is a pointer to the whole.
+    write: FPDF_FILEWRITE,
+    out: std::io::BufWriter<std::fs::File>,
+    failed: bool,
+}
+
+unsafe extern "C" fn write_block(this: *mut FPDF_FILEWRITE, data: *const std::ffi::c_void, size: std::ffi::c_ulong) -> std::ffi::c_int {
+    use std::io::Write;
+    // SAFETY: `this` is the `write` field at the start of a live `Sink` (see `arrange_file`),
+    // and PDFium hands over `size` bytes at `data`.
+    let sink = unsafe { &mut *(this as *mut Sink) };
+    let bytes = if size == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) } };
+    match sink.out.write_all(bytes) {
+        Ok(()) => 1,
+        Err(_) => {
+            sink.failed = true;
+            0
+        }
+    }
+}
+
+/// Writes the source arranged as `layout` to `out`: pages added at the end,
+/// then all moved into place at once and the rest deleted (inserted PDFs in `files_dir`).
+fn arrange_file(src: &Path, layout: &Layout, out: &Path, files_dir: &Path) -> anyhow::Result<()> {
+    use std::ffi::{c_int, c_ulong};
+    let b: &dyn PdfiumLibraryBindings = RAW.get().map(|b| b.as_ref()).ok_or_else(|| anyhow::anyhow!("PDFium isn't loaded"))?;
+    let doc = raw_open(b, src).ok_or_else(|| anyhow::anyhow!("{}: couldn't read it", src.display()))?;
+    let n = unsafe { b.FPDF_GetPageCount(doc.1) }.max(0) as usize;
+    let mut layout = layout.clone();
+    layout.fit(n);
+    let mut order: Vec<c_int> = Vec::with_capacity(layout.pages.len());
+    let mut count = n;
+    let mut used = HashSet::new();
+    let mut again: Option<RawDoc> = None;
+    let mut files: HashMap<String, Option<RawDoc>> = HashMap::new();
+    let failed = || anyhow::anyhow!("couldn't arrange the pages");
+    for p in &layout.pages {
+        // A page from another document (or the source again), imported at the end.
+        let import = |from: &RawDoc, page: usize| -> anyhow::Result<()> {
+            let idx = page as c_int;
+            if !b.is_true(unsafe { b.FPDF_ImportPagesByIndex(doc.1, from.1, &idx, 1, count as c_int) }) {
+                return Err(failed());
+            }
+            Ok(())
+        };
+        let blank = |s: Vec2| -> anyhow::Result<()> {
+            let page = unsafe { b.FPDFPage_New(doc.1, count as c_int, s.x as f64, s.y as f64) };
+            if page.is_null() {
+                return Err(failed());
+            }
+            unsafe { b.FPDF_ClosePage(page) };
+            Ok(())
+        };
+        match &p.src {
+            Src::Source { page } if *page < n && used.insert(*page) => {
+                order.push(*page as c_int);
+                continue;
+            }
+            Src::Source { page } if *page < n => {
+                if again.is_none() {
+                    again = Some(raw_open(b, src).ok_or_else(failed)?);
+                }
+                import(again.as_ref().unwrap(), *page)?;
+            }
+            Src::Source { .. } => blank(MISSING)?,
+            Src::Blank { width, height } => blank(vec2(*width, *height))?,
+            Src::File { file, page, .. } => {
+                let from = files.entry(file.clone()).or_insert_with(|| raw_open(b, &files_dir.join(file)));
+                match from {
+                    Some(f) if (*page as c_int) < unsafe { b.FPDF_GetPageCount(f.1) } => import(f, *page)?,
+                    _ => blank(MISSING)?,
+                }
+            }
+        }
+        order.push(count as c_int);
+        count += 1;
+    }
+    if !order.is_empty() && !b.is_true(unsafe { b.FPDF_MovePages(doc.1, order.as_ptr(), order.len() as c_ulong, 0) }) {
+        return Err(failed());
+    }
+    for i in (order.len()..count).rev() {
+        unsafe { b.FPDFPage_Delete(doc.1, i as c_int) };
+    }
+    let mut sink = Box::new(Sink { write: FPDF_FILEWRITE { version: 1, WriteBlock: Some(write_block) }, out: std::io::BufWriter::new(std::fs::File::create(out)?), failed: false });
+    let saved = b.is_true(unsafe { b.FPDF_SaveAsCopy(doc.1, &mut sink.write, 0) });
+    let flushed = std::io::Write::flush(&mut sink.out);
+    if !saved || sink.failed {
+        anyhow::bail!("couldn't write {}", out.display());
+    }
+    flushed?;
+    Ok(())
+}
+
 /// Indices into `v` of a longest strictly increasing subsequence.
 fn increasing(v: &[usize]) -> Vec<usize> {
     // tails[k]: index of the smallest last value of a run of length k+1.
@@ -384,6 +527,64 @@ mod tests {
         assert_eq!(doc.pages().len(), 6);
         assert_eq!(doc.pages().get(0).unwrap().width().value, 612.0);
         assert_eq!(doc.pages().get(1).unwrap().width().value, 100.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Three pages, the first with a link to the third.
+    fn linked(path: &Path) {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Annots [6 0 R] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>",
+            "<< /Type /Annot /Subtype /Link /Rect [0 0 50 50] /Dest [5 0 R /Fit] >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).bytes());
+        for o in offsets {
+            pdf.extend(format!("{o:010} 00000 n \n").bytes());
+        }
+        pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).bytes());
+        std::fs::write(path, pdf).unwrap();
+    }
+
+    #[test]
+    fn written_out_moved_pages_keep_their_links() {
+        let _turn = crate::render::tests::PDFIUM_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let pdfium = crate::render::tests::test_pdfium();
+        let dir = std::env::temp_dir().join(format!("greenline-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("linked.pdf");
+        linked(&src);
+        let dest = |doc: &PdfDocument, page: PdfPageIndex| -> PdfPageIndex {
+            let p = doc.pages().get(page).unwrap();
+            let a = p.annotations().iter().next().expect("the link");
+            a.as_link_annotation().unwrap().link().unwrap().destination().unwrap().page_index().unwrap()
+        };
+        assert_eq!(dest(&pdfium.load_pdf_from_file(&src, None).unwrap(), 0), 2);
+
+        // Page 3 first, then 1 and a blank (page 2 deleted): the link still leads to page 3, now first.
+        let l = insert_pages(&move_pages(&delete_pages(&Layout::identity(3), &[1]), &[1], 0), 2, vec![Src::Blank { width: 10.0, height: 20.0 }]);
+        let (doc, tmp) = open_to_write(pdfium, &src, Some(&l), &dir.join("arranged.pdf")).unwrap();
+        let sizes: Vec<f32> = doc.pages().iter().map(|p| p.width().value).collect();
+        assert_eq!(sizes, [300.0, 100.0, 10.0]);
+        assert_eq!(dest(&doc, 1), 0);
+        drop(doc);
+        assert!(tmp.is_some());
+
+        // In the PDF's own order: the PDF itself, nothing written.
+        let (doc, tmp) = open_to_write(pdfium, &src, Some(&Layout::identity(3)), &dir.join("same.pdf")).unwrap();
+        assert_eq!(doc.pages().len(), 3);
+        assert!(tmp.is_none() && !dir.join("same.pdf").exists());
+        drop(doc);
         std::fs::remove_dir_all(&dir).ok();
     }
 

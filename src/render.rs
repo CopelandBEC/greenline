@@ -64,6 +64,8 @@ pub enum Resp {
     Opened { generation: u64, pages: Vec<Vec2>, source: usize },
     /// Arranged anew (`Req::Relayout`): its pages' sizes.
     Relaid { generation: u64, pages: Vec<Vec2> },
+    /// Couldn't be arranged anew (the PDF can't be read now): nothing of it is open.
+    RelayoutFailed { generation: u64, error: String },
     /// A PDF to insert pages from: the file picked, its stored name and page sizes, or why not.
     Probed(PathBuf, Result<(String, Vec<Vec2>), String>),
     OpenFailed { generation: u64, error: String },
@@ -96,10 +98,10 @@ impl Worker {
         let keep2 = keep.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new().name("pdfium".into()).spawn(move || {
-            let pdfium = match Pdfium::bind_to_library(&lib) {
-                Ok(b) => {
+            let pdfium = match crate::pages::bind(&lib) {
+                Ok(p) => {
                     let _ = ready_tx.send(Ok(()));
-                    Pdfium::new(b)
+                    p
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(format!("loading {}: {e}", lib.display())));
@@ -185,7 +187,7 @@ fn run(
                         docs.insert(generation, d);
                         Resp::Relaid { generation, pages }
                     }
-                    Err(e) => Resp::OpenFailed { generation, error: e.to_string() },
+                    Err(e) => Resp::RelayoutFailed { generation, error: e.to_string() },
                 }
             }
             Req::Probe { path } => {
@@ -814,7 +816,20 @@ pub fn export(
     mode: ExportMode,
     author: &str,
 ) -> anyhow::Result<usize> {
-    let mut doc = crate::pages::open(pdfium, src, layout)?;
+    // Unique per process and export so concurrent exports can't share a temp file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let arranged = out.with_extension(format!("pdf.{}-{seq}.arranged", std::process::id()));
+    let (doc, arranged) = crate::pages::open_to_write(pdfium, src, layout, &arranged)?;
+    let written = write_export(doc, out, annots, images, mode, author, seq);
+    if let Some(a) = arranged {
+        let _ = std::fs::remove_file(a);
+    }
+    written
+}
+
+/// `export`'s work on the document opened for it (let go before the arranged copy it was read from is removed).
+fn write_export(mut doc: PdfDocument, out: &Path, annots: &[Annot], images: &HashMap<String, image::RgbaImage>, mode: ExportMode, author: &str, seq: u64) -> anyhow::Result<usize> {
     let f = doc.fonts_mut();
     let helvetica = [f.helvetica(), f.helvetica_bold(), f.helvetica_oblique(), f.helvetica_bold_oblique()];
     let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
@@ -855,9 +870,6 @@ pub fn export(
         page.regenerate_content()?;
     }
 
-    // Unique per process and export so concurrent exports can't share a temp file.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = out.with_extension(format!("pdf.{}-{seq}.part", std::process::id()));
     let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| Ok(std::fs::rename(&tmp, out)?));
     if saved.is_err() {
@@ -1051,9 +1063,20 @@ fn looks_different(a: &egui::ColorImage, b: &egui::ColorImage) -> bool {
 /// down to `dpi` and recompressed as JPEGs. Everything else (vector drawing,
 /// text, 1-bit scans, annotations) is left as it is; `src` is never changed.
 pub fn shrink(pdfium: &Pdfium, src: &Path, layout: Option<&Layout>, out: &Path, dpi: f32) -> anyhow::Result<Shrunk> {
+    let arranged = out.with_extension(format!("pdf.{}.arranged", std::process::id()));
+    let (doc, arranged) = crate::pages::open_to_write(pdfium, src, layout, &arranged)?;
+    // With nothing gained, the copy is this file, byte for byte: the original, or its pages arranged.
+    let base = arranged.clone().unwrap_or_else(|| src.to_path_buf());
+    let r = shrink_doc(pdfium, doc, &base, out, dpi);
+    if let Some(a) = arranged {
+        let _ = std::fs::remove_file(a);
+    }
+    r
+}
+
+/// `shrink`'s work on the document read from `src`.
+fn shrink_doc(pdfium: &Pdfium, doc: PdfDocument, src: &Path, out: &Path, dpi: f32) -> anyhow::Result<Shrunk> {
     let before = std::fs::metadata(src)?.len();
-    let arranged = crate::pages::fingerprint(layout) != 0;
-    let doc = crate::pages::open(pdfium, src, layout)?;
     let n = doc.pages().len();
     // How many times each image's data is used: pages can share one.
     let mut uses: HashMap<u64, usize> = HashMap::new();
@@ -1100,14 +1123,9 @@ pub fn shrink(pdfium: &Pdfium, src: &Path, layout: Option<&Layout>, out: &Path, 
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = out.with_extension(format!("pdf.{}-{seq}.part", std::process::id()));
     let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| {
-        // Never bigger: with nothing gained, the copy is the original, byte for byte
-        // (its pages as arranged, if they are, with nothing recompressed).
+        // Never bigger: with nothing gained, the copy is the original, byte for byte.
         if recompressed == 0 || std::fs::metadata(&tmp)?.len() >= before {
-            if arranged {
-                crate::pages::open(pdfium, src, layout)?.save_to_file(&tmp)?;
-            } else {
-                std::fs::copy(src, &tmp)?;
-            }
+            std::fs::copy(src, &tmp)?;
             kept += recompressed;
             recompressed = 0;
             looks.clear();

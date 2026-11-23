@@ -525,6 +525,8 @@ pub struct App {
     queued_pictures: std::collections::VecDeque<Place>,
     /// Bumped when placing is cancelled, so images still being stored are let go.
     picture_epoch: u64,
+    /// Images dropped on a sheet still being stored.
+    pictures_in_flight: usize,
     /// Open documents in tab order; `tabs[cur_tab]` is the one shown (its state is in `self`).
     tabs: Vec<Tab>,
     cur_tab: usize,
@@ -723,6 +725,7 @@ impl App {
             pictures: mpsc::channel(),
             queued_pictures: Default::default(),
             picture_epoch: 0,
+            pictures_in_flight: 0,
             tabs: vec![Tab { parked: None }],
             cur_tab: 0,
             title_dirty: false,
@@ -1670,6 +1673,7 @@ impl App {
         }
         let (tx, src) = (self.pictures.0.clone(), src.to_path_buf());
         let epoch = self.picture_epoch;
+        self.pictures_in_flight += 1;
         std::thread::spawn(move || {
             tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, epoch)).ok();
         });
@@ -1858,6 +1862,7 @@ impl App {
                     }
                 }
                 Resp::Relaid { generation, pages } if generation == self.generation => self.relaid(pages),
+                Resp::RelayoutFailed { generation, error } => self.relayout_failed(generation, error),
                 Resp::Probed(file, r) => self.probed(file, r),
                 Resp::Exported(r) => self.exported(r),
                 Resp::Created(Ok(path)) => {
@@ -5381,7 +5386,9 @@ impl App {
         let ids: HashSet<u64> = self.annots.iter().map(|a| a.id).collect();
         self.selected.retain(|id| ids.contains(id));
         self.changed();
+        let epoch = self.picture_epoch;
         let taken = self.set_layout(new, sizes);
+        let done = if epoch != self.picture_epoch { format!("{done} (the image still being added was let go: drop it again)") } else { done };
         let (annots, scales, layout, sizes) = before;
         self.undo.push((annots, scales, Some(PageStep { layout, sizes, proposals: taken })));
         if self.undo.len() > 200 {
@@ -5433,6 +5440,10 @@ impl App {
             o.view.req_patch.clear();
         }
         self.page_drag = None;
+        // An image on its way to a sheet would land by its old page number: let it go.
+        if self.pictures_in_flight > 0 {
+            self.picture_epoch += 1;
+        }
         self.building = None;
         self.scale_win.target = None;
         self.scale_win.calib = None;
@@ -5532,6 +5543,22 @@ impl App {
             self.toast(format!("Couldn't put the proposals back: {e}"));
         }
         self.reload_proposals();
+    }
+
+    /// The PDF couldn't be read to arrange its pages anew (moved, or its share
+    /// gone): its pages can't show, and markups stop saving (they're saved
+    /// up to the change) until it's opened again, so nothing is lost unseen.
+    fn relayout_failed(&mut self, generation: u64, error: String) {
+        let why = format!("the PDF couldn't be read to rearrange its pages ({error}); close and reopen it");
+        if generation == self.generation {
+            self.read_only = true;
+            self.read_only_why = why.clone();
+            self.status = format!("Not autosaving: {why}");
+            self.status_until = f64::INFINITY;
+        } else if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
+            p.read_only = true;
+            p.read_only_why = why;
+        }
     }
 
     /// The worker's arrangement arrived: its page sizes are the truth.
@@ -6436,6 +6463,7 @@ impl eframe::App for App {
         self.poll_patterns();
         self.poll_cli();
         while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
+            self.pictures_in_flight = self.pictures_in_flight.saturating_sub(1);
             self.picture_ready(stored, target, generation);
         }
 
@@ -8491,6 +8519,19 @@ mod tests {
         assert!(app.insert_win.is_none() && app.inserting.is_some());
         app.probed(PathBuf::from("/a.pdf"), Ok(("x.pdf".into(), vec![vec2(1.0, 1.0)])));
         assert!(app.insert_win.is_some());
+
+        // An image dropped on a sheet and still being stored when pages move is let go.
+        app.pictures_in_flight = 1;
+        let epoch = app.picture_epoch;
+        app.move_pages(&[0], 2);
+        assert_ne!(app.picture_epoch, epoch);
+        assert!(app.status.contains("drop it again"));
+
+        // The PDF gone when rearranging: markups stop saving, and it says so.
+        let g = app.generation;
+        app.relayout_failed(g, "not found".into());
+        assert!(app.read_only && app.read_only_why.contains("reopen"));
+        assert!(app.path.is_some(), "still open, its markups shown");
     }
 
     #[test]
