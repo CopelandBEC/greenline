@@ -16,7 +16,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `Ctrl+click` with a callout selected | Add another leader: arrowhead at the click, tail at the first leader's bend; drag a tip to adjust |
 | `T` `K` `R` `H` | Text box, revision cloud, rectangle, highlight |
 | `A` `L` `P` | Arrow, line, pen |
-| `N` / `Shift+N` | Polyline / polygon: click the corners, double-click or `Enter` to finish (click the first point again to close it as a polygon) |
+| `N` / `Shift+N` | Polyline / polygon: click the corners, double-click the last one or press `Enter` to finish; the first point is marked and the line snaps to it, so clicking it closes the shape as a polygon |
 | `D` `E` | Measure a length or an area: click the points, double-click or `Enter` to finish (drag for one segment or a rectangle); `Shift` squares a point to the last |
 | `U` | Scale for measuring: pick the drawing scale, use one written on the sheet, calibrate on a known dimension, or add a region for a detail at its own scale. A reduced or scanned set needs calibrating |
 | `V` / `Esc` | Select: move, resize, double-click or `Enter` to edit text |
@@ -35,7 +35,7 @@ Fast, native PDF markup for senior review of drawing sets, specs and decks. Buil
 | `Ctrl+G` / `Ctrl+Shift+G` | Group / ungroup the selection (Alt+click picks one piece of a group) |
 | Arrows | With a selection: nudge it (`Shift` for bigger steps); otherwise previous/next page and scroll |
 | `Ctrl+E` / `Ctrl+Alt+E` | Export flattened / editable PDF next to the original (placed photos go in as compact JPEGs); **Export → Measurements (CSV)** lists every measurement's length, area, width and height for a takeoff; **Export → Smaller copy** writes `<name>_smaller.pdf` with big scans and photos brought down to 200 dpi and recompressed, and names any page worth a second look |
-| `F1` | All shortcuts, your name for exported comments, and light/dark appearance |
+| `F1` | All shortcuts, your name for exported comments, the pattern library folder, and appearance (light, dark — soft cool grays — or follow the system) |
 
 Markups autosave (`%APPDATA%\Greenline` on Windows, `~/.local/share/greenline` on Linux; an old Redline folder is moved there on first launch); the source PDF is never modified (moved, inserted and deleted pages are kept with the markups, and exports come out in that order). Stamp images are copied into `images/` there, so placed stamps keep working if the original file moves.
 
