@@ -4,6 +4,7 @@
 
 use crate::annot::{Annot, Kind, COLORS};
 use crate::measure::{self, Scale, Units};
+use crate::pages::{Layout, Src};
 use crate::render::{self, ExportMode};
 use crate::{ops, pdf, proposals, sidecar};
 use egui::{pos2, Rect, Vec2};
@@ -179,17 +180,19 @@ pub struct Doc {
     pub path: PathBuf,
     pub annots: Vec<Annot>,
     pub scales: Vec<Scale>,
+    /// Its pages as the reviewer arranged them (none: the PDF's own order).
+    pub pages: Option<Layout>,
 }
 
 impl Doc {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         // Canonical, as the app opens it, so both find the same markups file.
         let path = dunce::canonicalize(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        let (annots, scales) = match sidecar::load(&path)? {
-            Some(s) => (s.annots, s.scales),
-            None => (Vec::new(), Vec::new()),
+        let (annots, scales, pages) = match sidecar::load(&path)? {
+            Some(s) => (s.annots, s.scales, s.pages),
+            None => (Vec::new(), Vec::new(), None),
         };
-        Ok(Self { path, annots, scales })
+        Ok(Self { path, annots, scales, pages })
     }
 }
 
@@ -341,7 +344,7 @@ fn overlay(a: &Args, doc: &Doc, pages: &[Vec2], page: usize, units: Units) -> an
 
 fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Value> {
     let units = a.units().map_err(anyhow::Error::msg)?;
-    let d = pdfium.load_pdf_from_file(&doc.path, None).map_err(|e| anyhow::anyhow!("{}: {e:?}", doc.path.display()))?;
+    let d = crate::pages::open(pdfium, &doc.path, doc.pages.as_ref())?;
     let pages = page_sizes(&d);
     match cmd {
         "info" => {
@@ -360,6 +363,14 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                     "markups": doc.annots.iter().filter(|x| x.page == i).count(),
                     "proposed": props.batches.iter().flat_map(|b| &b.annots).filter(|x| x.page == i).count(),
                 }));
+                // Arranged by the reviewer: where the page came from.
+                if let Some(p) = doc.pages.as_ref().and_then(|l| l.pages.get(i)) {
+                    list.last_mut().unwrap()["from"] = match &p.src {
+                        Src::Source { page } => json!(format!("page {} of the PDF", page + 1)),
+                        Src::Blank { .. } => json!("blank page"),
+                        Src::File { name, page, .. } => json!(format!("page {} of {name}", page + 1)),
+                    };
+                }
             }
             Ok(json!({
                 "pdf": doc.path,
@@ -367,6 +378,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                 "markups_file": sidecar::file_for(&doc.path),
                 "proposals_file": proposals::file_for(&doc.path),
                 "proposal_batches": props.batches.len(),
+                "pages_arranged": crate::pages::fingerprint(doc.pages.as_ref()) != 0,
                 "note": "Sheets under 11 x 17 in are often reduced prints: a scale written on them is then wrong; calibrate on a dimension instead.",
             }))
         }
@@ -451,7 +463,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             } else {
                 // Markups go through the flattened export, so the picture is what an export gives.
                 let tmp = std::env::temp_dir().join(format!("greenline-render-{}.pdf", std::process::id()));
-                render::flatten(pdfium, &doc.path, &tmp, &extra)?;
+                render::flatten(pdfium, &doc.path, doc.pages.as_ref(), &tmp, &extra)?;
                 let r = pdfium.load_pdf_from_file(&tmp, None).map_err(|e| anyhow::anyhow!("{e:?}")).and_then(|t| render::render_region(&t, page, k, [(region.min.x * k) as i32, (region.min.y * k) as i32], [w, h]));
                 let _ = std::fs::remove_file(&tmp);
                 r?
@@ -505,6 +517,8 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             let agent = a.get("agent").map(str::to_string).or_else(|| std::env::var("GREENLINE_AGENT").ok()).unwrap_or_else(|| "agent".into());
             let summary = a.get("summary").unwrap_or("").to_string();
             let dry = a.has("dry-run");
+            // The page order the ops count in: accepting them into another one is refused.
+            let layout = crate::pages::fingerprint(doc.pages.as_ref());
             let build = |p: &proposals::Proposals| -> anyhow::Result<(ops::Batch, Vec<Scale>)> {
                 let (id, group) = p.next_ids();
                 let mut b = ops::parse(&ops_json, &pages, id, group).map_err(anyhow::Error::msg)?;
@@ -535,7 +549,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
                 let id = p.take_id();
                 let created = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
                 let out = report(&b, &scales, Some(&id));
-                p.batches.push(proposals::Proposal { id, agent: agent.clone(), summary: summary.clone(), created, annots: b.annots, scales: b.scales, accepted_groups: Default::default() });
+                p.batches.push(proposals::Proposal { id, agent: agent.clone(), summary: summary.clone(), created, annots: b.annots, scales: b.scales, accepted_groups: Default::default(), layout });
                 Ok(out)
             })
         }
@@ -578,7 +592,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             not_source(&out, &doc.path)?;
             let author = a.get("author").map(str::to_string).unwrap_or_else(|| "Greenline".into());
             let images = render::load_images(&annots)?;
-            let missing = render::export(pdfium, &doc.path, &out, &annots, &images, mode, &author)?;
+            let missing = render::export(pdfium, &doc.path, doc.pages.as_ref(), &out, &annots, &images, mode, &author)?;
             Ok(json!({ "file": out, "markups": annots.len(), "characters_without_font": missing }))
         }
         "shrink" => {
@@ -589,7 +603,7 @@ fn command(cmd: &str, a: &Args, doc: &Doc, pdfium: &Pdfium) -> anyhow::Result<Va
             if !(50.0..=1200.0).contains(&dpi) {
                 anyhow::bail!("--dpi must be 50 to 1200");
             }
-            let r = render::shrink(pdfium, &doc.path, &out, dpi)?;
+            let r = render::shrink(pdfium, &doc.path, doc.pages.as_ref(), &out, dpi)?;
             Ok(json!({ "file": out, "bytes_before": r.before, "bytes_after": r.after, "images_recompressed": r.recompressed, "images_kept": r.kept, "check_pages": r.check_pages }))
         }
         _ => unreachable!(),

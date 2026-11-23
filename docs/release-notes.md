@@ -4,6 +4,7 @@ Greenline 2.0.0-rc.1 — fast PDF markup for drawing, spec and deck review. **Re
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
 
 **New in 2.0**
+- **Pages: move, insert, delete.** Drag a thumbnail in the sidebar or the overview (`O`) to move the page. Right-click one to insert a blank page or pages from another PDF before or after it, or to delete it. In the overview, `Ctrl+click`/`Shift+click` (or `Ctrl+A`) picks several pages to drag or delete (`Del`) at once. Markups go with their pages, `Ctrl+Z` undoes it, and exports come out in the new order. The PDF itself is never changed.
 - **Polylines and polygons.** `N` for a polyline, `Shift+N` for a polygon: click the corners, double-click or Enter to finish (click the first point again to close it as a polygon). Drag a corner to reshape.
 - **Fill.** The swatch beside the colours sets a fill — any markup colour or white — and its opacity, for clouds, rectangles, polygons, areas, callouts and text boxes. A filled shape selects with a click inside.
 - **Line types.** The sample beside the line width: dashed, dotted, dash-dot, or one from your pattern library.
@@ -27,6 +28,7 @@ Because the installer isn't code-signed yet, Windows may show "Windows protected
   - Busy sheets paint several times faster.
   - Autosave, image decoding and the pattern library load off the main thread.
   - Exports and smaller copies run in a process of their own, so you can keep reviewing meanwhile.
+- For agents: page numbers follow the reviewer's arrangement (`info` says where each page came from), and proposals made for an earlier order can't be accepted into a new one.
 - For agents: `greenline-cli` ops gain `polyline`, `polygon`, `fill`, `line`, `hatch`, `bold`/`italic`/`underline` (for the whole note or a list of its words), `greenline-cli patterns` lists the library, and `greenline-cli shrink` makes a smaller copy.
 
 Press `F1` in the app for all shortcuts, your name on exported comments, appearance, and the pattern library folder.

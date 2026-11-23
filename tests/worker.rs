@@ -20,8 +20,8 @@ fn worker_opens_renders_and_reuses_renders_for_thumbnails() {
 
     w.send(Req::Create { path: pdf.clone(), size: vec2(1224.0, 792.0), pages: 3 });
     assert!(matches!(next(&w), Resp::Created(Ok(_))));
-    w.send(Req::Open { generation: 1, path: pdf.clone() });
-    let Resp::Opened { generation: 1, pages } = next(&w) else { panic!("opened") };
+    w.send(Req::Open { generation: 1, path: pdf.clone(), layout: None });
+    let Resp::Opened { generation: 1, pages, source: 3 } = next(&w) else { panic!("opened") };
     assert_eq!(pages, vec![vec2(1224.0, 792.0); 3]);
 
     // A whole-page render of a page whose thumbnail is wanted and missing: the
@@ -62,6 +62,18 @@ fn worker_opens_renders_and_reuses_renders_for_thumbnails() {
     }
     assert_eq!(got, [[512, 0], [0, 0]]);
 
-    w.send(Req::Close { generation: 1 });
+    // Arranged anew (a blank page first, the last page deleted): a new generation.
+    let l = greenline::pages::Layout::identity(3);
+    let l = greenline::pages::insert_pages(&greenline::pages::delete_pages(&l, &[2]), 0, vec![greenline::pages::Src::Blank { width: 100.0, height: 50.0 }]);
+    w.send(Req::Relayout { from: 1, generation: 2, path: pdf.clone(), layout: Some(l) });
+    let Resp::Relaid { generation: 2, pages } = next(&w) else { panic!("relaid") };
+    assert_eq!(pages, [vec2(100.0, 50.0), vec2(1224.0, 792.0), vec2(1224.0, 792.0)]);
+    w.keep.lock().unwrap().base.insert((7, 0));
+    w.send(Req::Render { generation: 1, view: 7, page: 0, scale: 1.0, origin: [0, 0], size: [10, 10], layer: Layer::Base });
+    w.send(Req::Render { generation: 2, view: 7, page: 0, scale: 1.0, origin: [0, 0], size: [100, 50], layer: Layer::Base });
+    let Resp::Rendered { generation: 2, image, .. } = next(&w) else { panic!("the old generation's render is dropped") };
+    assert_eq!(image.size, [100, 50]);
+
+    w.send(Req::Close { generation: 2 });
     std::fs::remove_dir_all(&dir).ok();
 }

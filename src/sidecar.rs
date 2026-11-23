@@ -3,6 +3,7 @@
 
 use crate::annot::Annot;
 use crate::measure::{Scale, Units};
+use crate::pages::Layout;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, OnceLock};
@@ -19,6 +20,10 @@ pub struct Sidecar {
     /// and the rest of their groups still join them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted: Vec<String>,
+    /// The pages as arranged (moved, deleted, added); none for the PDF's own order.
+    /// Markups and scales count pages in this order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Layout>,
 }
 
 /// ~/.local/share/greenline on Linux, %APPDATA%\\Greenline on Windows.
@@ -133,8 +138,8 @@ pub fn lock(pdf: &Path) -> anyhow::Result<Option<std::fs::File>> {
 }
 
 /// Writes the markups file `f` for `pdf`.
-pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale], accepted: &[String]) -> anyhow::Result<()> {
-    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec(), accepted: accepted.to_vec() };
+pub fn save_file(f: &Path, pdf: &Path, annots: &[Annot], scales: &[Scale], accepted: &[String], pages: Option<&Layout>) -> anyhow::Result<()> {
+    let s = Sidecar { pdf: pdf.to_path_buf(), annots: annots.to_vec(), scales: scales.to_vec(), accepted: accepted.to_vec(), pages: pages.cloned() };
     write(f, &s)
 }
 

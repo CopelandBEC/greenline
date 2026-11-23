@@ -3,6 +3,7 @@
 //! flattened exports.
 
 use crate::annot::{Annot, Prim, Rgb};
+use crate::pages::Layout;
 use egui::{pos2, vec2, Pos2, Vec2};
 use pdfium_render::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,25 +37,35 @@ pub struct Keep {
 }
 
 pub enum Req {
-    Open { generation: u64, path: PathBuf },
+    /// Open `path`, arranged as `layout` (`pages::open`).
+    Open { generation: u64, path: PathBuf, layout: Option<Layout> },
+    /// The document open as `from` arranged anew: it's `generation` from now on.
+    Relayout { from: u64, generation: u64, path: PathBuf, layout: Option<Layout> },
+    /// Keep a copy of a PDF to insert pages from, and read its page sizes.
+    Probe { path: PathBuf },
     /// A tab closed: let its document go.
     Close { generation: u64 },
     /// Render the region `origin..origin+size` (pixels) of the page drawn at `scale` px/pt, for view `view`.
     Render { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], size: [usize; 2], layer: Layer },
-    Export { src: PathBuf, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
+    Export { src: PathBuf, layout: Option<Layout>, out: PathBuf, annots: Vec<Annot>, mode: ExportMode, author: String },
     /// A page's text, for the scales written on it.
     PageText { generation: u64, page: usize },
     /// Write a new PDF of `pages` blank pages, `size` points each.
     Create { path: PathBuf, size: Vec2, pages: usize },
-    /// Write a smaller copy of `src` to `out` (`shrink`).
-    Shrink { src: PathBuf, out: PathBuf, dpi: f32 },
+    /// Write a smaller copy of `src` (its pages arranged as `layout`) to `out` (`shrink`).
+    Shrink { src: PathBuf, layout: Option<Layout>, out: PathBuf, dpi: f32 },
     /// Find `query` on `pages` in turn, for search `id`. The worker searches one
     /// page per turn and queues the rest behind other work, so renders stay live.
     Search { generation: u64, id: u64, pages: VecDeque<usize>, query: String },
 }
 
 pub enum Resp {
-    Opened { generation: u64, pages: Vec<Vec2> },
+    /// Its pages' sizes, and how many the source PDF has.
+    Opened { generation: u64, pages: Vec<Vec2>, source: usize },
+    /// Arranged anew (`Req::Relayout`): its pages' sizes.
+    Relaid { generation: u64, pages: Vec<Vec2> },
+    /// A PDF to insert pages from: the file picked, its stored name and page sizes, or why not.
+    Probed(PathBuf, Result<(String, Vec<Vec2>), String>),
     OpenFailed { generation: u64, error: String },
     Rendered { generation: u64, view: u64, page: usize, scale: f32, origin: [i32; 2], layer: Layer, image: Arc<egui::ColorImage> },
     RenderFailed { generation: u64, view: u64, page: usize, layer: Layer, error: String },
@@ -153,14 +164,36 @@ fn run(
         }
         let Some(req) = next_request(&mut queue, &keep, &mut thumb_turn) else { continue };
         let resp = match req {
-            Req::Open { generation, path } => {
-                match pdfium.load_pdf_from_file(&path, None).and_then(|d| page_sizes(&d).map(|s| (d, s))) {
-                    Ok((d, pages)) => {
+            Req::Open { generation, path, layout } => {
+                let source = || pdfium.load_pdf_from_file(&path, None).map(|d| d.pages().len() as usize).map_err(|e| anyhow::anyhow!("{e:?}"));
+                match crate::pages::open(pdfium, &path, layout.as_ref()).and_then(|d| Ok((page_sizes(&d)?, d))) {
+                    Ok((pages, d)) => {
+                        // Arranged: the source's own page count, for pages it has gained since.
+                        let source = if layout.is_some() { source().unwrap_or(0) } else { pages.len() };
                         docs.insert(generation, d);
-                        Resp::Opened { generation, pages }
+                        Resp::Opened { generation, pages, source }
                     }
-                    Err(e) => Resp::OpenFailed { generation, error: format!("{e:?}") },
+                    Err(e) => Resp::OpenFailed { generation, error: e.to_string() },
                 }
+            }
+            Req::Relayout { from, generation, path, layout } => {
+                loaded.forget(from);
+                thumbs.forget(from);
+                docs.remove(&from);
+                match crate::pages::open(pdfium, &path, layout.as_ref()).and_then(|d| Ok((page_sizes(&d)?, d))) {
+                    Ok((pages, d)) => {
+                        docs.insert(generation, d);
+                        Resp::Relaid { generation, pages }
+                    }
+                    Err(e) => Resp::OpenFailed { generation, error: e.to_string() },
+                }
+            }
+            Req::Probe { path } => {
+                let probed = crate::pages::store(&path).and_then(|name| {
+                    let d = pdfium.load_pdf_from_file(&crate::pages::dir().join(&name), None).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    Ok((name, page_sizes(&d)?))
+                });
+                Resp::Probed(path, probed.map_err(|e| e.to_string()))
             }
             Req::Render { generation, view, page, scale, origin, size, layer } => {
                 let Some(d) = docs.get(&generation) else { continue };
@@ -225,10 +258,10 @@ fn run(
                 continue;
             }
             Req::Create { path, size, pages } => Resp::Created(create_blank(pdfium, &path, size, pages).map(|_| path).map_err(|e| e.to_string())),
-            Req::Shrink { src, out, dpi } => Resp::Shrunk(shrink(pdfium, &src, &out, dpi).map(|r| (out, r)).map_err(|e| e.to_string())),
-            Req::Export { src, out, annots, mode, author } => Resp::Exported(
+            Req::Shrink { src, layout, out, dpi } => Resp::Shrunk(shrink(pdfium, &src, layout.as_ref(), &out, dpi).map(|r| (out, r)).map_err(|e| e.to_string())),
+            Req::Export { src, layout, out, annots, mode, author } => Resp::Exported(
                 load_images(&annots)
-                    .and_then(|images| export(pdfium, &src, &out, &annots, &images, mode, &author))
+                    .and_then(|images| export(pdfium, &src, layout.as_ref(), &out, &annots, &images, mode, &author))
                     .map(|n| (out, n))
                     .map_err(|e| e.to_string()),
             ),
@@ -762,24 +795,26 @@ fn emit_prims<'a>(
 }
 
 /// A flattened copy of `src` with `annots` drawn in, for the command line's renders.
-pub fn flatten(pdfium: &Pdfium, src: &Path, out: &Path, annots: &[Annot]) -> anyhow::Result<usize> {
+pub fn flatten(pdfium: &Pdfium, src: &Path, layout: Option<&Layout>, out: &Path, annots: &[Annot]) -> anyhow::Result<usize> {
     let images = load_images(annots)?;
-    export(pdfium, src, out, annots, &images, ExportMode::Flatten, "Greenline")
+    export(pdfium, src, layout, out, annots, &images, ExportMode::Flatten, "Greenline")
 }
 
-/// Writes `annots` onto a copy of `src` and saves it to `out`. Returns how many
+/// Writes `annots` onto a copy of `src` (its pages arranged as `layout`) and saves it to `out`. Returns how many
 /// characters had no font. Annotations already in the PDF are left as they are
 /// (PDFium's flatten can resize pages and drop comments).
+#[allow(clippy::too_many_arguments)]
 pub fn export(
     pdfium: &Pdfium,
     src: &Path,
+    layout: Option<&Layout>,
     out: &Path,
     annots: &[Annot],
     images: &HashMap<String, image::RgbaImage>,
     mode: ExportMode,
     author: &str,
 ) -> anyhow::Result<usize> {
-    let mut doc = pdfium.load_pdf_from_file(src, None)?;
+    let mut doc = crate::pages::open(pdfium, src, layout)?;
     let f = doc.fonts_mut();
     let helvetica = [f.helvetica(), f.helvetica_bold(), f.helvetica_oblique(), f.helvetica_bold_oblique()];
     let mut fonts = TextFonts { helvetica, embedded: Default::default(), missing: 0 };
@@ -1012,12 +1047,13 @@ fn looks_different(a: &egui::ColorImage, b: &egui::ColorImage) -> bool {
     total as f64 / blocks.max(1) as f64 > 4.0 || big * 200 > blocks
 }
 
-/// Writes a copy of `src` to `out` with its big colour and grey images brought
+/// Writes a copy of `src` (its pages arranged as `layout`) to `out` with its big colour and grey images brought
 /// down to `dpi` and recompressed as JPEGs. Everything else (vector drawing,
 /// text, 1-bit scans, annotations) is left as it is; `src` is never changed.
-pub fn shrink(pdfium: &Pdfium, src: &Path, out: &Path, dpi: f32) -> anyhow::Result<Shrunk> {
+pub fn shrink(pdfium: &Pdfium, src: &Path, layout: Option<&Layout>, out: &Path, dpi: f32) -> anyhow::Result<Shrunk> {
     let before = std::fs::metadata(src)?.len();
-    let doc = pdfium.load_pdf_from_file(src, None)?;
+    let arranged = crate::pages::fingerprint(layout) != 0;
+    let doc = crate::pages::open(pdfium, src, layout)?;
     let n = doc.pages().len();
     // How many times each image's data is used: pages can share one.
     let mut uses: HashMap<u64, usize> = HashMap::new();
@@ -1064,9 +1100,14 @@ pub fn shrink(pdfium: &Pdfium, src: &Path, out: &Path, dpi: f32) -> anyhow::Resu
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = out.with_extension(format!("pdf.{}-{seq}.part", std::process::id()));
     let saved = doc.save_to_file(&tmp).map_err(anyhow::Error::from).and_then(|_| {
-        // Never bigger: with nothing gained, the copy is the original, byte for byte.
+        // Never bigger: with nothing gained, the copy is the original, byte for byte
+        // (its pages as arranged, if they are, with nothing recompressed).
         if recompressed == 0 || std::fs::metadata(&tmp)?.len() >= before {
-            std::fs::copy(src, &tmp)?;
+            if arranged {
+                crate::pages::open(pdfium, src, layout)?.save_to_file(&tmp)?;
+            } else {
+                std::fs::copy(src, &tmp)?;
+            }
             kept += recompressed;
             recompressed = 0;
             looks.clear();
@@ -1146,7 +1187,7 @@ pub(crate) mod tests {
             annots.push(annot(p, Kind::Text { pos: pos2(40.0, 200.0), box_w: 300.0, text: "WWWWWWWWWWWWWWWWWW".into(), size: 14.0 }));
         }
         for mode in [ExportMode::Flatten, ExportMode::Editable] {
-        export(pdfium, &src, &out, &annots, &HashMap::new(), mode, "test").unwrap();
+        export(pdfium, &src, None, &out, &annots, &HashMap::new(), mode, "test").unwrap();
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         for p in 0..4 {
@@ -1203,7 +1244,7 @@ pub(crate) mod tests {
             annots.push(annot(p, Kind::Image { rect, image: "ab.png".into(), name: "Seal".into() }));
         }
         for mode in [ExportMode::Flatten, ExportMode::Editable] {
-            export(pdfium, &src, &out, &annots, &images, mode, "test").unwrap();
+            export(pdfium, &src, None, &out, &annots, &images, mode, "test").unwrap();
             let size = std::fs::metadata(&out).unwrap().len();
             assert!(size < 40_000, "{mode:?}: image stored uncompressed? {size} bytes");
             let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
@@ -1224,7 +1265,7 @@ pub(crate) mod tests {
             }
         }
         let missing = annot(0, Kind::Image { rect, image: "ab.png".into(), name: "Seal".into() });
-        assert!(export(pdfium, &src, &out, &[missing], &HashMap::new(), ExportMode::Flatten, "test").is_err(), "missing image must fail");
+        assert!(export(pdfium, &src, None, &out, &[missing], &HashMap::new(), ExportMode::Flatten, "test").is_err(), "missing image must fail");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1251,7 +1292,7 @@ pub(crate) mod tests {
         let images = HashMap::from([("photo.jpg".to_string(), photo)]);
         let rect = Rect::from_min_max(pos2(50.0, 100.0), pos2(350.0, 300.0));
         let a = annot(0, Kind::Image { rect, image: "photo.jpg".into(), name: "Site photo".into() });
-        export(pdfium, &src, &out, &[a], &images, ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &[a], &images, ExportMode::Flatten, "test").unwrap();
         let size = std::fs::metadata(&out).unwrap().len();
         assert!(size < 400_000, "a photo stored as pixels? {size} bytes");
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
@@ -1302,7 +1343,7 @@ pub(crate) mod tests {
         doc.save_to_file(&src).unwrap();
         drop(doc);
 
-        let r = shrink(pdfium, &src, &out, SHRINK_DPI).unwrap();
+        let r = shrink(pdfium, &src, None, &out, SHRINK_DPI).unwrap();
         assert_eq!((r.recompressed, r.kept), (1, 2), "{r:?}");
         assert!(r.after * 4 < r.before, "{r:?}");
         assert!(r.check_pages.is_empty(), "{r:?}");
@@ -1316,7 +1357,7 @@ pub(crate) mod tests {
         assert!(px(300, 300).r() > 180 && px(300, 300).r() == px(300, 300).b(), "the scan, grey: {:?}", px(300, 300));
         // Nothing worth doing: an honest report, and still a copy.
         let again = dir.join("again.pdf");
-        let r = shrink(pdfium, &out, &again, SHRINK_DPI).unwrap();
+        let r = shrink(pdfium, &out, None, &again, SHRINK_DPI).unwrap();
         assert_eq!(r.recompressed, 0);
         assert_eq!(std::fs::read(&again).unwrap(), std::fs::read(&out).unwrap(), "never bigger: the original as it was");
         std::fs::remove_dir_all(&dir).ok();
@@ -1371,7 +1412,7 @@ pub(crate) mod tests {
         pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).into_bytes());
         std::fs::write(&src, pdf).unwrap();
 
-        let r = shrink(pdfium, &src, &out, SHRINK_DPI).unwrap();
+        let r = shrink(pdfium, &src, None, &out, SHRINK_DPI).unwrap();
         assert_eq!((r.recompressed, r.kept), (1, 2), "{r:?}");
         assert!(r.check_pages.is_empty(), "{r:?}");
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
@@ -1416,7 +1457,7 @@ pub(crate) mod tests {
         ];
         let scales = vec![crate::measure::Scale::from_ratio(0, None, 48.0, "1/4\" = 1'-0\"")];
         crate::measure::relabel(&mut annots, &scales, crate::measure::Units::Imperial);
-        export(pdfium, &src, &out, &annots, &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &annots, &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
         let text = page.text().unwrap().all();
@@ -1446,7 +1487,7 @@ pub(crate) mod tests {
         let poly = annot(0, Kind::Poly { pts: vec![pos2(50.0, 400.0), pos2(350.0, 400.0), pos2(200.0, 550.0)], closed: false });
         let mut hatched = annot(0, Kind::Rect { rect: egui::Rect::from_min_max(pos2(20.0, 280.0), pos2(380.0, 380.0)) });
         hatched.style.hatch = Some(crate::patterns::HatchFill { pattern: std::sync::Arc::new(crate::patterns::builtin_hatches()[2].clone()), scale: 1.0 });
-        export(pdfium, &src, &out, &[cloud, poly, hatched], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &[cloud, poly, hatched], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let img = render_region(&doc, 0, 1.0, [0, 0], [400, 600]).unwrap();
         let px = |x: usize, y: usize| img.pixels[y * 400 + x];
@@ -1464,7 +1505,7 @@ pub(crate) mod tests {
         dotted.style.line = Some(std::sync::Arc::new(crate::patterns::builtin_line_types()[1].clone()));
         assert!(dotted.prims().len() > 2000, "{}", dotted.prims().len());
         let t = std::time::Instant::now();
-        export(pdfium, &src, &out, &[dotted], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &[dotted], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         assert!(t.elapsed().as_secs_f32() < 2.0, "{:?}", t.elapsed());
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         assert!(doc.pages().get(0).unwrap().objects().len() < 5);
@@ -1553,7 +1594,7 @@ pub(crate) mod tests {
         b.style.bold = true;
         let mut i = annot(0, Kind::Text { pos: pos2(40.0, 140.0), box_w: 300.0, text: "Italic note".into(), size: 14.0 });
         i.style.italic = true;
-        export(pdfium, &src, &out, &[b, i], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &[b, i], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
         let fonts: Vec<String> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| t.font().name())).collect();
@@ -1565,7 +1606,7 @@ pub(crate) mod tests {
         let mut f = vec![crate::annot::Fmt::default(); 13];
         f[5..8].iter_mut().for_each(|x| x.bold = true);
         w.style.set_fmts(&f);
-        export(pdfium, &src, &out, &[w], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
+        export(pdfium, &src, None, &out, &[w], &HashMap::new(), ExportMode::Flatten, "test").unwrap();
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
         let runs: Vec<(String, String)> = page.objects().iter().filter_map(|o| o.as_text_object().map(|t| (t.text(), t.font().name()))).collect();
@@ -1646,7 +1687,7 @@ pub(crate) mod tests {
         let (src, out) = (dir.join("src.pdf"), dir.join("out.pdf"));
         std::fs::write(&src, &data).unwrap();
         let note = annot(0, Kind::Text { pos: pos2(300.0, 300.0), box_w: 400.0, text: "Δ ≥ 5\u{a0}mm, ⌀ 25 ☐ ok".into(), size: 20.0 });
-        assert_eq!(export(pdfium, &src, &out, &[note], &HashMap::new(), ExportMode::Flatten, "test").unwrap(), 0);
+        assert_eq!(export(pdfium, &src, None, &out, &[note], &HashMap::new(), ExportMode::Flatten, "test").unwrap(), 0);
 
         let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
         let page = doc.pages().get(0).unwrap();
@@ -1684,7 +1725,7 @@ mod sample {
         ];
         for (mode, out) in [(ExportMode::Flatten, out.clone()), (ExportMode::Editable, src.with_file_name("sample_markup_editable.pdf"))] {
             let t = std::time::Instant::now();
-            export(pdfium, &src, &out, &annots, &HashMap::new(), mode, "test").unwrap();
+            export(pdfium, &src, None, &out, &annots, &HashMap::new(), mode, "test").unwrap();
             eprintln!("{mode:?}: exported {} in {:?}", out.display(), t.elapsed());
         }
     }
