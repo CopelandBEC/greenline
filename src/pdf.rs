@@ -15,7 +15,7 @@ pub fn pdfium() -> anyhow::Result<&'static Pdfium> {
     PDFIUM
         .get_or_init(|| {
             let lib = find_pdfium().map_err(|e| e.to_string())?;
-            Pdfium::bind_to_library(&lib).map(Pdfium::new).map_err(|e| format!("loading {}: {e}", lib.display()))
+            crate::pages::bind(&lib).map_err(|e| format!("loading {}: {e}", lib.display()))
         })
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e}"))

@@ -176,6 +176,57 @@ fn an_agent_takes_off_a_window_for_review() {
 }
 
 #[test]
+fn pages_count_in_the_order_the_reviewer_arranged() {
+    use greenline::pages::{insert_pages, Layout, Src};
+    let env = Env::new("arranged", true);
+    let pdf = env.pdf();
+    // As the app saves it: a blank half-letter page put before the sheet.
+    let real = dunce::canonicalize(&env.pdf).unwrap();
+    let stem = format!("sheet-{:016x}.json", greenline::sidecar::fnv(real.as_os_str().as_encoded_bytes()));
+    let layout = insert_pages(&Layout::identity(1), 0, vec![Src::Blank { width: 396.0, height: 612.0 }]);
+    let sidecar = greenline::sidecar::Sidecar { pdf: real, annots: Vec::new(), scales: Vec::new(), accepted: Vec::new(), pages: Some(layout) };
+    let data = env.dir.join("data/greenline");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join(stem), serde_json::to_vec(&sidecar).unwrap()).unwrap();
+
+    let info = env.run(&["info", pdf]);
+    assert_eq!(info["pages_arranged"], true);
+    assert_eq!(info["pages"][0]["inches"], "5.5 x 8.5");
+    assert_eq!(info["pages"][0]["from"], "blank page");
+    assert_eq!(info["pages"][1]["from"], "page 1 of the PDF");
+    assert_eq!(env.run(&["text", pdf, "--page", "2", "--contains", "w1"])["count"], 1, "the sheet is page 2 now");
+
+    let ops = env.dir.join("ops.json");
+    std::fs::write(&ops, r#"[{"op": "cloud", "page": 2, "rect": [90, 90, 164, 200]}]"#).unwrap();
+    env.run(&["apply", pdf, ops.to_str().unwrap()]);
+    let props: Value = serde_json::from_slice(&std::fs::read(env.dir.join("data/greenline").read_dir().unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".proposals.json")).unwrap()).unwrap()).unwrap();
+    assert_ne!(props["batches"][0]["layout"], Value::Null, "marked with the order its pages count in");
+    assert_eq!(env.run(&["list", pdf, "--proposals"])["count"], 1);
+    // One made for another order (the reviewer moved pages meanwhile) is left out, and listed as stale.
+    let pfile = env.dir.join("data/greenline").read_dir().unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".proposals.json")).unwrap();
+    let mut stale = props.clone();
+    stale["batches"][0]["layout"] = serde_json::json!(12345);
+    std::fs::write(&pfile, serde_json::to_vec(&stale).unwrap()).unwrap();
+    assert_eq!(env.run(&["list", pdf, "--proposals"])["count"], 0);
+    assert_eq!(env.run(&["proposals", pdf])["batches"][0]["stale"], true);
+    std::fs::write(&pfile, serde_json::to_vec(&props).unwrap()).unwrap();
+
+    let out = env.dir.join("out.pdf");
+    env.run(&["export", pdf, "--proposals", "--out", out.to_str().unwrap()]);
+    let pdfium = greenline::pdf::pdfium().unwrap();
+    let doc = pdfium.load_pdf_from_file(&out, None).unwrap();
+    let sizes: Vec<f32> = doc.pages().iter().map(|p| p.width().value).collect();
+    assert_eq!(sizes, [396.0, 792.0], "exported in the arranged order");
+    drop(doc);
+    // A smaller copy too (nothing to recompress here: the arranged pages as they are).
+    let small = env.dir.join("small.pdf");
+    env.run(&["shrink", pdf, "--out", small.to_str().unwrap()]);
+    let doc = pdfium.load_pdf_from_file(&small, None).unwrap();
+    let sizes: Vec<f32> = doc.pages().iter().map(|p| p.width().value).collect();
+    assert_eq!(sizes, [396.0, 792.0], "a smaller copy keeps the arranged order");
+}
+
+#[test]
 fn guide_and_help_print_text() {
     let env = Env::new("help", false);
     for args in [&["guide"][..], &["help"], &["ops"], &[]] {

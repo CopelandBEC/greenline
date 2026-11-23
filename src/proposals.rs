@@ -30,6 +30,15 @@ pub struct Proposal {
     /// markup accepted later joins the rest of its group.
     #[serde(default)]
     pub accepted_groups: HashMap<u64, u64>,
+    /// The page arrangement its pages count in (`pages::fingerprint`; 0 for the
+    /// PDF's own order). The app carries batches along when it rearranges pages;
+    /// one made for an arrangement since changed can't be accepted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub layout: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]

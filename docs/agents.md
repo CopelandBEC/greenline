@@ -10,6 +10,8 @@ In a chat client without a shell, the same commands are MCP tools: add a server 
 
 Everything uses **page points** on the page as displayed: the origin is at the top-left, y runs down, and there are 72 points per paper inch. Pages count from 1. `text`, `paths`, `snap`, `render` and `list` all report in these coordinates, and ops take them.
 
+**Pages count in the reviewer's order.** In Greenline the reviewer can move, delete and insert pages (blank ones, or pages from another PDF) without changing the PDF. Every command reads that arrangement, so page N is the page they see as page N. `info` says `"pages_arranged": true` and gives each page's `from` (`"page 3 of the PDF"`, `"blank page"`, `"page 2 of other.pdf"`). If the pages are rearranged after you read them, anything you proposed for the old order can't be accepted: `proposals` marks it `"stale": true`, and `list`, `measurements`, `render` and `export` leave it out of `--proposals`. Withdraw it, run `info` again and propose again.
+
 A render's pixels map back to page points as `x = region[0] + px / px_per_pt`, `y = region[1] + py / px_per_pt`. The render prints both values.
 
 ## Work in a script, not one call at a time
@@ -63,7 +65,7 @@ The person accepts the markups in Greenline, and the CSV is ready for a spreadsh
 
 ## Smaller files
 
-`shrink <pdf> [--dpi 200] [--out F.pdf]` writes a smaller copy (`<name>_smaller.pdf` by default): big colour and grey images, such as scans and photos, are brought down to the resolution given and recompressed. Vector drawing, text, 1-bit scans and annotations are left as they are, and the original is never changed. The result gives the sizes before and after, and `check_pages` lists any page that looks noticeably different afterwards. Look at those pages before sending the copy on.
+`shrink <pdf> [--dpi 200] [--out F.pdf]` writes a smaller copy (`<name>_smaller.pdf` by default): big colour and grey images, such as scans and photos, are brought down to the resolution given and recompressed. Vector drawing, text, 1-bit scans and annotations are left as they are, and the original is never changed. Its pages are in the reviewer's order, like an export. The result gives the sizes before and after, and `check_pages` lists any page that looks noticeably different afterwards. Look at those pages before sending the copy on.
 
 ## Limits
 

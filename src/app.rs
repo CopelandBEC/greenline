@@ -2,6 +2,7 @@ use crate::annot::{self, Annot, Fill, Kind, Prim, Rgb, Style, COLORS, WHITE};
 use crate::patterns::{self, Hatch, HatchFill, LineType};
 use std::sync::Arc;
 use crate::measure::{self, Scale, Units};
+use crate::pages::{Layout, Src};
 use crate::proposals::{self, Proposals};
 use crate::render::{ExportMode, Layer, Req, Resp, Worker};
 use crate::sidecar;
@@ -11,7 +12,7 @@ use egui::{
     pos2, vec2, Align2, Color32, CursorIcon, FontFamily, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke,
     TextureHandle, TextureOptions, Ui, Vec2,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -50,6 +51,8 @@ enum Pick {
     Picture,
     /// The shared pattern library folder.
     PatternDir,
+    /// A PDF to insert pages from.
+    InsertPages(Anchor),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -211,13 +214,14 @@ struct Parked {
     overview_cursor: usize,
     annots: Vec<Annot>,
     scales: Vec<Scale>,
+    layout: Option<Layout>,
     scale_found: HashMap<usize, Vec<(String, f64)>>,
     scale_asked: HashSet<usize>,
     find: Find,
     find_from: usize,
     next_id: u64,
-    undo: Vec<(Vec<Annot>, Vec<Scale>)>,
-    redo: Vec<(Vec<Annot>, Vec<Scale>)>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     dirty: bool,
     selected: Vec<u64>,
     lock: Option<std::fs::File>,
@@ -280,6 +284,62 @@ struct Pane {
     view: View,
 }
 
+/// Where pages are to be inserted: before or after this page (found again by
+/// itself, so pages moved meanwhile don't put them elsewhere).
+#[derive(Clone)]
+struct Anchor {
+    page: crate::pages::PageRef,
+    after: bool,
+}
+
+/// Pages dragged in the sidebar or overview, and where they'd go if dropped
+/// now (before that page; the page count for the end).
+struct PageDrag {
+    pages: Vec<usize>,
+    to: Option<usize>,
+}
+
+/// A change asked for from a page's menu, made once the thumbnails are drawn
+/// (they're drawn from the page list it changes).
+enum PageOp {
+    Blank(usize, bool),
+    FromFile(usize, bool),
+    Delete(Vec<usize>),
+}
+
+/// The window for picking which pages of another PDF to insert.
+struct InsertWin {
+    /// The document they go into.
+    doc: PathBuf,
+    anchor: Anchor,
+    /// Its stored copy (`pages::store`), file name and page sizes.
+    file: String,
+    name: String,
+    sizes: Vec<Vec2>,
+    range: String,
+    error: Option<String>,
+}
+
+/// An undo step: the markups and scales before a change, and the pages'
+/// arrangement and sizes when it rearranged them.
+type Step = (Vec<Annot>, Vec<Scale>, Option<PageStep>);
+
+/// What an undo step that rearranged pages puts back: the arrangement and page
+/// sizes, and the proposed markups and scales the change took out of the
+/// proposals (on pages it deleted), to go back in.
+struct PageStep {
+    layout: Layout,
+    sizes: Vec<Vec2>,
+    proposals: Vec<proposals::Proposal>,
+}
+
+/// Where page `p` goes, by `map` (old index to new, `None`: deleted), with the
+/// arrangement then `len` pages long. Markups on pages past the end (a PDF
+/// that has lost pages) stay past it, so they never land on a page put there.
+fn moved_to(map: &[Option<usize>], len: usize, p: usize) -> Option<usize> {
+    if p < map.len() { map[p] } else { Some(len + (p - map.len())) }
+}
+
 /// Background tabs that keep their rendered pages.
 const TEX_TABS: usize = 2;
 
@@ -298,6 +358,11 @@ struct Wanted {
 /// An open document's place in the tab strip; the shown tab's state is in `App`.
 struct Tab {
     parked: Option<Box<Parked>>,
+}
+
+/// Moves `m`'s entries to new keys (`None`: dropped).
+fn follow<K: Eq + std::hash::Hash, V>(m: &mut HashMap<K, V>, to: impl Fn(&K) -> Option<K>) {
+    *m = std::mem::take(m).into_iter().filter_map(|(k, v)| to(&k).map(|k| (k, v))).collect();
 }
 
 /// Where each page sits in the scroll of pages, the widest page, and the total height.
@@ -434,6 +499,18 @@ pub struct App {
     annots: Vec<Annot>,
     /// Drawing scales on this document's pages.
     scales: Vec<Scale>,
+    /// Its pages as arranged (moved, deleted, added); none for the PDF's own order.
+    layout: Option<Layout>,
+    /// Pages picked in the overview (Ctrl/Shift+click), to move or delete together.
+    page_sel: BTreeSet<usize>,
+    /// Pages being dragged to a new place in the sidebar or overview.
+    page_drag: Option<PageDrag>,
+    /// A page menu's choice, made after the thumbnails are drawn.
+    page_op: Option<PageOp>,
+    /// A PDF being read to insert pages from: the document, where they go, and the PDF.
+    inserting: Option<(PathBuf, Anchor, PathBuf)>,
+    /// The window for choosing which of its pages to insert.
+    insert_win: Option<InsertWin>,
     /// Measurement (or calibration line) being clicked out: its page and points so far.
     building: Option<(usize, Vec<Pos2>)>,
     scale_win: ScaleWin,
@@ -448,6 +525,8 @@ pub struct App {
     queued_pictures: std::collections::VecDeque<Place>,
     /// Bumped when placing is cancelled, so images still being stored are let go.
     picture_epoch: u64,
+    /// Images dropped on a sheet still being stored.
+    pictures_in_flight: usize,
     /// Open documents in tab order; `tabs[cur_tab]` is the one shown (its state is in `self`).
     tabs: Vec<Tab>,
     cur_tab: usize,
@@ -465,8 +544,8 @@ pub struct App {
     shift: bool,
     next_id: u64,
     /// Markups and scales before each change (scale changes relabel measurements, so they undo with them).
-    undo: Vec<(Vec<Annot>, Vec<Scale>)>,
-    redo: Vec<(Vec<Annot>, Vec<Scale>)>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     dirty: bool,
 
     tool: Tool,
@@ -632,6 +711,12 @@ impl App {
             sidebar_synced: None,
             annots: Vec::new(),
             scales: Vec::new(),
+            layout: None,
+            page_sel: BTreeSet::new(),
+            page_drag: None,
+            page_op: None,
+            inserting: None,
+            insert_win: None,
             building: None,
             scale_win: ScaleWin::default(),
             find: Find::default(),
@@ -640,6 +725,7 @@ impl App {
             pictures: mpsc::channel(),
             queued_pictures: Default::default(),
             picture_epoch: 0,
+            pictures_in_flight: 0,
             tabs: vec![Tab { parked: None }],
             cur_tab: 0,
             title_dirty: false,
@@ -775,6 +861,7 @@ impl App {
         swap(&mut self.overview_cursor, &mut p.overview_cursor);
         swap(&mut self.annots, &mut p.annots);
         swap(&mut self.scales, &mut p.scales);
+        swap(&mut self.layout, &mut p.layout);
         swap(&mut self.scale_win.found, &mut p.scale_found);
         swap(&mut self.scale_win.asked, &mut p.scale_asked);
         swap(&mut self.find, &mut p.find);
@@ -819,6 +906,9 @@ impl App {
         self.req_thumb.clear();
         self.thumbs_wanted.clear();
         self.overview = false;
+        self.page_sel.clear();
+        self.page_drag = None;
+        self.page_op = None;
         self.sidebar_synced = None;
         self.editing = None;
         self.drag = Drag::None;
@@ -998,7 +1088,7 @@ impl App {
                 continue;
             };
             self.saver.flush();
-            match sidecar::save_file(f, pdf, &p.annots, &p.scales, &p.accepted) {
+            match sidecar::save_file(f, pdf, &p.annots, &p.scales, &p.accepted, p.layout.as_ref()) {
                 Ok(()) => p.dirty = false,
                 Err(e) => failed = Some(format!("AUTOSAVE FAILED for {}: {e}", pdf.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())),
             }
@@ -1172,11 +1262,9 @@ impl App {
             self.toast("Autosave failed; not switching documents so markups aren't lost".into());
             return;
         }
-        let w = self.worker.as_ref().unwrap();
         // Unique across tabs: the worker keeps each tab's document under its generation.
         self.last_generation += 1;
         self.generation = self.last_generation;
-        w.send(Req::Open { generation: self.generation, path: path.clone() });
         self.pages.clear();
         self.base.clear();
         self.patch.clear();
@@ -1186,6 +1274,8 @@ impl App {
         self.req_thumb.clear();
         self.thumbs_wanted.clear();
         self.overview = false;
+        self.page_sel.clear();
+        self.page_drag = None;
         self.sidebar_synced = None;
         self.failed.clear();
         self.undo.clear();
@@ -1198,6 +1288,7 @@ impl App {
         self.picture_epoch += 1;
         self.annots = Vec::new();
         self.scales = Vec::new();
+        self.layout = None;
         self.accepted = Vec::new();
         self.building = None;
         self.find.hits.clear();
@@ -1219,6 +1310,7 @@ impl App {
                 self.annots = s.annots;
                 self.scales = s.scales;
                 self.accepted = s.accepted;
+                self.layout = s.pages;
             }
             Ok(None) => {}
             // Never autosave over a markups file we couldn't read.
@@ -1226,6 +1318,9 @@ impl App {
         }
         self.read_only = why.is_some();
         self.read_only_why = why.unwrap_or_default();
+        // Its pages arranged as its markups were saved for.
+        let w = self.worker.as_ref().unwrap();
+        w.send(Req::Open { generation: self.generation, path: path.clone(), layout: self.layout.clone() });
         self.props = Proposals::default();
         self.props_path = Some(proposals::file_for(&path));
         self.markups_file = Some(sidecar::file_for(&path));
@@ -1236,7 +1331,13 @@ impl App {
         self.status = "Opening…".into();
     }
 
-    fn on_opened(&mut self, ctx: &egui::Context, pages: Vec<Vec2>) {
+    fn on_opened(&mut self, ctx: &egui::Context, pages: Vec<Vec2>, source: usize) {
+        // Pages a reissued set has gained since it was arranged were added at the end.
+        if let Some(l) = &mut self.layout {
+            if l.fit(source) && !self.read_only {
+                self.dirty = true;
+            }
+        }
         (self.page_y, self.doc_w, self.doc_h) = layout(&pages);
         self.pages = pages;
         self.fit_pending = true;
@@ -1285,7 +1386,8 @@ impl App {
     }
 
     /// Writes `<name>_smaller.pdf` beside the original: its big scans and photos
-    /// brought down and recompressed (markups aren't part of it; export them as usual).
+    /// brought down and recompressed, its pages in the order shown (markups
+    /// aren't part of it; export them as usual).
     fn smaller_copy(&mut self) {
         let Some(src) = self.path.clone() else { return };
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
@@ -1295,11 +1397,12 @@ impl App {
         }
         // A big scanned set takes a while: in a process of its own if we can.
         let dpi = crate::render::SHRINK_DPI;
-        if self.run_cli(CliJob::Shrink, vec!["shrink".into(), src.clone().into(), "--out".into(), out.clone().into(), "--dpi".into(), dpi.to_string().into()]) {
+        // The command line reads the page order from the markups file: saved first, or the worker does it.
+        if self.markups_saved() && self.run_cli(CliJob::Shrink, vec!["shrink".into(), src.clone().into(), "--out".into(), out.clone().into(), "--dpi".into(), dpi.to_string().into()]) {
             self.status = "Making a smaller copy… (carry on meanwhile)".into();
             self.status_until = f64::INFINITY;
         } else if let Some(w) = &self.worker {
-            w.send(Req::Shrink { src, out, dpi });
+            w.send(Req::Shrink { src, layout: self.layout.clone(), out, dpi });
             self.status = "Making a smaller copy…".into();
             self.status_until = f64::INFINITY;
         }
@@ -1411,7 +1514,7 @@ impl App {
         }
         let (Some(w), Some(src)) = (&self.worker, &self.path) else { return };
         let annots: Vec<Annot> = self.annots.iter().filter(|a| a.text_size().is_none() || !text_of(a).trim().is_empty()).cloned().collect();
-        w.send(Req::Export { src: src.clone(), out, annots, mode, author });
+        w.send(Req::Export { src: src.clone(), layout: self.layout.clone(), out, annots, mode, author });
         self.status = "Exporting…".into();
         self.status_until = f64::INFINITY;
     }
@@ -1444,6 +1547,7 @@ impl App {
                 }
             }
             Pick::PatternDir => d,
+            Pick::InsertPages(_) => d.add_filter("PDF", &["pdf"]),
         };
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
@@ -1455,6 +1559,7 @@ impl App {
                 Pick::Picture => d.pick_file().into_iter().collect(),
                 Pick::NewDoc(..) => d.save_file().into_iter().collect(),
                 Pick::PatternDir => d.pick_folder().into_iter().collect(),
+                Pick::InsertPages(_) => d.pick_file().into_iter().collect(),
             };
             tx.send((pick, paths)).ok();
             ctx.request_repaint();
@@ -1526,6 +1631,15 @@ impl App {
                     self.reload_patterns();
                 }
             }
+            Pick::InsertPages(anchor) => {
+                // One at a time: a second couldn't be told from the first when read.
+                if let (Some(file), Some(doc), Some(w), None) = (paths.into_iter().next(), self.path.clone(), &self.worker, &self.inserting) {
+                    w.send(Req::Probe { path: file.clone() });
+                    self.inserting = Some((doc, anchor, file));
+                    self.status = "Reading the PDF…".into();
+                    self.status_until = f64::INFINITY;
+                }
+            }
         }
     }
 
@@ -1559,6 +1673,7 @@ impl App {
         }
         let (tx, src) = (self.pictures.0.clone(), src.to_path_buf());
         let epoch = self.picture_epoch;
+        self.pictures_in_flight += 1;
         std::thread::spawn(move || {
             tx.send((stamps::store_picture(&src).map_err(|e| e.to_string()), target, epoch)).ok();
         });
@@ -1627,7 +1742,7 @@ impl App {
     /// The shown document's markups as they are now, to write to `markups_file`.
     fn sidecar_now(&self) -> Option<(PathBuf, sidecar::Sidecar)> {
         let (Some(p), Some(f)) = (&self.path, &self.markups_file) else { return None };
-        Some((f.clone(), sidecar::Sidecar { pdf: p.clone(), annots: self.annots.clone(), scales: self.scales.clone(), accepted: self.accepted.clone() }))
+        Some((f.clone(), sidecar::Sidecar { pdf: p.clone(), annots: self.annots.clone(), scales: self.scales.clone(), accepted: self.accepted.clone(), pages: self.layout.clone() }))
     }
 
     /// Autosave: hands the markups to the saver thread and carries on. A failure
@@ -1711,10 +1826,13 @@ impl App {
         let msgs: Vec<Resp> = w.rx.try_iter().collect();
         for m in msgs {
             match m {
-                Resp::Opened { generation, pages } if generation == self.generation => self.on_opened(ctx, pages),
+                Resp::Opened { generation, pages, source } if generation == self.generation => self.on_opened(ctx, pages, source),
                 // A document that finished loading after its tab went to the background.
-                Resp::Opened { generation, pages } => {
+                Resp::Opened { generation, pages, source } => {
                     if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
+                        if let Some(l) = &mut p.layout {
+                            p.dirty |= l.fit(source) && !p.read_only;
+                        }
                         (p.page_y, p.doc_w, p.doc_h) = layout(&pages);
                         p.pages = pages;
                         p.view.fit_pending = true;
@@ -1743,6 +1861,9 @@ impl App {
                         });
                     }
                 }
+                Resp::Relaid { generation, pages } if generation == self.generation => self.relaid(pages),
+                Resp::RelayoutFailed { generation, error } => self.relayout_failed(generation, error),
+                Resp::Probed(file, r) => self.probed(file, r),
                 Resp::Exported(r) => self.exported(r),
                 Resp::Created(Ok(path)) => {
                     let lock = self.creating.take().map(|c| c.1);
@@ -2241,6 +2362,10 @@ impl App {
         self.commit_edit();
         self.drag = Drag::None;
         self.building = None;
+        // Pages picked or dragged belong to the pane being left (maybe another document).
+        self.page_sel.clear();
+        self.page_drag = None;
+        self.page_op = None;
         let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
         match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
             Some((k, mut p)) => {
@@ -2442,7 +2567,7 @@ impl App {
     // Annotation editing
 
     fn snapshot(&mut self) {
-        self.undo.push((self.annots.clone(), self.scales.clone()));
+        self.undo.push((self.annots.clone(), self.scales.clone(), None));
         if self.undo.len() > 200 {
             self.undo.remove(0);
         }
@@ -2828,19 +2953,43 @@ impl App {
 
     fn undo(&mut self) {
         self.commit_edit();
-        if let Some((annots, scales)) = self.undo.pop() {
-            self.redo.push((std::mem::replace(&mut self.annots, annots), std::mem::replace(&mut self.scales, scales)));
-            self.selected.clear();
-            self.changed();
+        if let Some(step) = self.undo.pop() {
+            let back = self.restore(step);
+            self.redo.push(back);
         }
     }
 
     fn redo(&mut self) {
-        if let Some((annots, scales)) = self.redo.pop() {
-            self.undo.push((std::mem::replace(&mut self.annots, annots), std::mem::replace(&mut self.scales, scales)));
-            self.selected.clear();
-            self.changed();
+        self.commit_edit();
+        if let Some(step) = self.redo.pop() {
+            let back = self.restore(step);
+            self.undo.push(back);
         }
+    }
+
+    /// Puts back the markups, scales (and arrangement) of an undo or redo step;
+    /// the step that takes them back again.
+    fn restore(&mut self, (annots, scales, pages): Step) -> Step {
+        // A gesture under way holds pages by their number: cancel it before they change.
+        if pages.is_some() {
+            if !matches!(self.drag, Drag::None | Drag::Ignore) {
+                if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
+                    self.annots = before;
+                }
+            }
+            self.page_drag = None;
+        }
+        let annots = std::mem::replace(&mut self.annots, annots);
+        let scales = std::mem::replace(&mut self.scales, scales);
+        self.selected.clear();
+        self.changed();
+        let pages = pages.map(|step| {
+            let (layout, sizes) = (self.layout_now(), self.pages.clone());
+            let taken = self.set_layout(step.layout, step.sizes);
+            self.put_back_proposals(step.proposals);
+            PageStep { layout, sizes, proposals: taken }
+        });
+        (annots, scales, pages)
     }
 
     fn set_tool(&mut self, t: Tool) {
@@ -3028,6 +3177,9 @@ impl App {
                 }
                 self.changed();
             }
+            if pressed(Key::A) && self.overview {
+                self.page_sel = (0..self.pages.len()).collect();
+            }
             if pressed(Key::A) && !self.pages.is_empty() && !self.overview {
                 let page = self.current_page();
                 self.set_tool(Tool::Select);
@@ -3187,6 +3339,10 @@ impl App {
     /// Esc: cancels a gesture, then closes the find bar, drops a placement or a
     /// scale tool, clears the selection, and finally returns to Select.
     fn escape(&mut self) {
+        // Pages being dragged stay where they are.
+        if self.page_drag.take().is_some() {
+            return;
+        }
         // Cancel any gesture in progress (the rest of it is swallowed until release).
         let mut cancelled = false;
         if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
@@ -3413,7 +3569,7 @@ impl App {
             }
             Drag::Move { before, moved, .. } => {
                 if moved {
-                    self.undo.push((before, self.scales.clone()));
+                    self.undo.push((before, self.scales.clone(), None));
                     self.redo.clear();
                     self.changed();
                 }
@@ -3425,7 +3581,7 @@ impl App {
                     self.toast("That would make the polygon's outline cross itself".into());
                     return;
                 }
-                self.undo.push((before, self.scales.clone()));
+                self.undo.push((before, self.scales.clone(), None));
                 self.redo.clear();
                 self.changed();
                 // The next placement of this stamp uses the size just chosen.
@@ -3989,7 +4145,13 @@ impl App {
 
     /// Accepted scales with every batch's scales over them, as the proposals would leave things.
     fn proposed_scales(&self) -> Vec<Scale> {
-        self.props.batches.iter().fold(self.scales.clone(), |acc, b| crate::ops::merged_scales(&acc, &b.scales))
+        self.props.batches.iter().filter(|b| self.proposed_now(b)).fold(self.scales.clone(), |acc, b| crate::ops::merged_scales(&acc, &b.scales))
+    }
+
+    /// Whether a batch's pages count in the arrangement shown (one made for
+    /// another can't be accepted, and isn't drawn on the sheets).
+    fn proposed_now(&self, b: &proposals::Proposal) -> bool {
+        b.layout == crate::pages::fingerprint(self.layout.as_ref())
     }
 
     fn relabel_proposals(&mut self) {
@@ -4021,6 +4183,9 @@ impl App {
             // Keys for batches that are gone can go; this batch's stay until it's written.
             accepted_now.retain(|k| k.split_once('/').is_some_and(|(bid, _)| p.batches.iter().any(|b| b.id == bid)));
             let Some(b) = p.batches.iter_mut().find(|b| b.id == id) else { return Ok(0) };
+            if accept && b.layout != crate::pages::fingerprint(self.layout.as_ref()) {
+                anyhow::bail!("it was proposed for the pages in an earlier order; reject it and ask for it again");
+            }
             // Markups an accept took in before its proposals write failed are
             // skipped below; first recover, from the whole batch, the groups they
             // joined, so the rest of each group joins them too.
@@ -4073,7 +4238,7 @@ impl App {
                 if let Some(f) = &markups_file {
                     // After any autosave still on its way, so it can't land on top.
                     self.saver.flush();
-                    sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now)?;
+                    sidecar::save_file(f, &path, &annots_now, &scales_now, &accepted_now, self.layout.as_ref())?;
                     saved = true;
                 }
             }
@@ -4153,8 +4318,13 @@ impl App {
                 if !b.summary.is_empty() {
                     ui.label(&b.summary);
                 }
+                let now = self.proposed_now(b);
+                if !now {
+                    ui.colored_label(Color32::from_rgb(230, 80, 60), "Made for the pages in an earlier order: reject it and ask again.");
+                }
+                let can_accept = !self.read_only && now;
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!self.read_only, egui::Button::new("Accept all")).clicked() {
+                    if ui.add_enabled(can_accept, egui::Button::new("Accept all")).clicked() {
                         action = Some((b.id.clone(), None, None, true));
                     }
                     if ui.button("Reject all").clicked() {
@@ -4169,7 +4339,7 @@ impl App {
                             if ui.small_button("Reject").clicked() {
                                 action = Some((b.id.clone(), None, Some(s.clone()), false));
                             }
-                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                            if ui.add_enabled(can_accept, egui::Button::new("Accept").small()).clicked() {
                                 action = Some((b.id.clone(), None, Some(s.clone()), true));
                             }
                         });
@@ -4187,7 +4357,7 @@ impl App {
                             if ui.small_button("Reject").clicked() {
                                 action = Some((b.id.clone(), Some(a.id), None, false));
                             }
-                            if ui.add_enabled(!self.read_only, egui::Button::new("Accept").small()).clicked() {
+                            if ui.add_enabled(can_accept, egui::Button::new("Accept").small()).clicked() {
                                 action = Some((b.id.clone(), Some(a.id), None, true));
                             }
                         });
@@ -4503,7 +4673,7 @@ impl App {
             }
             // Proposed markups: drawn as they'd be accepted, each over a faint orange
             // wash and in a dashed orange outline.
-            for b in &self.props.batches {
+            for b in self.props.batches.iter().filter(|b| self.proposed_now(b)) {
                 for a in b.annots.iter().filter(|a| a.page == i) {
                     let r = a.bounds();
                     let r = Rect::from_min_max(self.page_to_screen(i, r.min), self.page_to_screen(i, r.max)).expand(4.0);
@@ -5165,6 +5335,511 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
+    // Pages: moved, deleted, inserted (the PDF itself is never changed)
+
+    /// The shown document's arrangement, the PDF's own order if it has none.
+    fn layout_now(&self) -> Layout {
+        self.layout.clone().unwrap_or_else(|| Layout::identity(self.pages.len()))
+    }
+
+    fn anchor(&self, page: usize, after: bool) -> Option<Anchor> {
+        let page = self.layout.as_ref().map_or_else(|| (page < self.pages.len()).then_some(crate::pages::PageRef { id: page as u64, src: Src::Source { page } }), |l| l.pages.get(page).cloned())?;
+        Some(Anchor { page, after })
+    }
+
+    /// Where pages inserted at `a` go now (the end if its page has gone).
+    fn anchor_index(&self, a: &Anchor) -> usize {
+        let l = self.layout_now();
+        l.pages.iter().position(|p| *p == a.page).map_or(l.pages.len(), |i| i + a.after as usize)
+    }
+
+    /// The pages a menu or drag on page `i` is for: the overview's picked pages if it's one of them.
+    fn pages_for(&self, i: usize) -> Vec<usize> {
+        if self.page_sel.contains(&i) { self.page_sel.iter().copied().collect() } else { vec![i] }
+    }
+
+    fn can_arrange(&mut self) -> bool {
+        if self.path.is_none() || self.pages.is_empty() {
+            return false;
+        }
+        if self.read_only {
+            self.toast(format!("Can't change pages while not autosaving ({})", self.read_only_why));
+            return false;
+        }
+        true
+    }
+
+    /// Rearranges the shown document's pages as `new` (page sizes `sizes`): its
+    /// markups and scales go with their pages (those on deleted pages go too),
+    /// in one undo step.
+    fn arrange(&mut self, new: Layout, sizes: Vec<Vec2>, done: String) {
+        self.commit_edit();
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        if !matches!(self.drag, Drag::None) {
+            self.drag = Drag::Ignore;
+        }
+        let old = self.layout_now();
+        let map = crate::pages::remap(&old.pages, &new.pages);
+        let before = (self.annots.clone(), self.scales.clone(), old, self.pages.clone());
+        let len = new.pages.len();
+        let to = |p: usize| moved_to(&map, len, p);
+        self.annots.retain_mut(|a| to(a.page).map(|n| a.page = n).is_some());
+        self.scales.retain_mut(|x| to(x.page).map(|n| x.page = n).is_some());
+        let ids: HashSet<u64> = self.annots.iter().map(|a| a.id).collect();
+        self.selected.retain(|id| ids.contains(id));
+        self.changed();
+        let epoch = self.picture_epoch;
+        let taken = self.set_layout(new, sizes);
+        let done = if epoch != self.picture_epoch { format!("{done} (the image still being added was let go: drop it again)") } else { done };
+        let (annots, scales, layout, sizes) = before;
+        self.undo.push((annots, scales, Some(PageStep { layout, sizes, proposals: taken })));
+        if self.undo.len() > 200 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.toast(format!("{done} · Ctrl+Z to undo"));
+    }
+
+    /// Shows the shown document's pages arranged as `new` (page sizes `sizes`):
+    /// what's rendered or found follows its page, the view stays on the page it
+    /// showed, and the worker arranges its copy anew (as a new generation, so
+    /// renders still on their way for the old order are dropped). The markups
+    /// and scales must count in `new` already. Saves, and carries proposals
+    /// made for the old order over; those on deleted pages are taken out and
+    /// returned (for undo to put back).
+    fn set_layout(&mut self, new: Layout, sizes: Vec<Vec2>) -> Vec<proposals::Proposal> {
+        let old = self.layout_now();
+        let map = crate::pages::remap(&old.pages, &new.pages);
+        let to = |p: usize| map.get(p).copied().flatten();
+        let keep_view = (!self.pages.is_empty()).then(|| {
+            let c = self.current_page();
+            (c, self.offset.y - self.page_y[c])
+        });
+        // Split screen's other view of this document stays on its page too.
+        let keep_other = if self.other.as_ref().is_some_and(|o| o.doc.is_none()) && !self.pages.is_empty() {
+            self.with_other(|app| {
+                let c = app.current_page();
+                (c, app.offset.y - app.page_y[c])
+            })
+        } else {
+            None
+        };
+        follow(&mut self.base, |k| to(*k));
+        follow(&mut self.patch, |k| to(k.0).map(|p| (p, k.1, k.2)));
+        follow(&mut self.thumbs, |k| to(*k));
+        follow(&mut self.scale_win.found, |k| to(*k));
+        self.scale_win.asked = self.scale_win.found.keys().copied().collect();
+        self.failed = self.failed.iter().filter_map(|&p| to(p)).collect();
+        self.page_sel = self.page_sel.iter().filter_map(|&p| to(p)).collect();
+        self.overview_cursor = to(self.overview_cursor).unwrap_or(self.overview_cursor).min(sizes.len().saturating_sub(1));
+        self.req_base.clear();
+        self.req_patch.clear();
+        self.req_thumb.clear();
+        if let Some(o) = self.other.as_mut().filter(|o| o.doc.is_none()) {
+            follow(&mut o.view.base, |k| to(*k));
+            follow(&mut o.view.patch, |k| to(k.0).map(|p| (p, k.1, k.2)));
+            o.view.req_base.clear();
+            o.view.req_patch.clear();
+        }
+        self.page_drag = None;
+        // An image on its way to a sheet would land by its old page number: let it go.
+        if self.pictures_in_flight > 0 {
+            self.picture_epoch += 1;
+        }
+        self.building = None;
+        self.scale_win.target = None;
+        self.scale_win.calib = None;
+        self.sidebar_synced = None;
+
+        self.last_generation += 1;
+        let from = std::mem::replace(&mut self.generation, self.last_generation);
+        self.layout = (!new.is_identity()).then_some(new);
+        if let (Some(w), Some(path)) = (&self.worker, &self.path) {
+            w.send(Req::Relayout { from, generation: self.generation, path: path.clone(), layout: self.layout.clone() });
+        }
+        (self.page_y, self.doc_w, self.doc_h) = layout(&sizes);
+        self.pages = sizes;
+        if let Some((c, dy)) = keep_view {
+            if let Some(n) = to(c) {
+                self.offset.y = self.page_y[n] + dy;
+            }
+        }
+        if let (Some((c, dy)), Some(o)) = (keep_other, self.other.as_mut()) {
+            if let Some(n) = to(c) {
+                o.view.offset.y = self.page_y[n] + dy;
+            }
+        }
+        // Found again on the new pages (the old search's answers are dropped with its generation).
+        if self.find.open {
+            self.start_search();
+        } else {
+            self.find.hits.clear();
+            self.find.cur = None;
+        }
+        self.dirty = true;
+        self.save_sidecar();
+        self.carry_proposals(crate::pages::fingerprint(Some(&old)), &map)
+    }
+
+    /// Proposals made for the arrangement `old` follow their pages to the
+    /// current one, once it's saved (agents read the arrangement from the
+    /// markups file, and mark what they propose with it).
+    /// Those on pages deleted are taken out and returned, as partial batches
+    /// (with their old page numbers).
+    fn carry_proposals(&mut self, old: u64, map: &[Option<usize>]) -> Vec<proposals::Proposal> {
+        let new = crate::pages::fingerprint(self.layout.as_ref());
+        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return Vec::new() };
+        if old == new || self.dirty || !file.exists() {
+            return Vec::new();
+        }
+        let len = self.pages.len();
+        let to = |p: usize| moved_to(map, len, p);
+        let carried = proposals::update_file(&file, &path, |p| {
+            let mut taken = Vec::new();
+            for b in p.batches.iter_mut().filter(|b| b.layout == old) {
+                let (annots, gone_annots): (Vec<Annot>, Vec<Annot>) = std::mem::take(&mut b.annots).into_iter().partition(|a| to(a.page).is_some());
+                let (scales, gone_scales): (Vec<Scale>, Vec<Scale>) = std::mem::take(&mut b.scales).into_iter().partition(|x| to(x.page).is_some());
+                b.annots = annots.into_iter().map(|a| Annot { page: to(a.page).unwrap(), ..a }).collect();
+                b.scales = scales.into_iter().map(|x| Scale { page: to(x.page).unwrap(), ..x }).collect();
+                if !gone_annots.is_empty() || !gone_scales.is_empty() {
+                    taken.push(proposals::Proposal { annots: gone_annots, scales: gone_scales, ..b.clone() });
+                }
+                b.layout = new;
+            }
+            p.batches.retain(|b| !b.annots.is_empty() || !b.scales.is_empty());
+            Ok(taken)
+        });
+        let taken = carried.unwrap_or_else(|e| {
+            self.toast(format!("Couldn't carry the proposals over to the new page order: {e}"));
+            Vec::new()
+        });
+        self.reload_proposals();
+        taken
+    }
+
+    /// Puts proposed markups and scales a page change took out back into their
+    /// batches (undoing it brought their pages back), counting in the arrangement now.
+    fn put_back_proposals(&mut self, back: Vec<proposals::Proposal>) {
+        let (Some(path), Some(file)) = (self.path.clone(), self.props_path.clone()) else { return };
+        if back.is_empty() {
+            return;
+        }
+        let now = crate::pages::fingerprint(self.layout.as_ref());
+        let put = proposals::update_file(&file, &path, |p| {
+            for mut d in back {
+                d.layout = now;
+                match p.batches.iter_mut().find(|b| b.id == d.id) {
+                    Some(b) if b.layout == now => {
+                        b.annots.extend(d.annots);
+                        b.scales.extend(d.scales);
+                    }
+                    // Since made for another order: these can't join it.
+                    Some(_) => {}
+                    // Emptied by the change (or since rejected or withdrawn whole): back as it was.
+                    None => p.batches.push(d),
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = put {
+            self.toast(format!("Couldn't put the proposals back: {e}"));
+        }
+        self.reload_proposals();
+    }
+
+    /// The PDF couldn't be read to arrange its pages anew (moved, or its share
+    /// gone): its pages can't show, and markups stop saving (they're saved
+    /// up to the change) until it's opened again, so nothing is lost unseen.
+    fn relayout_failed(&mut self, generation: u64, error: String) {
+        let why = format!("the PDF couldn't be read to rearrange its pages ({error}); close and reopen it");
+        if generation == self.generation {
+            self.read_only = true;
+            self.read_only_why = why.clone();
+            self.status = format!("Not autosaving: {why}");
+            self.status_until = f64::INFINITY;
+        } else if let Some(p) = self.tabs.iter_mut().filter_map(|t| t.parked.as_mut()).find(|p| p.generation == generation) {
+            p.read_only = true;
+            p.read_only_why = why;
+        }
+    }
+
+    /// The worker's arrangement arrived: its page sizes are the truth.
+    fn relaid(&mut self, pages: Vec<Vec2>) {
+        if pages != self.pages {
+            (self.page_y, self.doc_w, self.doc_h) = layout(&pages);
+            self.pages = pages;
+            self.base.clear();
+            self.patch.clear();
+            self.thumbs.clear();
+        }
+    }
+
+    /// Moves `pages` to before page `before` (the page count for the end).
+    fn move_pages(&mut self, pages: &[usize], before: usize) {
+        if !self.can_arrange() {
+            return;
+        }
+        let old = self.layout_now();
+        let new = crate::pages::move_pages(&old, pages, before);
+        if new == old {
+            return;
+        }
+        let sizes = crate::pages::moved(&self.pages, pages, before);
+        let what = if pages.len() == 1 { format!("Moved page {}", pages[0] + 1) } else { format!("Moved {} pages", pages.len()) };
+        self.arrange(new, sizes, what);
+    }
+
+    fn delete_pages(&mut self, pages: &[usize]) {
+        if !self.can_arrange() {
+            return;
+        }
+        if pages.len() >= self.pages.len() {
+            self.toast("A document keeps at least one page".into());
+            return;
+        }
+        let marks = self.annots.iter().filter(|a| pages.contains(&a.page)).count();
+        let new = crate::pages::delete_pages(&self.layout_now(), pages);
+        let sizes = crate::pages::without(&self.pages, pages);
+        let what = if pages.len() == 1 { format!("Deleted page {}", pages[0] + 1) } else { format!("Deleted {} pages", pages.len()) };
+        let with = match marks {
+            0 => String::new(),
+            1 => " and its markup".into(),
+            m => format!(" and their {m} markups"),
+        };
+        self.page_sel.clear();
+        self.arrange(new, sizes, format!("{what}{with}"));
+    }
+
+    /// A blank page the size of page `i`, before or after it.
+    fn insert_blank(&mut self, i: usize, after: bool) {
+        if !self.can_arrange() || i >= self.pages.len() {
+            return;
+        }
+        let s = self.pages[i];
+        let at = i + after as usize;
+        let new = crate::pages::insert_pages(&self.layout_now(), at, vec![Src::Blank { width: s.x, height: s.y }]);
+        let mut sizes = self.pages.clone();
+        sizes.insert(at, s);
+        self.page_sel.clear();
+        self.arrange(new, sizes, format!("Inserted a blank page {}", at + 1));
+    }
+
+    /// Asks for a PDF to insert pages from, before or after page `i`.
+    fn ask_insert(&mut self, i: usize, after: bool) {
+        if !self.can_arrange() {
+            return;
+        }
+        if self.inserting.is_some() {
+            self.toast("Still reading the last PDF picked: a moment".into());
+            return;
+        }
+        if let Some(a) = self.anchor(i, after) {
+            self.ask = Some(Pick::InsertPages(a));
+        }
+    }
+
+    /// The PDF to insert pages from was read: which of its pages?
+    fn probed(&mut self, file: PathBuf, r: Result<(String, Vec<Vec2>), String>) {
+        if self.inserting.as_ref().is_none_or(|i| i.2 != file) {
+            return;
+        }
+        let Some((doc, anchor, _)) = self.inserting.take() else { return };
+        self.status_until = f64::NAN;
+        if self.path.as_ref() != Some(&doc) {
+            return;
+        }
+        let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match r {
+            Ok((_, sizes)) if sizes.is_empty() => self.toast(format!("{name} has no pages")),
+            Ok((stored, sizes)) => self.insert_win = Some(InsertWin { doc, anchor, file: stored, name, sizes, range: "all".into(), error: None }),
+            Err(e) => self.toast(format!("Could not read {name}: {e}")),
+        }
+    }
+
+    fn insert_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.insert_win else { return };
+        if self.path.as_ref() != Some(&w.doc) {
+            self.insert_win = None;
+            return;
+        }
+        let n = w.sizes.len();
+        let anchor = self.layout.as_ref().map_or_else(
+            || match w.anchor.page.src {
+                Src::Source { page } => Some(page),
+                _ => None,
+            },
+            |l| l.pages.iter().position(|p| *p == w.anchor.page),
+        );
+        let place = match anchor {
+            Some(i) => format!("{} page {}", if w.anchor.after { "after" } else { "before" }, i + 1),
+            None => "at the end".into(),
+        };
+        let (mut open, mut go, mut cancel) = (true, false, false);
+        egui::Window::new("Insert pages").open(&mut open).resizable(false).collapsible(false).anchor(Align2::CENTER_TOP, vec2(0.0, 80.0)).show(ctx, |ui| {
+            ui.label(format!("From {}  ({n} page{}), {place}", w.name, if n == 1 { "" } else { "s" }));
+            ui.horizontal(|ui| {
+                ui.label("Pages");
+                let edit = ui.add(egui::TextEdit::singleline(&mut w.range).desired_width(160.0));
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    go = true;
+                }
+            });
+            ui.weak("all, or e.g. 1-3, 7");
+            if let Some(e) = &w.error {
+                ui.colored_label(ui.visuals().error_fg_color, e);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Insert").clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if !open || cancel {
+            self.insert_win = None;
+            return;
+        }
+        if !go {
+            return;
+        }
+        match crate::pages::parse_range(&w.range, n) {
+            Ok(picked) if picked.is_empty() => w.error = Some("No pages chosen".into()),
+            Ok(picked) => {
+                let w = self.insert_win.take().unwrap();
+                self.insert_from(w, picked);
+            }
+            Err(e) => w.error = Some(e),
+        }
+    }
+
+    fn insert_from(&mut self, w: InsertWin, picked: Vec<usize>) {
+        if !self.can_arrange() {
+            return;
+        }
+        let at = self.anchor_index(&w.anchor);
+        let srcs = picked.iter().map(|&page| Src::File { file: w.file.clone(), name: w.name.clone(), page }).collect();
+        let new = crate::pages::insert_pages(&self.layout_now(), at, srcs);
+        let mut sizes = self.pages.clone();
+        sizes.splice(at..at, picked.iter().map(|&p| w.sizes[p]));
+        let k = picked.len();
+        self.page_sel.clear();
+        self.arrange(new, sizes, format!("Inserted {k} page{} from {} at page {}", if k == 1 { "" } else { "s" }, w.name, at + 1));
+    }
+
+    /// The right-click menu on page `i`'s thumbnail.
+    fn page_menu(&mut self, ui: &mut Ui, i: usize) {
+        let pages = self.pages_for(i);
+        let mut op = None;
+        if ui.button("Insert blank page before").clicked() {
+            op = Some(PageOp::Blank(i, false));
+        }
+        if ui.button("Insert blank page after").clicked() {
+            op = Some(PageOp::Blank(i, true));
+        }
+        if ui.button("Insert pages from file before…").clicked() {
+            op = Some(PageOp::FromFile(i, false));
+        }
+        if ui.button("Insert pages from file after…").clicked() {
+            op = Some(PageOp::FromFile(i, true));
+        }
+        ui.separator();
+        let label = if pages.len() == 1 { format!("Delete page {}", i + 1) } else { format!("Delete {} pages", pages.len()) };
+        if ui.button(label).clicked() {
+            op = Some(PageOp::Delete(pages));
+        }
+        if op.is_some() {
+            self.page_op = op;
+            ui.close();
+        }
+    }
+
+    /// Makes the change a page menu asked for (after the thumbnails are drawn).
+    fn page_op(&mut self) {
+        match self.page_op.take() {
+            Some(PageOp::Blank(i, after)) => self.insert_blank(i, after),
+            Some(PageOp::FromFile(i, after)) => self.ask_insert(i, after),
+            Some(PageOp::Delete(pages)) => self.delete_pages(&pages),
+            None => {}
+        }
+    }
+
+    /// A thumbnail's part in dragging pages: starts a drag from it, and while
+    /// one is under way, marks where the pages would go with the pointer over
+    /// `hit` (before or after page `i`, by which half; `across`: side by side).
+    fn page_drop(&mut self, resp: &egui::Response, hit: Rect, i: usize, across: bool) {
+        if resp.drag_started() {
+            self.page_drag = Some(PageDrag { pages: self.pages_for(i), to: None });
+        }
+        let Some(d) = &mut self.page_drag else { return };
+        let Some(p) = resp.ctx.pointer_latest_pos().filter(|p| hit.contains(*p)) else { return };
+        let r = resp.rect;
+        let after = if across { p.x > r.center().x } else { p.y > r.center().y };
+        d.to = Some(i + after as usize);
+    }
+
+    /// While pages are dragged in a list or grid (`slots`: each page's place
+    /// drawn this frame): the mark where they'd go, scrolling near the edges,
+    /// and the pages, by the pointer.
+    fn page_drag_marks(&mut self, ui: &Ui, slots: &[(usize, Rect)], across: bool) {
+        let Some(d) = &self.page_drag else { return };
+        let ctx = ui.ctx().clone();
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        ctx.request_repaint();
+        let accent = crate::theme::accent(ui.visuals());
+        if let Some(t) = d.to {
+            // Before page t, or after the one before it: in a grid, whichever is in the pointer's row.
+            let before = slots.iter().find(|(i, _)| *i == t).map(|(_, r)| (r, false));
+            let after = slots.iter().find(|(i, _)| *i + 1 == t).map(|(_, r)| (r, true));
+            let y = ctx.pointer_latest_pos().map_or(f32::NAN, |p| p.y);
+            let line = match (before, after) {
+                (Some(b), Some(a)) if across && a.0.y_range().contains(y) && !b.0.y_range().contains(y) => Some(a),
+                (b, a) => b.or(a),
+            };
+            if let Some((r, end)) = line {
+                let (a, b) = match (across, end) {
+                    (true, false) => (pos2(r.min.x - 6.0, r.min.y), pos2(r.min.x - 6.0, r.max.y)),
+                    (true, true) => (pos2(r.max.x + 6.0, r.min.y), pos2(r.max.x + 6.0, r.max.y)),
+                    (false, false) => (pos2(r.min.x, r.min.y - 2.0), pos2(r.max.x, r.min.y - 2.0)),
+                    (false, true) => (pos2(r.min.x, r.max.y + 2.0), pos2(r.max.x, r.max.y + 2.0)),
+                };
+                ui.painter().line_segment([a, b], Stroke::new(3.0, accent));
+            }
+        }
+        if let Some(p) = ctx.pointer_latest_pos() {
+            let clip = ui.clip_rect();
+            let edge = 40.0;
+            if clip.x_range().contains(p.x) {
+                if p.y < clip.min.y + edge {
+                    ui.scroll_with_delta(vec2(0.0, (clip.min.y + edge - p.y).min(edge) * 0.5));
+                } else if p.y > clip.max.y - edge {
+                    ui.scroll_with_delta(vec2(0.0, -(p.y - clip.max.y + edge).min(edge) * 0.5));
+                }
+            }
+            let label = if d.pages.len() == 1 { format!("Page {}", d.pages[0] + 1) } else { format!("{} pages", d.pages.len()) };
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("greenline-page-drag")));
+            let galley = painter.layout_no_wrap(label, FontId::proportional(13.0), Color32::WHITE);
+            let r = Rect::from_min_size(p + vec2(14.0, 10.0), galley.size() + vec2(14.0, 8.0));
+            painter.rect_filled(r, 4.0, accent);
+            painter.galley(r.min + vec2(7.0, 4.0), galley, Color32::WHITE);
+        }
+    }
+
+    /// Pages dropped: moved where marked (nowhere if the pointer left the pages).
+    fn finish_page_drag(&mut self, ctx: &egui::Context) {
+        if self.page_drag.is_none() || ctx.input(|i| i.pointer.primary_down()) {
+            return;
+        }
+        let d = self.page_drag.take().unwrap();
+        if let Some(to) = d.to {
+            self.move_pages(&d.pages, to);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Thumbnails, overview, markup list
 
     fn markup_count(&self, page: usize) -> usize {
@@ -5224,9 +5899,14 @@ impl App {
             area = area.vertical_scroll_offset(top);
             self.sidebar_synced = Some(cur);
         }
+        if let Some(d) = &mut self.page_drag {
+            d.to = None;
+        }
         area.show_rows(ui, row_h, n, |ui, range| {
+            let gap = ui.spacing().item_spacing.y;
+            let mut slots = Vec::new();
             for i in range {
-                let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click_and_drag());
                 let slot = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(w, slot_h));
                 self.paint_thumb(ui, slot, i, i == cur);
                 ui.painter().text(pos2(rect.center().x, rect.max.y - 9.0), Align2::CENTER_CENTER, (i + 1).to_string(), FontId::proportional(12.0), ui.visuals().text_color());
@@ -5234,7 +5914,12 @@ impl App {
                     self.goto_page(i);
                     self.sidebar_synced = Some(i);
                 }
+                // Drag to move the page; right-click to insert or delete pages.
+                self.page_drop(&resp, rect.expand2(vec2(8.0, gap / 2.0 + 0.5)), i, false);
+                resp.context_menu(|ui| self.page_menu(ui, i));
+                slots.push((i, rect));
             }
+            self.page_drag_marks(ui, &slots, false);
         });
     }
 
@@ -5249,6 +5934,8 @@ impl App {
             self.drag = Drag::Ignore;
         }
         self.overview = !self.overview;
+        self.page_sel.clear();
+        self.page_drag = None;
         if self.overview {
             self.overview_cursor = self.current_page();
             self.overview_scroll = true;
@@ -5288,9 +5975,18 @@ impl App {
         }
         if pressed(Key::Enter) || pressed(Key::Space) {
             self.overview = false;
+            self.page_sel.clear();
             self.goto_page(c);
+        } else if pressed(Key::Escape) && self.page_drag.take().is_some() {
+            // A page drag is cancelled first, then the picked pages let go.
         } else if pressed(Key::Escape) {
-            self.overview = false;
+            if self.page_sel.is_empty() {
+                self.overview = false;
+            }
+            self.page_sel.clear();
+        } else if pressed(Key::Delete) || pressed(Key::Backspace) {
+            let pages = self.pages_for(c);
+            self.delete_pages(&pages);
         }
     }
 
@@ -5317,13 +6013,24 @@ impl App {
             area = area.vertical_scroll_offset(top);
         }
         let mut open = None;
+        if let Some(d) = &mut self.page_drag {
+            d.to = None;
+        }
+        let right = ui.max_rect().max.x;
+        let mods = ui.input(|i| i.modifiers);
         area.show_rows(ui, row_h, rows, |ui, range| {
+            let vgap = ui.spacing().item_spacing.y;
+            let mut slots = Vec::new();
             for row in range {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    for i in row * cols..((row + 1) * cols).min(n) {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(tile, row_h), Sense::click());
+                    let last = ((row + 1) * cols).min(n) - 1;
+                    for i in row * cols..=last {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(tile, row_h), Sense::click_and_drag());
                         let slot = Rect::from_min_size(rect.min + vec2(0.0, 4.0), vec2(tile, slot_h));
+                        if self.page_sel.contains(&i) {
+                            ui.painter().rect_filled(slot.expand(8.0), 6.0, crate::theme::accent(ui.visuals()).gamma_multiply(0.3));
+                        }
                         self.paint_thumb(ui, slot, i, i == cur);
                         let label = match self.markup_count(i) {
                             0 => format!("{}", i + 1),
@@ -5333,15 +6040,39 @@ impl App {
                         if resp.hovered() {
                             ui.painter().rect_stroke(slot.expand(3.0), 3.0, Stroke::new(1.0, ui.visuals().weak_text_color()), egui::StrokeKind::Outside);
                         }
-                        if resp.clicked() {
+                        if resp.clicked() && mods.command {
+                            // Ctrl+click picks pages, Shift+click a run of them, to move or delete together.
+                            if !self.page_sel.remove(&i) {
+                                self.page_sel.insert(i);
+                            }
+                            self.overview_cursor = i;
+                        } else if resp.clicked() && mods.shift {
+                            let (a, b) = (self.overview_cursor.min(i), self.overview_cursor.max(i));
+                            self.page_sel.extend(a..=b);
+                            self.overview_cursor = i;
+                        } else if resp.clicked() {
                             open = Some(i);
                         }
+                        // A right-click outside the picked pages is for that page alone.
+                        if resp.secondary_clicked() && !self.page_sel.contains(&i) {
+                            self.page_sel.clear();
+                        }
+                        // The pointer anywhere in the row past its last page drops at the end of the row.
+                        let mut hit = rect.expand2(vec2(gap / 2.0 + 0.5, vgap / 2.0 + 0.5));
+                        if i == last {
+                            hit.max.x = right;
+                        }
+                        self.page_drop(&resp, hit, i, true);
+                        resp.context_menu(|ui| self.page_menu(ui, i));
+                        slots.push((i, slot));
                     }
                 });
             }
+            self.page_drag_marks(ui, &slots, true);
         });
         if let Some(i) = open {
             self.overview = false;
+            self.page_sel.clear();
             self.goto_page(i);
         }
     }
@@ -5657,6 +6388,8 @@ impl App {
                     ("S / O / M / I", "Page thumbnails / overview of all pages / markup list / stamps"),
                     ("Ctrl+G / Ctrl+Shift+G", "Group / ungroup the selection   ·   Alt+click one piece of a group"),
                     ("In overview", "Arrows move, Enter opens, Ctrl+wheel resizes, O or Esc closes"),
+                    ("Pages", "Drag a thumbnail (sidebar or overview) to move the page; right-click to insert blank pages or pages from another PDF, or delete"),
+                    ("In overview", "Ctrl+click / Shift+click pick pages (Ctrl+A all) to drag or delete (Del) together"),
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
                     ("W / F / G", "Fit width / fit page / go to page"),
@@ -5734,6 +6467,7 @@ impl eframe::App for App {
         self.poll_patterns();
         self.poll_cli();
         while let Ok((stored, target, generation)) = self.pictures.1.try_recv() {
+            self.pictures_in_flight = self.pictures_in_flight.saturating_sub(1);
             self.picture_ready(stored, target, generation);
         }
 
@@ -5847,6 +6581,9 @@ impl eframe::App for App {
         self.goto_overlay(&ctx);
         self.find_bar(&ctx);
         self.new_doc_window(&ctx);
+        self.insert_window(&ctx);
+        self.page_op();
+        self.finish_page_drag(&ctx);
         self.help(&ctx);
         self.request_all_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
@@ -7603,10 +8340,224 @@ mod tests {
             {"op": "callout", "page": 1, "target": [400, 350], "at": [420, 300], "text": "Gap in air barrier", "group": "g"}
         ]);
         let b2 = crate::ops::parse(&ops, &app.pages, 3, 2).unwrap();
-        let mk = |id: &str, b: crate::ops::Batch| proposals::Proposal { id: id.into(), agent: "test".into(), summary: String::new(), created: "2026-11-13T12:00:00-05:00".into(), annots: b.annots, scales: b.scales, accepted_groups: Default::default() };
+        let mk = |id: &str, b: crate::ops::Batch| proposals::Proposal { id: id.into(), agent: "test".into(), summary: String::new(), created: "2026-11-13T12:00:00-05:00".into(), annots: b.annots, scales: b.scales, accepted_groups: Default::default(), layout: 0 };
         let p = Proposals { pdf: dir.join("doc.pdf"), batches: vec![mk("1", b1), mk("2", b2)], seq: 2 };
         std::fs::write(&file, serde_json::to_vec(&p).unwrap()).unwrap();
         (app, dir)
+    }
+
+    /// `app` with pages of these sizes.
+    fn with_pages(mut app: App, sizes: &[Vec2]) -> App {
+        app.pages = sizes.to_vec();
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+        app
+    }
+
+    fn sources(app: &App) -> Vec<String> {
+        app.layout_now()
+            .pages
+            .iter()
+            .map(|p| match &p.src {
+                Src::Source { page } => page.to_string(),
+                Src::Blank { .. } => "b".into(),
+                Src::File { page, .. } => format!("f{page}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pages_move_delete_and_insert_with_their_markups_in_undo_steps() {
+        let sizes = [vec2(600.0, 800.0), vec2(800.0, 600.0), vec2(300.0, 400.0)];
+        let mut app = with_pages(app(), &sizes);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        let on0 = rect(&mut app, 10.0, 10.0);
+        let on2 = app.add(2, Kind::Rect { rect: Rect::from_min_size(pos2(5.0, 5.0), vec2(20.0, 20.0)) });
+        let page_of = |app: &App, id: u64| app.find(id).map(|a| a.page);
+        let g0 = app.generation;
+
+        app.move_pages(&[0], 3);
+        assert_eq!(sources(&app), ["1", "2", "0"]);
+        assert_eq!(app.pages, [sizes[1], sizes[2], sizes[0]], "page sizes go with their pages");
+        assert_eq!((page_of(&app, on0), page_of(&app, on2)), (Some(2), Some(1)), "markups go with their pages");
+        assert_ne!(app.generation, g0, "renders for the old order are told apart");
+
+        app.delete_pages(&[1]);
+        assert_eq!(sources(&app), ["1", "0"]);
+        assert_eq!(page_of(&app, on2), None, "a deleted page's markups go with it");
+        assert_eq!(page_of(&app, on0), Some(1));
+
+        app.insert_blank(1, false);
+        assert_eq!(sources(&app), ["1", "b", "0"]);
+        assert_eq!(app.pages[1], sizes[0], "a blank page is the size of the page it was asked on");
+        assert_eq!(page_of(&app, on0), Some(2));
+
+        app.delete_pages(&[0, 1, 2]);
+        assert_eq!(app.pages.len(), 3, "the last page can't go");
+
+        app.undo();
+        app.undo();
+        assert_eq!(sources(&app), ["1", "2", "0"]);
+        assert_eq!(page_of(&app, on2), Some(1), "undoing a delete brings its markups back");
+        app.undo();
+        assert!(app.layout.is_none(), "back to the PDF's own order");
+        assert_eq!(app.pages, sizes);
+        assert_eq!((page_of(&app, on0), page_of(&app, on2)), (Some(0), Some(2)));
+        app.redo();
+        assert_eq!(sources(&app), ["1", "2", "0"]);
+        assert_eq!(page_of(&app, on0), Some(2));
+    }
+
+    #[test]
+    fn the_overview_picks_pages_to_move_or_delete_together() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 5]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.page_sel = [1, 3].into_iter().collect();
+        assert_eq!(app.pages_for(3), [1, 3], "a drag or menu on a picked page is for all of them");
+        assert_eq!(app.pages_for(0), [0]);
+        app.page_drag = Some(PageDrag { pages: app.pages_for(1), to: Some(0) });
+        app.finish_page_drag(&egui::Context::default());
+        assert_eq!(sources(&app), ["1", "3", "0", "2", "4"]);
+        assert_eq!(app.page_sel, [0, 1].into_iter().collect(), "the picked pages stay picked where they went");
+        app.delete_pages(&app.pages_for(0));
+        assert_eq!(sources(&app), ["0", "2", "4"]);
+        assert!(app.page_sel.is_empty());
+    }
+
+    #[test]
+    fn pages_cant_change_without_autosave() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.read_only = true;
+        app.move_pages(&[0], 2);
+        assert!(app.layout.is_none());
+    }
+
+    #[test]
+    fn proposals_follow_their_pages_and_older_ones_cant_be_accepted() {
+        let (app, dir) = reviewing("pages");
+        let mut app = with_pages(app, &[vec2(600.0, 800.0); 3]);
+        app.poll_proposals(10.0);
+        assert_eq!(app.props.batches[0].annots[0].page, 0);
+        // Saved first, so an agent reading the markups file then counts pages the new way.
+        app.move_pages(&[0], 3);
+        let saved = sidecar::load_file(&dir.join("doc.json")).unwrap();
+        assert_eq!(saved.pages, app.layout);
+        let fp = crate::pages::fingerprint(app.layout.as_ref());
+        let props = proposals::load_file(&dir.join("doc.proposals.json")).unwrap();
+        assert!(props.batches.iter().all(|b| b.layout == fp && b.annots.iter().all(|a| a.page == 2)), "carried to the page's new place");
+        app.settle("1", None, None, true);
+        assert_eq!(app.annots.iter().map(|a| a.page).collect::<Vec<_>>(), [2]);
+
+        // One proposed for the old order meanwhile (read before the move was saved) is refused.
+        proposals::update_file(&dir.join("doc.proposals.json"), &dir.join("doc.pdf"), |p| {
+            p.batches[0].layout = 0;
+            Ok(())
+        })
+        .unwrap();
+        app.reload_proposals();
+        app.settle("2", None, None, true);
+        assert_eq!(app.annots.len(), 1, "not accepted");
+        assert!(app.status.contains("earlier order"), "{}", app.status);
+
+        // Undone: carried back.
+        app.undo();
+        app.undo();
+        assert!(app.layout.is_none());
+        let props = proposals::load_file(&dir.join("doc.proposals.json")).unwrap();
+        assert_eq!(props.batches[0].layout, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_page_with_proposals_on_it_undoes_with_them() {
+        let (app, dir) = reviewing("delete");
+        let mut app = with_pages(app, &[vec2(600.0, 800.0); 2]);
+        app.poll_proposals(10.0);
+        let before = app.props.count();
+        app.delete_pages(&[0]);
+        assert_eq!(app.props.count(), 0, "their page is gone");
+        app.undo();
+        assert_eq!(app.props.count(), before, "and back with it");
+        assert!(app.props.batches.iter().all(|b| b.layout == 0 && b.annots.iter().all(|a| a.page == 0)));
+        app.redo();
+        assert_eq!(app.props.count(), 0);
+        app.undo();
+        assert_eq!(app.props.count(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn markups_past_the_last_page_stay_past_it() {
+        // Markups for page 3 of a PDF that now has two.
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        let lost = app.add(2, Kind::Rect { rect: Rect::from_min_size(pos2(5.0, 5.0), vec2(20.0, 20.0)) });
+        app.insert_blank(1, true);
+        assert_eq!(app.pages.len(), 3);
+        assert_eq!(app.find(lost).map(|a| a.page), Some(3), "not on the page just added");
+        app.delete_pages(&[0]);
+        assert_eq!(app.find(lost).map(|a| a.page), Some(2));
+    }
+
+    #[test]
+    fn gestures_dont_outlive_their_pages() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.insert_blank(1, true);
+        // Drawing on the page just added when its insert is undone.
+        app.drag = Drag::Create { page: 2, start: pos2(10.0, 10.0), cur: pos2(50.0, 50.0) };
+        app.undo();
+        assert_eq!(app.pages.len(), 2);
+        assert!(matches!(app.drag, Drag::Ignore), "the rest of the gesture is swallowed");
+
+        // Esc drops pages being dragged.
+        app.page_drag = Some(PageDrag { pages: vec![0], to: Some(2) });
+        app.escape();
+        app.finish_page_drag(&egui::Context::default());
+        assert!(app.layout.is_none(), "nothing moved");
+
+        // A PDF read for inserting is only taken for the request it answers.
+        let anchor = app.anchor(0, false).unwrap();
+        app.inserting = Some((PathBuf::from("/nowhere/set.pdf"), anchor, PathBuf::from("/a.pdf")));
+        app.probed(PathBuf::from("/b.pdf"), Ok(("x.pdf".into(), vec![vec2(1.0, 1.0)])));
+        assert!(app.insert_win.is_none() && app.inserting.is_some());
+        app.probed(PathBuf::from("/a.pdf"), Ok(("x.pdf".into(), vec![vec2(1.0, 1.0)])));
+        assert!(app.insert_win.is_some());
+
+        // An image dropped on a sheet and still being stored when pages move is let go.
+        app.pictures_in_flight = 1;
+        let epoch = app.picture_epoch;
+        app.move_pages(&[0], 2);
+        assert_ne!(app.picture_epoch, epoch);
+        assert!(app.status.contains("drop it again"));
+
+        // The PDF gone when rearranging: markups stop saving, and it says so.
+        let g = app.generation;
+        app.relayout_failed(g, "not found".into());
+        assert!(app.read_only && app.read_only_why.contains("reopen"));
+        assert!(app.path.is_some(), "still open, its markups shown");
+    }
+
+    #[test]
+    fn picked_pages_stay_with_their_pane() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 4]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.toggle_split();
+        app.page_sel = [0, 2].into_iter().collect();
+        app.page_drag = Some(PageDrag { pages: vec![0, 2], to: Some(4) });
+        app.activate_other();
+        assert!(app.page_sel.is_empty() && app.page_drag.is_none());
+    }
+
+    #[test]
+    fn a_page_menu_choice_waits_for_the_thumbnails() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.page_op = Some(PageOp::Delete(vec![0]));
+        assert_eq!(app.pages.len(), 2);
+        app.page_op();
+        assert_eq!(app.pages.len(), 1);
+        assert!(app.page_op.is_none());
     }
 
     #[test]
