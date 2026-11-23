@@ -354,53 +354,71 @@ fn arrange_file(src: &Path, layout: &Layout, out: &Path, files_dir: &Path) -> an
     let n = unsafe { b.FPDF_GetPageCount(doc.1) }.max(0) as usize;
     let mut layout = layout.clone();
     layout.fit(n);
-    let mut order: Vec<c_int> = Vec::with_capacity(layout.pages.len());
+    // Each page's index in the document once everything is added at the end.
+    let mut order: Vec<Option<c_int>> = vec![None; layout.pages.len()];
     let mut count = n;
     let mut used = HashSet::new();
-    let mut again: Option<RawDoc> = None;
-    let mut files: HashMap<String, Option<RawDoc>> = HashMap::new();
     let failed = || anyhow::anyhow!("couldn't arrange the pages");
-    for p in &layout.pages {
-        // A page from another document (or the source again), imported at the end.
-        let import = |from: &RawDoc, page: usize| -> anyhow::Result<()> {
-            let idx = page as c_int;
-            if !b.is_true(unsafe { b.FPDF_ImportPagesByIndex(doc.1, from.1, &idx, 1, count as c_int) }) {
-                return Err(failed());
-            }
-            Ok(())
-        };
-        let blank = |s: Vec2| -> anyhow::Result<()> {
-            let page = unsafe { b.FPDFPage_New(doc.1, count as c_int, s.x as f64, s.y as f64) };
-            if page.is_null() {
-                return Err(failed());
-            }
-            unsafe { b.FPDF_ClosePage(page) };
-            Ok(())
-        };
-        match &p.src {
+    // Pages from another document (or the source again), by document in order
+    // first asked for: imported together, so resources they share (fonts,
+    // images) come in once. (PDFium drops links among imported pages either way.)
+    // By document (`None`: the source): the arranged position and page of each.
+    type Wanted<'k> = Vec<(Option<&'k str>, Vec<(usize, usize)>)>;
+    let mut wanted: Wanted = Vec::new();
+    for (t, p) in layout.pages.iter().enumerate() {
+        let (key, page) = match &p.src {
             Src::Source { page } if *page < n && used.insert(*page) => {
-                order.push(*page as c_int);
+                order[t] = Some(*page as c_int);
                 continue;
             }
-            Src::Source { page } if *page < n => {
-                if again.is_none() {
-                    again = Some(raw_open(b, src).ok_or_else(failed)?);
-                }
-                import(again.as_ref().unwrap(), *page)?;
-            }
-            Src::Source { .. } => blank(MISSING)?,
-            Src::Blank { width, height } => blank(vec2(*width, *height))?,
-            Src::File { file, page, .. } => {
-                let from = files.entry(file.clone()).or_insert_with(|| raw_open(b, &files_dir.join(file)));
-                match from {
-                    Some(f) if (*page as c_int) < unsafe { b.FPDF_GetPageCount(f.1) } => import(f, *page)?,
-                    _ => blank(MISSING)?,
-                }
-            }
+            Src::Source { page } if *page < n => (None, *page),
+            Src::File { file, page, .. } => (Some(file.as_str()), *page),
+            _ => continue,
+        };
+        match wanted.iter_mut().find(|w| w.0 == key) {
+            Some(w) => w.1.push((t, page)),
+            None => wanted.push((key, vec![(t, page)])),
         }
-        order.push(count as c_int);
+    }
+    for (key, pages) in &wanted {
+        let from = match key {
+            None => raw_open(b, src),
+            Some(file) => raw_open(b, &files_dir.join(file)),
+        };
+        let Some(from) = from else { continue };
+        let there = unsafe { b.FPDF_GetPageCount(from.1) }.max(0) as usize;
+        // Pages it lacks are made blank below.
+        let pages: Vec<(usize, usize)> = pages.iter().copied().filter(|(_, pg)| *pg < there).collect();
+        if pages.is_empty() {
+            continue;
+        }
+        let idx: Vec<c_int> = pages.iter().map(|(_, pg)| *pg as c_int).collect();
+        if !b.is_true(unsafe { b.FPDF_ImportPagesByIndex(doc.1, from.1, idx.as_ptr(), idx.len() as c_ulong, count as c_int) }) {
+            return Err(failed());
+        }
+        for (t, _) in pages {
+            order[t] = Some(count as c_int);
+            count += 1;
+        }
+    }
+    // Blank pages, and blanks for pages whose source is gone.
+    for (t, p) in layout.pages.iter().enumerate() {
+        if order[t].is_some() {
+            continue;
+        }
+        let s = match &p.src {
+            Src::Blank { width, height } => vec2(*width, *height),
+            _ => MISSING,
+        };
+        let page = unsafe { b.FPDFPage_New(doc.1, count as c_int, s.x as f64, s.y as f64) };
+        if page.is_null() {
+            return Err(failed());
+        }
+        unsafe { b.FPDF_ClosePage(page) };
+        order[t] = Some(count as c_int);
         count += 1;
     }
+    let order: Vec<c_int> = order.into_iter().flatten().collect();
     if !order.is_empty() && !b.is_true(unsafe { b.FPDF_MovePages(doc.1, order.as_ptr(), order.len() as c_ulong, 0) }) {
         return Err(failed());
     }
@@ -579,6 +597,16 @@ mod tests {
         assert_eq!(dest(&doc, 1), 0);
         drop(doc);
         assert!(tmp.is_some());
+
+        // Another PDF inserted whole (here, the same one): the set's own links still hold. (PDFium's
+        // import drops links among the pages it brings in, however many come in one import.)
+        let srcs = (0..3).map(|page| Src::File { file: "linked.pdf".into(), name: "linked.pdf".into(), page }).collect();
+        let l = insert_pages(&Layout::identity(3), 3, srcs);
+        arrange_file(&src, &l, &dir.join("inserted.pdf"), &dir).unwrap();
+        let doc = pdfium.load_pdf_from_file(&dir.join("inserted.pdf"), None).unwrap();
+        assert_eq!(doc.pages().len(), 6);
+        assert_eq!(dest(&doc, 0), 2);
+        drop(doc);
 
         // In the PDF's own order: the PDF itself, nothing written.
         let (doc, tmp) = open_to_write(pdfium, &src, Some(&Layout::identity(3)), &dir.join("same.pdf")).unwrap();
