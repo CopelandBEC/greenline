@@ -507,8 +507,8 @@ pub struct App {
     page_drag: Option<PageDrag>,
     /// A page menu's choice, made after the thumbnails are drawn.
     page_op: Option<PageOp>,
-    /// A PDF being read to insert pages from: the document, and where they go.
-    inserting: Option<(PathBuf, Anchor)>,
+    /// A PDF being read to insert pages from: the document, where they go, and the PDF.
+    inserting: Option<(PathBuf, Anchor, PathBuf)>,
     /// The window for choosing which of its pages to insert.
     insert_win: Option<InsertWin>,
     /// Measurement (or calibration line) being clicked out: its page and points so far.
@@ -1629,9 +1629,10 @@ impl App {
                 }
             }
             Pick::InsertPages(anchor) => {
-                if let (Some(file), Some(doc), Some(w)) = (paths.into_iter().next(), self.path.clone(), &self.worker) {
-                    w.send(Req::Probe { path: file });
-                    self.inserting = Some((doc, anchor));
+                // One at a time: a second couldn't be told from the first when read.
+                if let (Some(file), Some(doc), Some(w), None) = (paths.into_iter().next(), self.path.clone(), &self.worker, &self.inserting) {
+                    w.send(Req::Probe { path: file.clone() });
+                    self.inserting = Some((doc, anchor, file));
                     self.status = "Reading the PDF…".into();
                     self.status_until = f64::INFINITY;
                 }
@@ -2960,6 +2961,15 @@ impl App {
     /// Puts back the markups, scales (and arrangement) of an undo or redo step;
     /// the step that takes them back again.
     fn restore(&mut self, (annots, scales, pages): Step) -> Step {
+        // A gesture under way holds pages by their number: cancel it before they change.
+        if pages.is_some() {
+            if !matches!(self.drag, Drag::None | Drag::Ignore) {
+                if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
+                    self.annots = before;
+                }
+            }
+            self.page_drag = None;
+        }
         let annots = std::mem::replace(&mut self.annots, annots);
         let scales = std::mem::replace(&mut self.scales, scales);
         self.selected.clear();
@@ -3320,6 +3330,10 @@ impl App {
     /// Esc: cancels a gesture, then closes the find bar, drops a placement or a
     /// scale tool, clears the selection, and finally returns to Select.
     fn escape(&mut self) {
+        // Pages being dragged stay where they are.
+        if self.page_drag.take().is_some() {
+            return;
+        }
         // Cancel any gesture in progress (the rest of it is swallowed until release).
         let mut cancelled = false;
         if let Drag::Move { before, .. } | Drag::Handle { before, .. } = std::mem::replace(&mut self.drag, Drag::Ignore) {
@@ -5586,6 +5600,10 @@ impl App {
         if !self.can_arrange() {
             return;
         }
+        if self.inserting.is_some() {
+            self.toast("Still reading the last PDF picked: a moment".into());
+            return;
+        }
         if let Some(a) = self.anchor(i, after) {
             self.ask = Some(Pick::InsertPages(a));
         }
@@ -5593,7 +5611,10 @@ impl App {
 
     /// The PDF to insert pages from was read: which of its pages?
     fn probed(&mut self, file: PathBuf, r: Result<(String, Vec<Vec2>), String>) {
-        let Some((doc, anchor)) = self.inserting.take() else { return };
+        if self.inserting.as_ref().is_none_or(|i| i.2 != file) {
+            return;
+        }
+        let Some((doc, anchor, _)) = self.inserting.take() else { return };
         self.status_until = f64::NAN;
         if self.path.as_ref() != Some(&doc) {
             return;
@@ -5925,8 +5946,9 @@ impl App {
             self.overview = false;
             self.page_sel.clear();
             self.goto_page(c);
+        } else if pressed(Key::Escape) && self.page_drag.take().is_some() {
+            // A page drag is cancelled first, then the picked pages let go.
         } else if pressed(Key::Escape) {
-            // Picked pages are let go first.
             if self.page_sel.is_empty() {
                 self.overview = false;
             }
@@ -8443,6 +8465,32 @@ mod tests {
         assert_eq!(app.find(lost).map(|a| a.page), Some(3), "not on the page just added");
         app.delete_pages(&[0]);
         assert_eq!(app.find(lost).map(|a| a.page), Some(2));
+    }
+
+    #[test]
+    fn gestures_dont_outlive_their_pages() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 2]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.insert_blank(1, true);
+        // Drawing on the page just added when its insert is undone.
+        app.drag = Drag::Create { page: 2, start: pos2(10.0, 10.0), cur: pos2(50.0, 50.0) };
+        app.undo();
+        assert_eq!(app.pages.len(), 2);
+        assert!(matches!(app.drag, Drag::Ignore), "the rest of the gesture is swallowed");
+
+        // Esc drops pages being dragged.
+        app.page_drag = Some(PageDrag { pages: vec![0], to: Some(2) });
+        app.escape();
+        app.finish_page_drag(&egui::Context::default());
+        assert!(app.layout.is_none(), "nothing moved");
+
+        // A PDF read for inserting is only taken for the request it answers.
+        let anchor = app.anchor(0, false).unwrap();
+        app.inserting = Some((PathBuf::from("/nowhere/set.pdf"), anchor, PathBuf::from("/a.pdf")));
+        app.probed(PathBuf::from("/b.pdf"), Ok(("x.pdf".into(), vec![vec2(1.0, 1.0)])));
+        assert!(app.insert_win.is_none() && app.inserting.is_some());
+        app.probed(PathBuf::from("/a.pdf"), Ok(("x.pdf".into(), vec![vec2(1.0, 1.0)])));
+        assert!(app.insert_win.is_some());
     }
 
     #[test]
