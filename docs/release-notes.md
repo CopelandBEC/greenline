@@ -1,6 +1,6 @@
-Greenline 2.0.0-rc.1 — fast PDF markup for drawing, spec and deck review. **Release candidate:** for trying out before 2.0; report anything odd to the team.
+Greenline 2.0.0 — fast PDF markup for drawing, spec and deck review.
 
-**Install (Windows 10/11, 64-bit):** download `Greenline-2.0.0-rc.1-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
+**Install (Windows 10/11, 64-bit):** download `Greenline-2.0.0-setup.exe` below and run it. No admin rights needed; it installs for you only. Installing over Redline or an earlier Greenline keeps your markups.
 Because the installer isn't code-signed yet, Windows may show "Windows protected your PC": click **More info → Run anyway**.
 
 **New in 2.0**
@@ -28,7 +28,6 @@ Because the installer isn't code-signed yet, Windows may show "Windows protected
   - Busy sheets paint several times faster.
   - Autosave, image decoding and the pattern library load off the main thread.
   - Exports and smaller copies run in a process of their own, so you can keep reviewing meanwhile.
-- For agents: page numbers follow the reviewer's arrangement (`info` says where each page came from), and proposals made for an earlier order can't be accepted into a new one.
-- For agents: `greenline-cli` ops gain `polyline`, `polygon`, `fill`, `line`, `hatch`, `bold`/`italic`/`underline` (for the whole note or a list of its words), `greenline-cli patterns` lists the library, and `greenline-cli shrink` makes a smaller copy.
+- For agents: page numbers follow the reviewer's arrangement (`info` says where each page came from), and proposals made for an earlier order can't be accepted into a new one. `greenline-cli` ops gain `polyline`, `polygon`, `fill`, `line`, `hatch`, `bold`/`italic`/`underline` (for the whole note or a list of its words), `greenline-cli patterns` lists the library, and `greenline-cli shrink` makes a smaller copy.
 
 Press `F1` in the app for all shortcuts, your name on exported comments, appearance, and the pattern library folder.
