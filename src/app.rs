@@ -2362,6 +2362,10 @@ impl App {
         self.commit_edit();
         self.drag = Drag::None;
         self.building = None;
+        // Pages picked or dragged belong to the pane being left (maybe another document).
+        self.page_sel.clear();
+        self.page_drag = None;
+        self.page_op = None;
         let tab = pane.doc.and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
         match tab.and_then(|k| self.tabs[k].parked.take().map(|p| (k, p))) {
             Some((k, mut p)) => {
@@ -8532,6 +8536,17 @@ mod tests {
         app.relayout_failed(g, "not found".into());
         assert!(app.read_only && app.read_only_why.contains("reopen"));
         assert!(app.path.is_some(), "still open, its markups shown");
+    }
+
+    #[test]
+    fn picked_pages_stay_with_their_pane() {
+        let mut app = with_pages(app(), &[vec2(600.0, 800.0); 4]);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.toggle_split();
+        app.page_sel = [0, 2].into_iter().collect();
+        app.page_drag = Some(PageDrag { pages: vec![0, 2], to: Some(4) });
+        app.activate_other();
+        assert!(app.page_sel.is_empty() && app.page_drag.is_none());
     }
 
     #[test]
