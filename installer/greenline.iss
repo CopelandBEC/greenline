@@ -1,15 +1,15 @@
 ; Inno Setup script for the Windows installer. Built by .github/workflows/build.yml:
-;   iscc /DAppVersion=2.0.0-rc.1 /DAppNumVersion=2.0.0 installer\greenline.iss
+;   iscc /DAppVersion=2.1.0-rc.1 /DAppNumVersion=2.1.0 installer\greenline.iss
 ; Per-user install (no admin rights needed).
 ; The app was called Redline before 1.3. AppId is unchanged so this upgrades
 ; that install; [InstallDelete] and the deletekey entries clear its leftovers.
 
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.1.0-rc.1"
 #endif
 ; Windows file versions are numbers only: the version without a pre-release tag.
 #ifndef AppNumVersion
-  #define AppNumVersion "2.0.0"
+  #define AppNumVersion "2.1.0"
 #endif
 
 [Setup]
