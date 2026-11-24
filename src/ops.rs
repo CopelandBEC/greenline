@@ -41,6 +41,10 @@ share a name, write "library/name" (built-ins are "built-in/dashed").
         leader arrow to "target" (and to each of "targets"); "at" is the note box's
         top-left; the box wraps at "box_width" (default 16 x size) and shrinks to fit
   {"op": "text",      "page": 4, "at": [x, y], "text": "...", "box_width": 200}
+        callouts and text boxes also take "box_height" (a box that tall, at "box_width",
+        kept that size; "fit": true sizes the text to the biggest that fits it),
+        "align" (left, center, right) and "valign" (top, middle, bottom: the text in a
+        box taller than it)
   {"op": "length",    "page": 4, "points": [[x, y], [x, y], ...], "name": "Sill"}
   {"op": "area",      "page": 4, "rect": [...] | "points": [[x, y], ...], "name": "W1"}
         measurements: the value (12'-6", 15.00 sf) comes from the page's scale and is
@@ -199,9 +203,37 @@ pub fn parse(ops: &Value, pages: &[Vec2], first_id: u64, first_group: u64) -> Re
         } else if f.o.contains_key("hatch_scale") {
             return Err(ctx("\"hatch_scale\" goes with \"hatch\"".into()));
         }
+        // A note's box and alignment.
+        let note_keys = ["box_height", "fit", "align", "valign"];
+        if !is_note {
+            if let Some(k) = note_keys.iter().find(|k| f.o.contains_key(**k)) {
+                return Err(ctx(format!("\"{k}\" is for callouts and text boxes")));
+            }
+        }
+        if let Some(v) = f.o.get("align").filter(|v| !v.is_null()) {
+            a.style.align = serde_json::from_value(v.clone()).map_err(|_| ctx("\"align\" must be left, center or right".into()))?;
+        }
+        if let Some(v) = f.o.get("valign").filter(|v| !v.is_null()) {
+            a.style.valign = serde_json::from_value(v.clone()).map_err(|_| ctx("\"valign\" must be top, middle or bottom".into()))?;
+        }
+        if let Some(h) = f.num("box_height").map_err(ctx)? {
+            let size = a.text_size().unwrap_or(12.0);
+            let least = 2.0 * annot::pad(size) + annot::line_h(size);
+            if h < least {
+                return Err(ctx(format!("\"box_height\" must be at least {least} points (a line of text at this size)")));
+            }
+            a.style.box_h = Some(h);
+        }
         if let Kind::Callout { box_w, .. } | Kind::Text { box_w, .. } = a.kind {
             a.wrap_w = Some(box_w);
             a.fit_box_w();
+        }
+        match f.o.get("fit") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                a.fit_text_to_box();
+            }
+            Some(_) => return Err(ctx("\"fit\" must be true or false".into())),
         }
         batch.annots.push(a);
     }
@@ -338,8 +370,8 @@ impl Fields<'_> {
 
     fn size(&self, default: f32) -> Result<f32, String> {
         let s = self.num_or("size", default)?;
-        if !(4.0..=72.0).contains(&s) {
-            return Err("\"size\" must be 4 to 72 points".into());
+        if !(annot::TEXT_SIZE_MIN..=annot::TEXT_SIZE_MAX).contains(&s) {
+            return Err(format!("\"size\" must be {} to {} points", annot::TEXT_SIZE_MIN, annot::TEXT_SIZE_MAX));
         }
         Ok(s)
     }
@@ -556,6 +588,9 @@ mod tests {
         assert!(bad(json!([{"op": "cloud", "page": 1, "rect": [0, 0, 10, 10]}, {"op": "cloud", "page": 1, "rect": [0, 0, 900, 10]}])).starts_with("op 2 (cloud): "));
         assert!(bad(json!([{"op": "callout", "page": 1, "target": [5, 5], "at": [50, 50], "text": " "}])).contains("empty"));
         assert!(bad(json!([{"op": "circle", "page": 1}])).contains("unknown op"));
+        assert!(bad(json!([{"op": "rect", "page": 1, "rect": [0, 0, 10, 10], "align": "center"}])).contains("for callouts and text boxes"));
+        assert!(bad(json!([{"op": "text", "page": 1, "at": [0, 0], "text": "x", "align": "middle"}])).contains("left, center or right"));
+        assert!(bad(json!([{"op": "text", "page": 1, "at": [0, 0], "text": "x", "box_height": 2}])).contains("at least"));
         assert!(bad(json!([{"op": "rect", "page": 1, "rect": [0, 0, 10, 10], "color": "teal"}])).contains("unknown colour"));
         assert!(bad(json!([{"op": "scale", "page": 1, "preset": "1/5\" = 1'"}])).contains("unknown preset"));
         assert!(bad(json!([])).contains("no ops"));

@@ -18,6 +18,16 @@ Because the installer isn't code-signed yet, Windows may show "Windows protected
 - **Tabs.** Opening another PDF opens it in a tab. `Ctrl+Tab`/`Ctrl+Shift+Tab` switch, `Ctrl+W` or middle-click closes, drag a tab to move it; each keeps its own markups, view and undo.
 - **Split screen (`\`).** Two places side by side, each with its own zoom: compare a plan with its details, or two documents. Click a pane (or scroll in it) to work there; pick a tab while a pane is active to show another document in it. The other document's tab is marked ⬌.
 - **Per-word formatting.** While typing a note, `Ctrl+B` / `I` / `U` (or **B I U**) format the words selected, or what you type next. Outside the note they still format the whole of the selected notes.
+- **Right-click a page** in the thumbnails or overview to open it in a **new tab** (another view of the same document, sharing its markups; tabs on one document show their page) or in **split view**.
+- **Exports say they're done:** a notice in the corner names the file, with **Open** and **Show in folder** (PDF exports, smaller copies, comment and measurement lists). A failed export stays up until closed.
+- **Copy and paste markups:** `Ctrl+C` / `Ctrl+X` / `Ctrl+V` paste where the pointer is, also into another tab. Text copied from another program pastes as a note.
+- **Text sizes from 4 to 72 pt:** type or drag any size in the toolbar, with presets in its ⏷ menu.
+- **Note boxes take a height:** drag a note's bottom edge or corner (or draw the box with `T`), and **Fit text to box** sizes the text to the biggest that fits it. Text **aligns** left, centre or right, and top, middle or bottom.
+- **Arrange:** line selected markups up by their left, centre, right, top, middle or bottom (one on its own lines up with the page), or **centre them on the page**.
+- **Shift keeps it straight:** lines, arrows, measurements and moves go across, up and down, or at 45°.
+- Notes running off the edge of a page still show past it.
+- **`Shift+I` inserts an image.**
+- A note placed with a click (`T`) now starts its text at the click, not below it.
 - **Smaller files.** **Export → Smaller copy** writes `<name>_smaller.pdf` with big scans and photos brought down to 200 dpi and recompressed, and names any page worth a second look; the original is never changed. Placed photos now go into exports as compact JPEGs.
 - **A softer look.** Dark mode in soft, slightly cool grays with off-white text instead of near-black, and in both modes soft shadows under pages, thumbnails and dialogs give a little depth. Light, dark or follow the system in `F1`.
 - **Faster all round.**

@@ -98,7 +98,7 @@ const TOOLS: [(Tool, &str, Key); 13] = [
 ];
 
 const COLOR_KEYS: [Key; 6] = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6];
-const TEXT_SIZES: [f32; 6] = [8.0, 10.0, 12.0, 14.0, 18.0, 24.0];
+const TEXT_SIZES: [f32; 12] = [4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 18.0, 24.0, 32.0, 40.0, 54.0, 72.0];
 /// Colour of placed dates.
 const DATE_COLOR: Rgb = COLORS[3].0;
 
@@ -124,6 +124,10 @@ enum Handle {
     /// Rect corner; holds the fixed opposite corner.
     Corner(Pos2),
     BoxWidth,
+    /// A note box's bottom edge: sets its height.
+    BoxHeight,
+    /// A note box's bottom-right corner: width and height.
+    BoxSize,
     Anchor,
     /// Tip of a callout's extra leader, by index in its `leaders`.
     Leader(usize),
@@ -139,7 +143,8 @@ enum Drag {
     Create { page: usize, start: Pos2, cur: Pos2 },
     Pen { page: usize, pts: Vec<Pos2> },
     /// Moves the selected markups on `page` together.
-    Move { page: usize, ids: Vec<u64>, last: Pos2, before: Vec<Annot>, moved: bool },
+    /// `start`: where it began (Shift keeps the move straight from there); `last`: where the markups were last moved to.
+    Move { page: usize, ids: Vec<u64>, start: Pos2, last: Pos2, before: Vec<Annot>, moved: bool },
     Handle { id: u64, handle: Handle, before: Vec<Annot> },
     /// Rubber-band selection; adds whatever it crosses on release.
     Marquee { page: usize, start: Pos2, cur: Pos2 },
@@ -167,7 +172,7 @@ struct Mods {
     /// Ctrl (Cmd) without Shift: with one callout selected, clicking empty
     /// space adds a leader there.
     ctrl: bool,
-    /// Shift: square a measurement's next point to the last one.
+    /// Shift: keep a line, a measurement's next point or a move straight: across, up and down, or at 45°.
     shift: bool,
 }
 
@@ -282,6 +287,19 @@ struct Pane {
     doc: Option<u64>,
     /// Its view of the shown document (unused while it shows another tab).
     view: View,
+    /// A page to bring into view when it's next drawn (after fitting a new view).
+    page: Option<usize>,
+}
+
+/// A finished export (or one that failed), shown in the window's corner.
+struct Notice {
+    title: String,
+    body: String,
+    /// The file written, to open or show in its folder.
+    file: Option<PathBuf>,
+    ok: bool,
+    /// When it goes: NaN until first shown; failures stay until closed.
+    until: f64,
 }
 
 /// Where pages are to be inserted: before or after this page (found again by
@@ -302,6 +320,9 @@ struct PageDrag {
 /// A change asked for from a page's menu, made once the thumbnails are drawn
 /// (they're drawn from the page list it changes).
 enum PageOp {
+    /// Open the page in a tab of its own / in split view.
+    Tab(usize),
+    Split(usize),
     Blank(usize, bool),
     FromFile(usize, bool),
     Delete(Vec<usize>),
@@ -355,9 +376,15 @@ struct Wanted {
     reqs: Vec<Req>,
 }
 
-/// An open document's place in the tab strip; the shown tab's state is in `App`.
+/// A place in the tab strip; the shown tab's state is in `App`. A document
+/// may have several tabs, each its own view of it: its state is with the one
+/// shown, or else with one of them (`parked`), the others holding only their
+/// view (`view_of`).
+#[derive(Default)]
 struct Tab {
     parked: Option<Box<Parked>>,
+    /// Another tab's document (by generation), seen from a place of its own.
+    view_of: Option<(u64, View)>,
 }
 
 /// Moves `m`'s entries to new keys (`None`: dropped).
@@ -565,6 +592,8 @@ pub struct App {
     tool_hatch: HashMap<Tool, HatchFill>,
     /// Bold, italic, underline for new notes.
     text_format: [bool; 3],
+    /// Alignment for new notes: across, and up and down.
+    text_align: (annot::HAlign, annot::VAlign),
     /// The characters selected in the note being typed (the cursor, when equal).
     edit_sel: Option<std::ops::Range<usize>>,
     /// Formatting for what's typed next at the cursor (B / I / U with nothing selected).
@@ -590,6 +619,9 @@ pub struct App {
     edit_needs_focus: bool,
     goto: Option<String>,
     show_help: bool,
+    notice: Option<Notice>,
+    /// Markups copied (Ctrl+C), with the text put on the clipboard for them.
+    clip: Option<(String, Vec<Annot>)>,
 
     library: stamps::Library,
     /// Library images as textures, by stored name; `tex_failed` ones won't load.
@@ -726,7 +758,7 @@ impl App {
             queued_pictures: Default::default(),
             picture_epoch: 0,
             pictures_in_flight: 0,
-            tabs: vec![Tab { parked: None }],
+            tabs: vec![Tab::default()],
             cur_tab: 0,
             title_dirty: false,
             last_generation: 0,
@@ -747,6 +779,7 @@ impl App {
             tool_line: HashMap::new(),
             tool_hatch: HashMap::new(),
             text_format: [false; 3],
+            text_align: Default::default(),
             edit_sel: None,
             typing: None,
             patterns: patterns::Library::builtins(),
@@ -763,6 +796,8 @@ impl App {
             edit_needs_focus: false,
             goto: None,
             show_help: false,
+            notice: None,
+            clip: None,
             library: stamps::Library::default(),
             textures: HashMap::new(),
             tex_failed: HashSet::new(),
@@ -932,6 +967,12 @@ impl App {
     /// Lets go of rendered pages kept for background tabs beyond the latest
     /// `TEX_TABS` (not the one split screen's other pane shows).
     fn trim_parked_tex(&mut self) {
+        // Other views of documents not shown render again when they're shown.
+        let current = self.generation;
+        for (_, v) in self.tabs.iter_mut().filter_map(|t| t.view_of.as_mut()).filter(|v| v.0 != current) {
+            v.base.clear();
+            v.patch.clear();
+        }
         let shown = self.other.as_ref().and_then(|p| p.doc);
         let has = |p: &Parked| !p.view.base.is_empty() || !p.view.patch.is_empty() || !p.thumbs.is_empty();
         let mut seqs: Vec<u64> = self.tabs.iter().filter_map(|t| t.parked.as_deref()).filter(|p| has(p) && Some(p.generation) != shown).map(|p| p.parked_seq).collect();
@@ -946,10 +987,90 @@ impl App {
         }
     }
 
+    /// The document tab `i` shows, by generation (`None` for an empty tab).
+    fn tab_doc(&self, i: usize) -> Option<u64> {
+        if i == self.cur_tab {
+            return self.path.as_ref().map(|_| self.generation);
+        }
+        let t = self.tabs.get(i)?;
+        t.parked.as_ref().map(|p| p.generation).or(t.view_of.as_ref().map(|v| v.0))
+    }
+
+    /// Whether tabs `i` and `k` show one document. (Of a document's tabs, one
+    /// holds it and the others are views of it, so one of the two is a view.)
+    fn same_doc(&self, i: usize, k: usize) -> bool {
+        let view = |t: usize| self.tabs.get(t).is_some_and(|t| t.view_of.is_some());
+        i != k && (view(i) || view(k)) && self.tab_doc(i).is_some() && self.tab_doc(i) == self.tab_doc(k)
+    }
+
+    /// A background document's state, by generation.
+    fn parked_doc(&self, g: u64) -> Option<&Parked> {
+        self.tabs.iter().filter_map(|t| t.parked.as_deref()).find(|p| p.generation == g)
+    }
+
+    /// Opens page `page` of the shown document in a tab of its own, beside
+    /// this one: another view of it, sharing its markups.
+    fn open_page_in_tab(&mut self, page: usize) {
+        if self.path.is_none() || page >= self.pages.len() {
+            return;
+        }
+        let id = self.new_view_id();
+        let view = View { id, zoom: self.zoom, offset: self.offset, canvas: self.canvas, ..Default::default() };
+        self.tabs.insert(self.cur_tab + 1, Tab { parked: None, view_of: Some((self.generation, view)) });
+        self.trade_view(self.cur_tab + 1);
+        self.goto_page(page);
+    }
+
+    /// Shows tab `i`, another view of the shown document: the two trade
+    /// views, this one keeping only its view.
+    fn trade_view(&mut self, i: usize) {
+        if matches!(self.drag, Drag::Move { .. } | Drag::Handle { .. }) {
+            self.end_drag();
+        }
+        self.commit_edit();
+        let Some((g, mut v)) = self.tabs[i].view_of.take() else { return };
+        self.swap_view(&mut v);
+        // Renders on their way for the view left are dropped: asked for again when it's shown.
+        v.req_base.clear();
+        v.req_patch.clear();
+        self.tabs[self.cur_tab].view_of = Some((g, v));
+        self.cur_tab = i;
+        self.drag = Drag::None;
+        self.building = None;
+        self.overview = false;
+        self.sidebar_synced = None;
+        self.set_title();
+    }
+
+    /// Tab `i` (another view of a background document) takes that document's
+    /// state from the tab holding it, which keeps only its view.
+    fn take_doc_for(&mut self, i: usize) {
+        let Some(g) = self.tabs[i].view_of.as_ref().map(|v| v.0) else { return };
+        let Some(k) = self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)) else { return };
+        let (Some(mut p), Some((_, mut v))) = (self.tabs[k].parked.take(), self.tabs[i].view_of.take()) else { return };
+        std::mem::swap(&mut p.view, &mut v);
+        v.req_base.clear();
+        v.req_patch.clear();
+        self.tabs[k].view_of = Some((g, v));
+        self.tabs[i].parked = Some(p);
+    }
+
     /// Shows tab `i` (in the active pane; if the other pane shows it, that pane becomes the active one).
     fn switch_tab(&mut self, i: usize) {
         if i == self.cur_tab || i >= self.tabs.len() {
             return;
+        }
+        // Another view of a document.
+        if let Some(g) = self.tabs[i].view_of.as_ref().map(|v| v.0) {
+            // In the other pane: that pane becomes the active one, then takes this tab's view.
+            if self.other.as_ref().is_some_and(|p| p.doc == Some(g)) {
+                self.activate_other();
+            }
+            if g == self.generation && self.path.is_some() {
+                self.trade_view(i);
+                return;
+            }
+            self.take_doc_for(i);
         }
         let g = self.tabs[i].parked.as_ref().map(|p| p.generation);
         if g.is_some() && self.other.as_ref().is_some_and(|p| p.doc == g) {
@@ -972,6 +1093,30 @@ impl App {
     fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
+        }
+        // Its document has another tab: only this view goes.
+        if let Some(g) = self.tab_doc(i) {
+            if let Some(k) = (0..self.tabs.len()).find(|&k| self.same_doc(i, k)) {
+                if i == self.cur_tab {
+                    // The other tab is shown instead, this one left holding only its view.
+                    self.trade_view(k);
+                } else if let Some(mut p) = self.tabs[i].parked.take() {
+                    // It holds the document's state: hand that on (with the other tab's view,
+                    // unless the other pane shows the document, whose view this is).
+                    if let Some((_, v)) = self.tabs[k].view_of.take() {
+                        if !self.other.as_ref().is_some_and(|o| o.doc == Some(g)) {
+                            p.view = v;
+                        }
+                    }
+                    self.tabs[k].parked = Some(p);
+                }
+                self.tabs.remove(i);
+                if i < self.cur_tab {
+                    self.cur_tab -= 1;
+                }
+                self.set_title();
+                return;
+            }
         }
         // A background save still on its way may yet fail: know before letting a document go.
         self.settle_saves();
@@ -1000,7 +1145,7 @@ impl App {
             // Split screen on another document: that one takes over, in its pane.
             let beside = self.other.as_ref().and_then(|o| o.doc).and_then(|g| self.tabs.iter().position(|t| t.parked.as_ref().is_some_and(|p| p.generation == g)));
             if self.tabs.is_empty() {
-                self.tabs.push(Tab { parked: None });
+                self.tabs.push(Tab::default());
                 self.cur_tab = 0;
                 self.last_generation += 1;
                 self.generation = self.last_generation;
@@ -1008,6 +1153,7 @@ impl App {
                 self.status_until = f64::INFINITY;
             } else {
                 self.cur_tab = beside.unwrap_or(i.min(self.tabs.len() - 1));
+                self.take_doc_for(self.cur_tab);
                 if let Some(p) = self.tabs[self.cur_tab].parked.take() {
                     self.unpark(p);
                 }
@@ -1031,7 +1177,7 @@ impl App {
             if let (Some(p), Some(w)) = (tab.parked, &self.worker) {
                 if p.dirty && !p.read_only {
                     // Bring it back to save it properly, then close it as the shown tab.
-                    self.tabs.insert(i, Tab { parked: Some(p) });
+                    self.tabs.insert(i, Tab { parked: Some(p), view_of: None });
                     if i <= self.cur_tab {
                         self.cur_tab += 1;
                     }
@@ -1102,7 +1248,13 @@ impl App {
 
     /// A tab's label: its file name.
     fn tab_name(&self, i: usize) -> String {
-        let path = if i == self.cur_tab { self.path.as_ref() } else { self.tabs[i].parked.as_ref().and_then(|p| p.path.as_ref()) };
+        let path = if i == self.cur_tab || self.same_doc(i, self.cur_tab) {
+            self.path.as_ref()
+        } else if let Some(p) = self.tabs.get(i).and_then(|t| t.parked.as_ref()) {
+            p.path.as_ref()
+        } else {
+            self.tab_doc(i).and_then(|g| self.parked_doc(g)).and_then(|p| p.path.as_ref())
+        };
         path.and_then(|p| p.file_name()).map_or_else(|| "New tab".into(), |f| f.to_string_lossy().into_owned())
     }
 
@@ -1127,6 +1279,21 @@ impl App {
         self.tab_scroll = true;
     }
 
+    /// The page tab `i` is on, when its document has other tabs too (to tell them apart).
+    fn tab_page(&self, i: usize) -> Option<usize> {
+        let g = self.tab_doc(i)?;
+        if !(0..self.tabs.len()).any(|k| self.same_doc(i, k)) {
+            return None;
+        }
+        if i == self.cur_tab {
+            return Some(self.current_page());
+        }
+        let t = &self.tabs[i];
+        let v = t.view_of.as_ref().map(|v| &v.1).or(t.parked.as_ref().map(|p| &p.view))?;
+        let page_y = if g == self.generation && self.path.is_some() { &self.page_y } else { &self.parked_doc(g)?.page_y };
+        Some(page_in_middle(page_y, v.offset, v.canvas, v.zoom))
+    }
+
     /// The tab strip, shown once two or more documents are open. Tabs drag to reorder.
     fn tab_strip(&mut self, ui: &mut Ui) {
         let mut switch = None;
@@ -1139,9 +1306,15 @@ impl App {
                 let mut dragging = None;
                 let mut dropped = None;
                 for i in 0..self.tabs.len() {
-                    let name = self.tab_name(i);
+                    let mut name = self.tab_name(i);
                     let mut short: String = if name.chars().count() > 28 { format!("{}…", name.chars().take(27).collect::<String>()) } else { name.clone() };
-                    let unsaved = self.tabs[i].parked.as_ref().is_some_and(|p| p.dirty && !p.read_only);
+                    // Two tabs on one document: told apart by page.
+                    if let Some(p) = self.tab_page(i) {
+                        short += &format!(" · p {}", p + 1);
+                        name += &format!(", page {}", p + 1);
+                    }
+                    let doc = self.tabs[i].parked.as_deref().or_else(|| if self.same_doc(i, self.cur_tab) { None } else { self.tab_doc(i).and_then(|g| self.parked_doc(g)) });
+                    let unsaved = i != self.cur_tab && doc.is_some_and(|p| p.dirty && !p.read_only);
                     if unsaved {
                         short.insert_str(0, "● ");
                     }
@@ -1253,7 +1426,7 @@ impl App {
             self.leaving_shown_doc(&mut parked);
             self.tabs[self.cur_tab].parked = Some(parked);
             self.trim_parked_tex();
-            self.tabs.insert(self.cur_tab + 1, Tab { parked: None });
+            self.tabs.insert(self.cur_tab + 1, Tab::default());
             self.cur_tab += 1;
         }
         self.commit_edit();
@@ -1466,18 +1639,30 @@ impl App {
         }
     }
 
+    /// Shows how an export went in the corner, and clears "Exporting…" from the status line.
+    fn notify(&mut self, title: &str, body: String, file: Option<PathBuf>, ok: bool) {
+        let until = if ok { f64::NAN } else { f64::INFINITY };
+        self.notice = Some(Notice { title: title.into(), body, file, ok, until });
+        self.status_until = 0.0;
+    }
+
     fn exported(&mut self, r: Result<(PathBuf, usize), String>) {
-        self.toast(match r {
-            Ok((p, 0)) => format!("Exported → {}", p.display()),
-            Ok((p, missing)) => format!("Exported → {}  ({missing} character(s) had no font and became '?')", p.display()),
-            Err(e) => format!("Export failed: {e}"),
-        });
+        match r {
+            Ok((p, missing)) => {
+                let mut body = file_and_folder(&p);
+                if missing > 0 {
+                    body += &format!("\n{missing} character(s) had no font and became '?'");
+                }
+                self.notify("Export complete", body, Some(p), true);
+            }
+            Err(e) => self.notify("Export failed", e, None, false),
+        }
     }
 
     fn shrunk(&mut self, r: Result<(PathBuf, crate::render::Shrunk), String>) {
         let (p, r) = match r {
             Ok(x) => x,
-            Err(e) => return self.toast(format!("Smaller copy failed: {e}")),
+            Err(e) => return self.notify("Smaller copy failed", e, None, false),
         };
         let mb = |b: u64| b as f64 / 1_048_576.0;
         let check = if r.check_pages.is_empty() {
@@ -1485,11 +1670,12 @@ impl App {
         } else {
             format!("; check page{} {}", if r.check_pages.len() == 1 { "" } else { "s" }, r.check_pages.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
         };
-        self.toast(if r.recompressed == 0 {
-            format!("Nothing to make smaller: no big scans or photos ({})", p.display())
+        let body = if r.recompressed == 0 {
+            format!("{}\nNothing to make smaller: no big scans or photos", file_and_folder(&p))
         } else {
-            format!("Smaller copy → {}: {:.1} MB → {:.1} MB ({} images){check}", p.display(), mb(r.before), mb(r.after), r.recompressed)
-        });
+            format!("{}\n{:.1} MB → {:.1} MB ({} images){check}", file_and_folder(&p), mb(r.before), mb(r.after), r.recompressed)
+        };
+        self.notify("Smaller copy made", body, Some(p), true);
     }
 
     fn export_to(&mut self, mode: ExportMode, out: PathBuf) {
@@ -1977,8 +2163,7 @@ impl App {
     }
 
     fn current_page(&self) -> usize {
-        let mid = self.offset.y + self.canvas.height() / (2.0 * self.zoom);
-        (0..self.pages.len()).rev().find(|&i| self.page_y[i] - GAP <= mid).unwrap_or(0)
+        page_in_middle(&self.page_y, self.offset, self.canvas, self.zoom)
     }
 
     fn zoom_at(&mut self, factor: f32, screen: Pos2) {
@@ -2348,8 +2533,26 @@ impl App {
             return;
         }
         let view = View { id: self.new_view_id(), zoom: self.zoom, offset: self.offset, canvas: self.canvas, ..Default::default() };
-        self.other = Some(Pane { doc: None, view });
+        self.other = Some(Pane { doc: None, view, page: None });
         self.active_left = true;
+    }
+
+    /// Shows page `page` of the shown document in split screen's other pane,
+    /// splitting the screen if need be (the active pane stays as it is).
+    fn open_page_in_split(&mut self, page: usize) {
+        if self.path.is_none() || page >= self.pages.len() {
+            return;
+        }
+        match self.other.as_ref().map(|o| o.doc) {
+            None => self.toggle_split(),
+            Some(Some(_)) => self.reset_other_view(),
+            Some(None) => {}
+        }
+        // The overview covers both panes: back to the sheets, to see it.
+        self.overview = false;
+        if let Some(o) = self.other.as_mut() {
+            o.page = Some(page);
+        }
     }
 
     /// Makes split screen's other pane the active one: keys, tools and the
@@ -2426,12 +2629,16 @@ impl App {
 
     /// Draws split screen's other pane into `r`, and keeps its view in bounds.
     fn paint_other(&mut self, ui: &mut Ui, r: Rect, now: f64) {
+        let page = self.other.as_mut().and_then(|o| o.page.take());
         self.with_other(|app| {
             app.inactive = true;
             app.canvas = r;
             if app.fit_pending && !app.pages.is_empty() && r.width() > 50.0 {
                 app.fit_pending = false;
                 app.fit_width();
+            }
+            if let Some(i) = page {
+                app.goto_page(i);
             }
             app.clamp_offset();
             if app.zoom != app.view_key.0 {
@@ -2604,6 +2811,7 @@ impl App {
         }
         if a.text_size().is_some() && !matches!(a.kind, Kind::Measure { .. }) {
             [a.style.bold, a.style.italic, a.style.underline] = self.text_format;
+            (a.style.align, a.style.valign) = self.text_align;
         }
     }
 
@@ -2878,13 +3086,13 @@ impl App {
             },
             Kind::Callout { anchor, leaders, .. } => {
                 let r = a.text_box().unwrap();
-                let mut hs = vec![(Handle::Anchor, *anchor), (Handle::BoxWidth, pos2(r.max.x, r.center().y))];
+                let mut hs = vec![(Handle::Anchor, *anchor), (Handle::BoxWidth, pos2(r.max.x, r.center().y)), (Handle::BoxHeight, pos2(r.center().x, r.max.y)), (Handle::BoxSize, r.max)];
                 hs.extend(leaders.iter().enumerate().map(|(i, tip)| (Handle::Leader(i), *tip)));
                 hs
             }
             Kind::Text { .. } => {
                 let r = a.text_box().unwrap();
-                vec![(Handle::BoxWidth, pos2(r.max.x, r.center().y))]
+                vec![(Handle::BoxWidth, pos2(r.max.x, r.center().y)), (Handle::BoxHeight, pos2(r.center().x, r.max.y)), (Handle::BoxSize, r.max)]
             }
             Kind::Arrow { a: p, b } | Kind::Line { a: p, b } => vec![(Handle::A, *p), (Handle::B, *b)],
             Kind::Pen { .. } => vec![],
@@ -2902,6 +3110,16 @@ impl App {
     }
 
     fn apply_handle(a: &mut Annot, h: Handle, p: Pos2) {
+        // A note box's height: set by hand, it keeps its size (no shrinking to the text).
+        if let (Some(r), Some(size), Handle::BoxHeight | Handle::BoxSize) = (a.text_box(), a.text_size(), h) {
+            if matches!(h, Handle::BoxSize) {
+                Self::apply_handle(a, Handle::BoxWidth, p);
+            }
+            let min_h = 2.0 * annot::pad(size) + annot::line_h(size);
+            a.style.box_h = Some((p.y - r.min.y).max(min_h));
+            a.wrap_w = a.text_box().map(|r| r.width());
+            return;
+        }
         match (&mut a.kind, h) {
             (Kind::Cloud { rect } | Kind::Rect { rect } | Kind::Highlight { rect }, Handle::Corner(opposite)) => {
                 *rect = Rect::from_two_pos(opposite, p);
@@ -3088,12 +3306,13 @@ impl App {
 
     fn step_text_size(&mut self, dir: i32) {
         let cur = self.lead_text_size().unwrap_or(self.text_size);
-        let i = TEXT_SIZES.iter().position(|&s| s >= cur).unwrap_or(TEXT_SIZES.len() - 1) as i32;
-        let next = TEXT_SIZES[(i + dir).clamp(0, TEXT_SIZES.len() as i32 - 1) as usize];
-        self.set_text_size(next);
+        // To the next preset size up or down (from one in between, the nearest that way).
+        let next = if dir > 0 { TEXT_SIZES.iter().copied().find(|&s| s > cur) } else { TEXT_SIZES.iter().rev().copied().find(|&s| s < cur) };
+        self.set_text_size(next.unwrap_or(cur));
     }
 
     fn set_text_size(&mut self, s: f32) {
+        let s = s.clamp(annot::TEXT_SIZE_MIN, annot::TEXT_SIZE_MAX);
         self.text_size = s;
         if self.lead_text_size().is_some() {
             self.edit_selected(|a| {
@@ -3101,6 +3320,196 @@ impl App {
                     *size = s;
                 }
             });
+        }
+    }
+
+    /// Adds copies of `src`, moved by `d` (and onto `page`, if given), and
+    /// selects them; copies of a group form a new group. One undo step.
+    fn add_copies(&mut self, src: Vec<Annot>, page: Option<usize>, d: Vec2) {
+        if src.is_empty() {
+            return;
+        }
+        self.snapshot();
+        self.selected.clear();
+        let mut groups = HashMap::new();
+        let mut next_group = self.next_group();
+        let last = self.pages.len().saturating_sub(1);
+        for a in src {
+            let id = self.next_id;
+            self.next_id += 1;
+            let group = a.group.map(|g| {
+                *groups.entry(g).or_insert_with(|| {
+                    next_group += 1;
+                    next_group - 1
+                })
+            });
+            let mut b = Annot { id, group, ..a };
+            // Into another document: onto a page it has.
+            b.page = page.unwrap_or(b.page).min(last);
+            b.translate(d);
+            self.annots.push(b);
+            self.selected.push(id);
+        }
+        self.changed();
+    }
+
+    /// Ctrl+C / Ctrl+X: the selected markups, to paste here or in another tab,
+    /// and their text (notes' words, else what they are) for other programs.
+    fn copy_selection(&mut self, ctx: &egui::Context, cut: bool) {
+        let mut copies: Vec<Annot> = self.annots.iter().filter(|a| self.selected.contains(&a.id)).cloned().collect();
+        if copies.is_empty() {
+            return;
+        }
+        copies.sort_by_key(page_order);
+        let text = copies.iter().map(|a| a.label().trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+        ctx.copy_text(text.clone());
+        let n = copies.len();
+        self.clip = Some((text, copies));
+        if cut {
+            self.delete_selected();
+        }
+        self.toast(format!("{} {n} markup{} (Ctrl+V to paste where the pointer is)", if cut { "Cut" } else { "Copied" }, if n == 1 { "" } else { "s" }));
+    }
+
+    /// Ctrl+V: markups copied here go where the pointer is (top left at it),
+    /// or just beside where they were; text from elsewhere becomes a note.
+    fn paste(&mut self, text: String, at: Option<Pos2>) {
+        self.commit_edit();
+        let target = at.filter(|p| self.canvas.contains(*p)).and_then(|p| self.page_at(p).map(|page| (page, self.screen_to_page(page, p))));
+        // What's on the clipboard is still what was copied here: the markups.
+        if let Some((_, copies)) = self.clip.as_ref().filter(|c| c.0 == text) {
+            let copies = copies.clone();
+            let one_page = copies.iter().all(|a| a.page == copies[0].page);
+            let bb = copies.iter().map(|a| a.bounds()).reduce(|a, b| a.union(b)).unwrap_or(Rect::NOTHING);
+            match target {
+                Some((page, p)) if one_page => self.add_copies(copies, Some(page), p - bb.min),
+                _ => {
+                    let d = vec2(12.0, 12.0) / self.zoom.max(0.1);
+                    // Each paste a step further on, so they don't stack.
+                    if let Some(c) = self.clip.as_mut() {
+                        c.1.iter_mut().for_each(|a| a.translate(d));
+                    }
+                    self.add_copies(copies, None, d);
+                }
+            }
+            return;
+        }
+        let text = text.trim_end().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        // Text from another program: a note, its first line where the pointer is (else mid-view).
+        let (page, p) = target.unwrap_or_else(|| {
+            let page = self.current_page();
+            (page, self.screen_to_page(page, self.canvas.center()))
+        });
+        let size = self.text_size;
+        let box_w = annot::default_box_w(size);
+        let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
+        let at = p - vec2(annot::pad(size), annot::pad(size) + annot::line_h(size) / 2.0);
+        let pos = pos2(at.x.clamp(0.0, (bounds.max.x - box_w).max(0.0)), at.y.clamp(0.0, bounds.max.y.max(0.0)));
+        self.snapshot();
+        let id = self.add(page, Kind::Text { pos, box_w, text, size });
+        if let Some(a) = self.find_mut(id) {
+            a.fit_box_w();
+        }
+        self.set_tool(Tool::Select);
+        self.selected = vec![id];
+        self.changed();
+    }
+
+    /// What arranging moves: the selected markups on the lead one's page, a
+    /// group as one, with their bounds.
+    fn arrange_units(&self) -> Vec<(Vec<u64>, Rect)> {
+        let Some(page) = self.lead().map(|a| a.page) else { return Vec::new() };
+        let mut units: Vec<(Option<u64>, Vec<u64>, Rect)> = Vec::new();
+        for a in self.annots.iter().filter(|a| a.page == page && self.selected.contains(&a.id)) {
+            match units.iter_mut().find(|u| u.0.is_some() && u.0 == a.group) {
+                Some(u) => {
+                    u.1.push(a.id);
+                    u.2 = u.2.union(a.bounds());
+                }
+                None => units.push((a.group, vec![a.id], a.bounds())),
+            }
+        }
+        units.into_iter().map(|(_, ids, r)| (ids, r)).collect()
+    }
+
+    /// Lines the selected markups up: several with each other (left edges to
+    /// the leftmost, say), one (or one group) with its page; or centres the
+    /// whole selection on its page. One undo step.
+    fn arrange_markups(&mut self, how: Arrange) {
+        let mut units = self.arrange_units();
+        let Some(page) = self.lead().map(|a| a.page).filter(|&p| p < self.pages.len()) else { return };
+        let sheet = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
+        if how == Arrange::PageCenter {
+            let all = units.iter().fold(Rect::NOTHING, |r, u| r.union(u.1));
+            units = vec![(units.into_iter().flat_map(|u| u.0).collect(), all)];
+        }
+        if units.is_empty() {
+            return;
+        }
+        let to = if units.len() == 1 { sheet } else { units.iter().fold(Rect::NOTHING, |r, u| r.union(u.1)) };
+        self.snapshot();
+        for (ids, b) in units {
+            let d = match how {
+                Arrange::Left => vec2(to.min.x - b.min.x, 0.0),
+                Arrange::Center => vec2(to.center().x - b.center().x, 0.0),
+                Arrange::Right => vec2(to.max.x - b.max.x, 0.0),
+                Arrange::Top => vec2(0.0, to.min.y - b.min.y),
+                Arrange::Middle => vec2(0.0, to.center().y - b.center().y),
+                Arrange::Bottom => vec2(0.0, to.max.y - b.max.y),
+                Arrange::PageCenter => to.center() - b.center(),
+            };
+            for a in self.annots.iter_mut().filter(|a| ids.contains(&a.id)) {
+                a.translate(d);
+            }
+        }
+        self.changed();
+    }
+
+    /// The alignment the toolbar shows: the lead selected note's, else new notes'.
+    fn shown_align(&self) -> (annot::HAlign, annot::VAlign) {
+        self.selected.iter().rev().filter_map(|&id| self.find(id)).find(|a| a.text_box().is_some()).map_or(self.text_align, |a| (a.style.align, a.style.valign))
+    }
+
+    /// Aligns the selected notes' text (and new notes'): across, or up and down.
+    fn set_align(&mut self, h: Option<annot::HAlign>, v: Option<annot::VAlign>) {
+        if let Some(h) = h {
+            self.text_align.0 = h;
+        }
+        if let Some(v) = v {
+            self.text_align.1 = v;
+        }
+        if self.selected.iter().filter_map(|&id| self.find(id)).any(|a| a.text_box().is_some()) {
+            self.edit_selected(|a| {
+                if a.text_box().is_some() {
+                    a.style.align = h.unwrap_or(a.style.align);
+                    a.style.valign = v.unwrap_or(a.style.valign);
+                }
+            });
+        }
+        if self.editing.is_some() {
+            self.edit_needs_focus = true;
+        }
+    }
+
+    /// Sizes the selected notes' text to fill their boxes' width.
+    fn fit_text_to_box(&mut self) {
+        let notes = self.selected.iter().filter_map(|&id| self.find(id)).filter(|a| a.text_box().is_some() && !text_of(a).trim().is_empty()).count();
+        if notes == 0 {
+            self.toast("Select a note or callout with text to fit its text to its box".into());
+            return;
+        }
+        self.edit_selected(|a| {
+            a.fit_text_to_box();
+        });
+        if let Some(size) = self.lead_text_size() {
+            self.text_size = size;
+        }
+        // The note being typed: what's typed so far is fitted, and it stays being typed.
+        if self.editing.is_some() {
+            self.edit_needs_focus = true;
         }
     }
 
@@ -3130,6 +3539,18 @@ impl App {
             self.goto_keys(ctx);
             return;
         }
+        // Copy, cut and paste come as events of their own (not key presses).
+        if !self.overview && !self.pages.is_empty() {
+            let (events, at) = ctx.input(|i| (i.events.clone(), i.pointer.hover_pos()));
+            for e in events {
+                match e {
+                    egui::Event::Copy => self.copy_selection(ctx, false),
+                    egui::Event::Cut => self.copy_selection(ctx, true),
+                    egui::Event::Paste(text) => self.paste(text, at),
+                    _ => {}
+                }
+            }
+        }
         let (cmd, shift) = ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
         if cmd {
@@ -3154,28 +3575,9 @@ impl App {
                 if shift { self.ungroup_selected() } else { self.group_selected() }
             }
             if pressed(Key::D) && !self.selected.is_empty() {
-                self.snapshot();
                 let d = vec2(12.0, 12.0) / self.zoom.max(0.1);
                 let copies: Vec<Annot> = self.annots.iter().filter(|a| self.selected.contains(&a.id)).cloned().collect();
-                self.selected.clear();
-                // Copies of a group form a new group.
-                let mut groups = HashMap::new();
-                let mut next_group = self.next_group();
-                for a in copies {
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    let group = a.group.map(|g| {
-                        *groups.entry(g).or_insert_with(|| {
-                            next_group += 1;
-                            next_group - 1
-                        })
-                    });
-                    let mut b = Annot { id, group, ..a };
-                    b.translate(d);
-                    self.annots.push(b);
-                    self.selected.push(id);
-                }
-                self.changed();
+                self.add_copies(copies, None, d);
             }
             if pressed(Key::A) && self.overview {
                 self.page_sel = (0..self.pages.len()).collect();
@@ -3224,7 +3626,10 @@ impl App {
         if pressed(Key::M) {
             self.toggle_right_panel(false);
         }
-        if pressed(Key::I) {
+        // Shift+I: insert an image; I alone: the stamps panel.
+        if pressed(Key::I) && shift && !self.pages.is_empty() {
+            self.ask = Some(Pick::Picture);
+        } else if pressed(Key::I) {
             self.toggle_right_panel(true);
         }
         if pressed(Key::Y) {
@@ -3508,7 +3913,7 @@ impl App {
                     }
                     // Markups selected on other pages stay put.
                     let ids = self.annots.iter().filter(|a| a.page == page && self.selected.contains(&a.id)).map(|a| a.id).collect();
-                    Drag::Move { page, ids, last: p, before: self.annots.clone(), moved: false }
+                    Drag::Move { page, ids, start: p, last: p, before: self.annots.clone(), moved: false }
                 } else {
                     if !mods.add {
                         self.selected.clear();
@@ -3539,9 +3944,10 @@ impl App {
                     pts.push(p);
                 }
             }
-            Drag::Move { ids, last, moved, .. } => {
-                let d = p - *last;
-                *last = p;
+            Drag::Move { ids, start, last, moved, .. } => {
+                let to = if self.shift { straight(*start, p) } else { p };
+                let d = to - *last;
+                *last = to;
                 *moved = true;
                 for a in self.annots.iter_mut().filter(|a| ids.contains(&a.id)) {
                     a.translate(d);
@@ -3549,7 +3955,14 @@ impl App {
             }
             Drag::Handle { id, handle, .. } => {
                 let (id, h) = (*id, *handle);
+                let shift = self.shift;
                 if let Some(a) = self.annots.iter_mut().find(|a| a.id == id) {
+                    // Shift: a line's end kept straight from its other end.
+                    let p = match (&a.kind, h) {
+                        (Kind::Arrow { b, .. } | Kind::Line { b, .. }, Handle::A) if shift => straight(*b, p),
+                        (Kind::Arrow { a, .. } | Kind::Line { a, .. }, Handle::B) if shift => straight(*a, p),
+                        _ => p,
+                    };
                     Self::apply_handle(a, h, p);
                 }
             }
@@ -3692,6 +4105,7 @@ impl App {
 
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
+        let end = if self.shift && matches!(self.tool, Tool::Line | Tool::Arrow) { straight(start, end) } else { end };
         let end = bounds.clamp(end);
         if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion | Tool::Polyline | Tool::Polygon) {
             self.create_measure(page, start, end);
@@ -3721,9 +4135,15 @@ impl App {
                 Kind::Callout { anchor: start, pos, box_w, text: String::new(), size, leaders: Vec::new() }
             }
             Tool::Text => {
-                let box_w = if dragged && rect.width() > 4.0 * size { rect.width() } else { annot::default_box_w(size) };
-                let x = rect.min.x.clamp(0.0, (bounds.max.x - box_w).max(0.0));
-                Kind::Text { pos: pos2(x, rect.min.y), box_w, text: String::new(), size }
+                let drawn = dragged && rect.width() > 4.0 * size;
+                let box_w = if drawn { rect.width() } else { annot::default_box_w(size) };
+                // A drawn box is where it was drawn; a click puts the first line's
+                // text where it was clicked (the box's padding round it).
+                let at = if drawn { rect.min } else { start - vec2(annot::pad(size), annot::pad(size) + annot::line_h(size) / 2.0) };
+                let h = annot::box_rect(Pos2::ZERO, box_w, "", size).height();
+                let x = at.x.clamp(0.0, (bounds.max.x - box_w).max(0.0));
+                let y = at.y.clamp(0.0, (bounds.max.y - h).max(0.0));
+                Kind::Text { pos: pos2(x, y), box_w, text: String::new(), size }
             }
             _ if tiny => return,
             Tool::Cloud => Kind::Cloud { rect },
@@ -3742,6 +4162,10 @@ impl App {
         let id = self.add(page, kind);
         if let Some(a) = self.find_mut(id) {
             a.wrap_w = explicit_w;
+            // A box drawn taller than a line keeps the height drawn.
+            if explicit_w.is_some() && rect.height() > 2.0 * annot::pad(size) + annot::line_h(size) {
+                a.style.box_h = Some(rect.height());
+            }
         }
         if is_text {
             self.start_edit(id);
@@ -3773,7 +4197,7 @@ impl App {
             return;
         }
         let last = *pts.last().unwrap();
-        let p = if shift { square(last, p) } else { p };
+        let p = if shift { straight(last, p) } else { p };
         // egui counts any two clicks within 0.3 s as a double-click, wherever they
         // land: clicking corners out quickly would finish the line and start
         // another. Only a second click on the point just placed finishes it.
@@ -3838,7 +4262,7 @@ impl App {
             }
             return;
         }
-        let squared = if self.shift { square(start, end) } else { end };
+        let squared = if self.shift { straight(start, end) } else { end };
         match self.tool {
             Tool::Length => self.add_measure(page, vec![start, squared], false),
             Tool::Area => {
@@ -4102,9 +4526,11 @@ impl App {
         let csv = measure::csv(&order, &self.scales, units);
         let unscaled = order.iter().filter(|a| measure::measured(a, &self.scales).is_none()).count();
         match std::fs::write(&out, csv) {
-            Ok(()) if unscaled > 0 => self.toast(format!("Measurements → {} ({unscaled} with no scale)", out.display())),
-            Ok(()) => self.toast(format!("Measurements → {}", out.display())),
-            Err(e) => self.toast(format!("Could not write {}: {e}", out.display())),
+            Ok(()) => {
+                let more = if unscaled > 0 { format!("\n{unscaled} with no scale") } else { String::new() };
+                self.notify("Measurements exported", file_and_folder(&out) + &more, Some(out), true);
+            }
+            Err(e) => self.notify("Measurements not exported", format!("Could not write {}: {e}", out.display()), None, false),
         }
     }
 
@@ -4594,7 +5020,8 @@ impl App {
         painter.rect_filled(self.canvas, 0.0, crate::theme::canvas(ui.visuals()));
         let k = self.text_metrics(&painter);
         let shadow = crate::theme::page_shadow(ui.visuals());
-        for i in self.visible_pages() {
+        let vis = self.visible_pages();
+        for &i in &vis {
             let pr = self.page_doc_rect(i);
             let sr = Rect::from_min_max(self.to_screen(pr.min), self.to_screen(pr.max));
             painter.add(shadow.as_shape(sr, 0.0));
@@ -4618,8 +5045,11 @@ impl App {
                     painter.image(t.tex.id(), r, uv, Color32::WHITE);
                 }
             }
-
-            let pp = painter.with_clip_rect(sr.intersect(self.canvas));
+        }
+        // Markups over all the sheets, so one running off its page (a note too
+        // long for where it is) still shows past the edge rather than being cut off.
+        let pp = painter.with_clip_rect(self.canvas);
+        for &i in &vis {
             // The part of the page on screen (page points), with room for strokes
             // drawn wider than their width when zoomed far out: markups wholly
             // outside it aren't drawn at all.
@@ -4652,7 +5082,7 @@ impl App {
             let drag = if self.inactive { &Drag::None } else { &self.drag };
             match drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
-                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline) { square(*start, *cur) } else { *cur };
+                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline | Tool::Line | Tool::Arrow) { straight(*start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
                         let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };
@@ -4691,7 +5121,7 @@ impl App {
                 let mut closing = false;
                 if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
                     let h = self.screen_to_page(i, h);
-                    let h = if self.shift { square(*pts.last().unwrap(), h) } else { h };
+                    let h = if self.shift { straight(*pts.last().unwrap(), h) } else { h };
                     closing = self.closes_on(&pts, h);
                     if !closing {
                         pts.push(h);
@@ -4832,10 +5262,16 @@ impl App {
         };
         let (page, size, color) = (a.page, a.text_size().unwrap(), a.color);
         let r = a.text_box().unwrap();
+        let halign = match a.style.align {
+            annot::HAlign::Left => egui::Align::LEFT,
+            annot::HAlign::Center => egui::Align::Center,
+            annot::HAlign::Right => egui::Align::RIGHT,
+        };
+        let drop = a.text_drop();
         let k = self.text_k.unwrap_or((1.0, 0.8));
         let z = self.zoom;
         let pad = annot::pad(size);
-        let pos = self.page_to_screen(page, r.min + vec2(pad, pad));
+        let pos = self.page_to_screen(page, r.min + vec2(pad, pad + drop));
         let width = (r.width() - 2.0 * pad) * z;
         let fs = (size * z * k.0).max(6.0);
         let mut text = text_of(a).to_string();
@@ -4858,7 +5294,9 @@ impl App {
             // The cursor isn't known until the edit is shown: a frame laid out
             // by inference at most, then by what's stored.
             let f = annot::carry_fmts(&old_text, &fmts_now, t, typing, whole, None);
-            ui.painter().layout_job(note_job(t, &f, fs, ink, wrap))
+            let mut job = note_job(t, &f, fs, ink, wrap);
+            job.halign = halign;
+            ui.painter().layout_job(job)
         };
         let out = egui::Area::new(egui::Id::new("greenline-edit"))
             .fixed_pos(pos)
@@ -4874,6 +5312,7 @@ impl App {
                     .margin(egui::Margin::ZERO)
                     .desired_width(width.max(20.0))
                     .desired_rows(1)
+                    .horizontal_align(halign)
                     // Its row height sizes the editor and the caret, even with a layouter
                     // (which still picks each word's face; the styled faces share this height).
                     .font(FontId::new(fs, helv()))
@@ -4997,7 +5436,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                if ui.add_enabled(!self.pages.is_empty(), egui::Button::new("Insert image…")).on_hover_text("A photo or sketch as a markup (or drop a PNG/JPEG on a sheet)").clicked() {
+                if ui.add_enabled(!self.pages.is_empty(), egui::Button::new("Insert image…   (Shift+I)")).on_hover_text("A photo or sketch as a markup (or drop a PNG/JPEG on a sheet)").clicked() {
                     self.ask = Some(Pick::Picture);
                     ui.close();
                 }
@@ -5008,6 +5447,25 @@ impl App {
             })
             .response
             .on_hover_text("Markup tool: the button shows the active one");
+            ui.add_enabled_ui(!self.selected.is_empty(), |ui| {
+                ui.menu_button("Arrange ⏷", |ui| {
+                    let several = self.arrange_units().len() > 1;
+                    ui.weak(if several { "Line the selected up with each other:" } else { "Line it up with the page:" });
+                    for (how, name) in [(Arrange::Left, "Align left"), (Arrange::Center, "Align centre"), (Arrange::Right, "Align right"), (Arrange::Top, "Align top"), (Arrange::Middle, "Align middle"), (Arrange::Bottom, "Align bottom")] {
+                        if ui.button(name).clicked() {
+                            self.arrange_markups(how);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Centre on page").on_hover_text("The selection as a whole, in the middle of its page").clicked() {
+                        self.arrange_markups(Arrange::PageCenter);
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("Line selected markups up: with each other, or one (or one group) with the page");
+            });
             ui.separator();
             let cur = self.lead().map(|a| a.color).unwrap_or(self.color());
             for (i, (c, name)) in COLORS.iter().enumerate() {
@@ -5029,14 +5487,29 @@ impl App {
                 self.set_width(w);
             }
             self.line_type_button(ui);
+            // Any size in range by dragging or typing; the presets and fitting in its menu.
             let cur_size = self.lead_text_size().unwrap_or(self.text_size);
-            egui::ComboBox::from_id_salt("tsize").width(56.0).selected_text(format!("Text {cur_size} pt")).show_ui(ui, |ui| {
+            let mut size = cur_size;
+            let r = ui.add(egui::DragValue::new(&mut size).range(annot::TEXT_SIZE_MIN..=annot::TEXT_SIZE_MAX).speed(0.2).max_decimals(1).prefix("Text ").suffix(" pt"));
+            if r.on_hover_text(format!("Text size, {} to {} pt (Shift+[ / Shift+])", annot::TEXT_SIZE_MIN, annot::TEXT_SIZE_MAX)).changed() {
+                self.set_text_size(size);
+            }
+            ui.menu_button("⏷", |ui| {
                 for s in TEXT_SIZES {
                     if ui.selectable_label(s == cur_size, format!("{s} pt")).clicked() {
                         self.set_text_size(s);
+                        ui.close();
                     }
                 }
-            });
+                ui.separator();
+                let notes = self.selected.iter().filter_map(|&id| self.find(id)).any(|a| a.text_box().is_some());
+                if ui.add_enabled(notes, egui::Button::new("Fit text to box")).on_hover_text("The biggest text that fits the selected notes' boxes (drag a box's bottom edge or corner to give it a height; without one, the text fills its width)").clicked() {
+                    self.fit_text_to_box();
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Text size presets, and fitting text to its box");
             let fmt = self.shown_format();
             let labels = [
                 (egui::RichText::new("B").strong(), "Bold (Ctrl+B)"),
@@ -5048,6 +5521,28 @@ impl App {
                     self.toggle_format(i);
                 }
             }
+            let (h, v) = self.shown_align();
+            use annot::{HAlign, VAlign};
+            let shown = match h {
+                HAlign::Left => "Left ⏷",
+                HAlign::Center => "Centre ⏷",
+                HAlign::Right => "Right ⏷",
+            };
+            ui.menu_button(shown, |ui| {
+                for (a, name) in [(HAlign::Left, "Left"), (HAlign::Center, "Centre"), (HAlign::Right, "Right")] {
+                    if ui.selectable_label(h == a, name).clicked() {
+                        self.set_align(Some(a), None);
+                    }
+                }
+                ui.separator();
+                for (a, name) in [(VAlign::Top, "Top"), (VAlign::Middle, "Middle"), (VAlign::Bottom, "Bottom")] {
+                    if ui.selectable_label(v == a, name).on_hover_text("In a box taller than its text (drag its bottom edge)").clicked() {
+                        self.set_align(None, Some(a));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Text alignment in notes and callouts: left, centre or right; top, middle or bottom");
         });
     }
 
@@ -5417,6 +5912,19 @@ impl App {
             let c = self.current_page();
             (c, self.offset.y - self.page_y[c])
         });
+        // So do the document's other tabs.
+        let (from_gen, old_y) = (self.generation, self.page_y.clone());
+        let keep_tabs: Vec<(usize, usize, f32)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, t)| t.view_of.as_ref().filter(|v| v.0 == from_gen).map(|v| (k, &v.1)))
+            .filter(|_| !old_y.is_empty())
+            .map(|(k, v)| {
+                let c = page_in_middle(&old_y, v.offset, v.canvas, v.zoom);
+                (k, c, v.offset.y - old_y[c])
+            })
+            .collect();
         // Split screen's other view of this document stays on its page too.
         let keep_other = if self.other.as_ref().is_some_and(|o| o.doc.is_none()) && !self.pages.is_empty() {
             self.with_other(|app| {
@@ -5469,6 +5977,18 @@ impl App {
         if let (Some((c, dy)), Some(o)) = (keep_other, self.other.as_mut()) {
             if let Some(n) = to(c) {
                 o.view.offset.y = self.page_y[n] + dy;
+            }
+        }
+        for t in self.tabs.iter_mut().filter_map(|t| t.view_of.as_mut()).filter(|v| v.0 == from) {
+            t.0 = self.generation;
+            follow(&mut t.1.base, |k| to(*k));
+            follow(&mut t.1.patch, |k| to(k.0).map(|p| (p, k.1, k.2)));
+            t.1.req_base.clear();
+            t.1.req_patch.clear();
+        }
+        for (k, c, dy) in keep_tabs {
+            if let (Some(n), Some(v)) = (to(c), self.tabs[k].view_of.as_mut()) {
+                v.1.offset.y = self.page_y[n] + dy;
             }
         }
         // Found again on the new pages (the old search's answers are dropped with its generation).
@@ -5734,6 +6254,13 @@ impl App {
     fn page_menu(&mut self, ui: &mut Ui, i: usize) {
         let pages = self.pages_for(i);
         let mut op = None;
+        if ui.button("Open in new tab").on_hover_text("Another view of this document, sharing its markups").clicked() {
+            op = Some(PageOp::Tab(i));
+        }
+        if ui.button("Open in split view").clicked() {
+            op = Some(PageOp::Split(i));
+        }
+        ui.separator();
         if ui.button("Insert blank page before").clicked() {
             op = Some(PageOp::Blank(i, false));
         }
@@ -5760,6 +6287,8 @@ impl App {
     /// Makes the change a page menu asked for (after the thumbnails are drawn).
     fn page_op(&mut self) {
         match self.page_op.take() {
+            Some(PageOp::Tab(i)) => self.open_page_in_tab(i),
+            Some(PageOp::Split(i)) => self.open_page_in_split(i),
             Some(PageOp::Blank(i, after)) => self.insert_blank(i, after),
             Some(PageOp::FromFile(i, after)) => self.ask_insert(i, after),
             Some(PageOp::Delete(pages)) => self.delete_pages(&pages),
@@ -6351,8 +6880,70 @@ impl App {
             csv += &format!("{},{},{},{},{}\n", n + 1, a.page + 1, a.kind_name(), colour, q(note_of(a).trim()));
         }
         match std::fs::write(&out, csv) {
-            Ok(()) => self.toast(format!("Comment list → {}", out.display())),
-            Err(e) => self.toast(format!("Could not write {}: {e}", out.display())),
+            Ok(()) => self.notify("Comment list exported", file_and_folder(&out), Some(out), true),
+            Err(e) => self.notify("Comment list not exported", format!("Could not write {}: {e}", out.display()), None, false),
+        }
+    }
+
+    /// The notice in the corner after an export: what was written, with
+    /// buttons to open it or show it in its folder.
+    fn notice(&mut self, ctx: &egui::Context, now: f64) {
+        let Some(n) = &mut self.notice else { return };
+        if n.until.is_nan() {
+            n.until = now + 10.0;
+        }
+        if now >= n.until {
+            self.notice = None;
+            return;
+        }
+        let ok = n.ok;
+        let mut close = false;
+        let mut open = None;
+        let area = egui::Area::new(egui::Id::new("greenline-notice")).order(egui::Order::Foreground).anchor(Align2::RIGHT_BOTTOM, vec2(-14.0, -40.0)).show(ctx, |ui| {
+            let color = if ok { crate::theme::accent(ui.visuals()) } else { Color32::from_rgb(200, 60, 45) };
+            egui::Frame::popup(ui.style()).stroke(Stroke::new(1.5, color)).inner_margin(12.0).show(ui, |ui| {
+                ui.set_max_width(420.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(if ok { "✔" } else { "⚠" }).size(22.0).color(color));
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&n.title).strong().color(color));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new("×").frame(false)).on_hover_text("Close").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add(egui::Label::new(&n.body).wrap());
+                        if let Some(f) = &n.file {
+                            ui.horizontal(|ui| {
+                                if ui.button("Open").clicked() {
+                                    open = Some((f.clone(), false));
+                                }
+                                if ui.button("Show in folder").clicked() {
+                                    open = Some((f.clone(), true));
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+        });
+        // Kept up while the pointer is on it.
+        if area.response.contains_pointer() && n.until.is_finite() {
+            n.until = n.until.max(now + 3.0);
+        }
+        if n.until.is_finite() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((n.until - now).max(0.05)));
+        }
+        if let Some((f, reveal)) = open {
+            close = true;
+            if let Err(e) = open_in_system(&f, reveal) {
+                self.toast(format!("Could not open {}: {e}", f.display()));
+            }
+        }
+        if close {
+            self.notice = None;
         }
     }
 
@@ -6380,15 +6971,19 @@ impl App {
                     ("Ctrl+B / I / U", "Bold / italic / underline: while typing, the words selected (or what you type next); otherwise the selected notes (also the B I U buttons)"),
                     ("1–6", "Colour (applies to all selected)   ·   fill swatch beside the colours: fill, opacity and hatch"),
                     ("Line sample beside the width", "Line type: dashed, dotted, or one from the pattern library (set its folder below)"),
-                    ("[ ]", "Line width   ·   { } text size"),
+                    ("[ ]", "Line width   ·   { } text size (4–72 pt; type any size in the toolbar, or ⏷ ▸ Fit text to box)"),
+                    ("Note box edges", "Drag a note's right edge for its width, its bottom edge or corner for its height (or draw the box with T); Left ⏷ aligns its text left, centre or right and top, middle or bottom"),
+                    ("Shift while drawing or dragging", "Keeps lines, arrows, measurements, line ends and moves straight: across, up and down, or at 45°"),
+                    ("Arrange ⏷ (toolbar)", "Align the selected markups' left, centre, right, top, middle or bottom edges (one on its own, or one group: to the page), or centre them on the page"),
                     ("Del", "Delete selection   ·   Ctrl+D duplicate"),
+                    ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy / cut / paste markups (pasted where the pointer is, also into another tab); text copied from another program pastes as a note"),
                     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
                     ("Ctrl+E", "Export flattened PDF next to original (Ctrl+Shift+E: Save As)"),
                     ("Ctrl+Alt+E", "Export editable PDF (markups as movable comments for Bluebeam/Acrobat)"),
                     ("S / O / M / I", "Page thumbnails / overview of all pages / markup list / stamps"),
                     ("Ctrl+G / Ctrl+Shift+G", "Group / ungroup the selection   ·   Alt+click one piece of a group"),
                     ("In overview", "Arrows move, Enter opens, Ctrl+wheel resizes, O or Esc closes"),
-                    ("Pages", "Drag a thumbnail (sidebar or overview) to move the page; right-click to insert blank pages or pages from another PDF, or delete"),
+                    ("Pages", "Drag a thumbnail (sidebar or overview) to move the page; right-click to open it in a new tab (another view of the same document) or split view, insert blank pages or pages from another PDF, or delete"),
                     ("In overview", "Ctrl+click / Shift+click pick pages (Ctrl+A all) to drag or delete (Del) together"),
                     ("Wheel / Ctrl+wheel", "Scroll / zoom at cursor"),
                     ("Middle or right drag, Space+drag", "Pan"),
@@ -6397,7 +6992,7 @@ impl App {
                     ("Ctrl+Tab / Ctrl+W", "Next tab (Shift: previous; also Ctrl+PgDn/PgUp) / close tab — opening another PDF opens it in a new tab; drag a tab to move it"),
                     ("\\", "Split screen: two places side by side; click a pane to work in it, pick a tab to show another document there"),
                     ("Ctrl+N", "New blank document: pick the page size and count, then mark up or drop images on it"),
-                    ("Drop an image", "A PNG or JPEG dropped on a sheet is placed there as a markup (also tool menu ▸ Insert image…)"),
+                    ("Shift+I or drop an image", "Insert a PNG or JPEG photo or sketch as a markup: Shift+I picks one (also tool menu ▸ Insert image…); one dropped on a sheet is placed there"),
                     ("Ctrl+F", "Find text in the document: Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes"),
                     ("Zoom % (status bar)", "Click for fit width, fit page, actual size and preset zooms"),
                     ("PgUp PgDn ← →  Home End", "Previous / next page"),
@@ -6585,6 +7180,7 @@ impl eframe::App for App {
         self.page_op();
         self.finish_page_drag(&ctx);
         self.help(&ctx);
+        self.notice(&ctx, now);
         self.request_all_renders(&ctx, now);
         self.show_dialog(&ctx, frame);
 
@@ -6628,6 +7224,69 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// "name.pdf" and, under it, the folder it's in.
+fn file_and_folder(p: &std::path::Path) -> String {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(d) => format!("{name}\nin {}", d.display()),
+        None => name,
+    }
+}
+
+/// Opens `path` with the system's own program for it, or (`reveal`) shows it in its folder.
+fn open_in_system(path: &std::path::Path, reveal: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("explorer");
+        if reveal {
+            c.raw_arg(format!("/select,\"{}\"", path.display()));
+        } else {
+            c.arg(path);
+        }
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        if reveal {
+            c.arg("-R");
+        }
+        c.arg(path);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        // xdg-open can't pick out a file: its folder is opened.
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(if reveal { path.parent().unwrap_or(path) } else { path });
+        c
+    };
+    let mut child = cmd.stdin(std::process::Stdio::null()).spawn()?;
+    // Reaped in the background, so no zombie is left.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// How `App::arrange` lines markups up.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Arrange {
+    Left,
+    Center,
+    Right,
+    Top,
+    Middle,
+    Bottom,
+    /// The whole selection to the middle of its page.
+    PageCenter,
+}
+
+/// The page in the middle of a view of a document laid out at `page_y`.
+fn page_in_middle(page_y: &[f32], offset: Vec2, canvas: Rect, zoom: f32) -> usize {
+    let mid = offset.y + canvas.height() / (2.0 * zoom);
+    (0..page_y.len()).rev().find(|&i| page_y[i] - GAP <= mid).unwrap_or(0)
 }
 
 /// `11`, `8.5`: a sheet dimension without trailing zeros.
@@ -6715,9 +7374,17 @@ fn cached_triangles(pts: &[Pos2]) -> Option<Triangles> {
 }
 
 /// `p` moved onto the horizontal or vertical through `from`, whichever is nearer.
-fn square(from: Pos2, p: Pos2) -> Pos2 {
+/// `p` brought round to the nearest of across, up and down, or a 45° diagonal
+/// from `from` (Shift while drawing, measuring or moving).
+fn straight(from: Pos2, p: Pos2) -> Pos2 {
     let d = p - from;
-    if d.x.abs() >= d.y.abs() { pos2(p.x, from.y) } else { pos2(from.x, p.y) }
+    if d == Vec2::ZERO {
+        return p;
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let a = (d.y.atan2(d.x) / step).round() * step;
+    let dir = vec2(a.cos(), a.sin());
+    from + dir * d.dot(dir)
 }
 
 /// A markup too small on screen to make out (under `below` pixels across, zoomed
@@ -7935,10 +8602,10 @@ mod tests {
         let mut parked = |name: &str| {
             let mut p = app.park();
             p.path = Some(PathBuf::from(format!("/{name}.pdf")));
-            Tab { parked: Some(p) }
+            Tab { parked: Some(p), view_of: None }
         };
         let (a, b, d) = (parked("a"), parked("b"), parked("d"));
-        app.tabs = vec![a, b, Tab { parked: None }, d];
+        app.tabs = vec![a, b, Tab::default(), d];
         app.cur_tab = 2;
         app.path = Some(PathBuf::from("/c.pdf"));
         let names = |app: &App| (0..app.tabs.len()).map(|i| app.tab_name(i)).collect::<Vec<_>>().join(" ").replace(".pdf", "");
@@ -7978,7 +8645,7 @@ mod tests {
         let parked = app.park();
         assert!(app.annots.is_empty() && app.path.is_none() && app.selected.is_empty());
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(PathBuf::from("/b.pdf"));
         app.pages = vec![vec2(600.0, 800.0)];
@@ -8018,7 +8685,7 @@ mod tests {
                 let parked = app.park();
                 app.tabs[app.cur_tab].parked = Some(parked);
                 app.trim_parked_tex();
-                app.tabs.push(Tab { parked: None });
+                app.tabs.push(Tab::default());
                 app.cur_tab = i;
                 app.pages = vec![vec2(600.0, 800.0)];
                 app.page_y = vec![0.0];
@@ -8069,7 +8736,7 @@ mod tests {
         let mut parked = parked;
         app.leaving_shown_doc(&mut parked);
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(PathBuf::from("/b.pdf"));
         app.generation = 2;
@@ -8100,6 +8767,318 @@ mod tests {
         assert_eq!(app.with_other(|o| o.annots.len()), Some(1));
         app.toggle_split();
         assert!(app.other.is_none() && app.active_left);
+    }
+
+    fn three_pages(app: &mut App) {
+        app.pages = vec![vec2(600.0, 800.0); 3];
+        (app.page_y, app.doc_w, app.doc_h) = layout(&app.pages);
+    }
+
+    /// A page opened in a new tab: another view of the same document, sharing
+    /// its markups; closing one of its tabs leaves the document open.
+    #[test]
+    fn a_page_opens_in_a_tab_of_its_own_on_the_same_document() {
+        let mut app = app();
+        three_pages(&mut app);
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        let a = rect(&mut app, 100.0, 100.0);
+        app.zoom = 2.0;
+        let first_view = app.view_id;
+        app.open_page_in_tab(2);
+        assert_eq!((app.tabs.len(), app.cur_tab), (2, 1));
+        assert_eq!(app.current_page(), 2);
+        assert_ne!(app.view_id, first_view, "a view of its own");
+        assert_eq!(app.tab_name(0), "a.pdf");
+        assert_eq!((app.tab_page(0), app.tab_page(1)), (Some(0), Some(2)), "told apart by page");
+        // Markups are shared: one added here is there in the first tab.
+        let b = rect(&mut app, 200.0, 2 as f32 * 810.0 + 100.0);
+        app.switch_tab(0);
+        assert_eq!((app.cur_tab, app.view_id, app.current_page()), (0, first_view, 0));
+        assert!(app.find(a).is_some() && app.find(b).is_some());
+        // A second document, then back to the page tab: the document comes with it.
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab::default());
+        app.cur_tab = 2;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.switch_tab(1);
+        assert_eq!((app.cur_tab, app.path.clone(), app.current_page(), app.annots.len()), (1, Some(PathBuf::from("/a.pdf")), 2, 2));
+        assert!(app.tabs[0].view_of.is_some() && app.tabs[0].parked.is_none(), "the first tab keeps only its view");
+        assert_eq!(app.tab_name(0), "a.pdf");
+        assert_eq!(app.tab_page(0), Some(0));
+        // Closing a background tab that holds a document's state hands it on.
+        app.switch_tab(2);
+        assert!(app.tabs[1].parked.is_some());
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 2);
+        assert!(app.tabs[0].parked.is_some(), "the remaining tab of a.pdf holds it now");
+        assert_eq!(app.tab_page(0), None, "one tab: no page shown");
+        app.switch_tab(0);
+        assert_eq!((app.path.clone(), app.annots.len(), app.current_page()), (Some(PathBuf::from("/a.pdf")), 2, 0));
+        // And closing the shown one of two tabs on a document keeps the document.
+        app.open_page_in_tab(1);
+        app.close_tab(1);
+        assert_eq!((app.tabs.len(), app.cur_tab, app.current_page(), app.annots.len()), (2, 0, 0, 2));
+        assert!(app.tabs.iter().all(|t| t.view_of.is_none()));
+    }
+
+    /// Closing the shown document's tab when its neighbour is another view of a
+    /// background document shows that document.
+    #[test]
+    fn closing_beside_a_page_tab_brings_its_document() {
+        let mut app = app();
+        three_pages(&mut app);
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        rect(&mut app, 100.0, 100.0);
+        app.open_page_in_tab(2);
+        // b.pdf opens after a's two tabs, and is closed.
+        let parked = app.park();
+        app.tabs[1].parked = Some(parked);
+        app.tabs.push(Tab::default());
+        app.cur_tab = 2;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.close_tab(2);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.cur_tab, 1);
+        assert_eq!((app.path.clone(), app.annots.len()), (Some(PathBuf::from("/a.pdf")), 1));
+    }
+
+    /// A page opened in split view: the other pane shows it, this one stays put.
+    #[test]
+    fn a_page_opens_in_split_view() {
+        let mut app = app();
+        three_pages(&mut app);
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        let view = app.view_id;
+        app.overview = true;
+        app.open_page_in_split(2);
+        assert!(!app.overview);
+        assert_eq!(app.other.as_ref().map(|o| (o.doc, o.page)), Some((None, Some(2))));
+        let ui_ctx = egui::Context::default();
+        install_fonts(&ui_ctx);
+        let _ = ui_ctx.run_ui(Default::default(), |ui| {
+            app.paint_other(ui, Rect::from_min_size(pos2(500.0, 0.0), vec2(500.0, 1000.0)), 0.0);
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(app.with_other(|o| o.current_page()), Some(2));
+        assert_eq!((app.view_id, app.current_page(), app.active_left), (view, 0, true));
+    }
+
+    #[test]
+    fn exports_say_so_in_a_notice_with_the_file() {
+        let mut app = app();
+        app.status = "Exporting…".into();
+        app.status_until = f64::INFINITY;
+        app.exported(Ok((PathBuf::from("/x/a_marked.pdf"), 0)));
+        let n = app.notice.as_ref().unwrap();
+        assert!(n.ok && n.until.is_nan() && n.file == Some(PathBuf::from("/x/a_marked.pdf")));
+        assert!(n.body.starts_with("a_marked.pdf"));
+        assert_eq!(app.status_until, 0.0, "Exporting… is cleared");
+        app.exported(Err("disk full".into()));
+        let n = app.notice.as_ref().unwrap();
+        assert!(!n.ok && n.until == f64::INFINITY && n.file.is_none(), "failures stay until closed");
+    }
+
+    #[test]
+    fn text_sizes_go_from_4_to_72_and_fit_the_box() {
+        let mut app = app();
+        app.set_text_size(2.0);
+        assert_eq!(app.text_size, annot::TEXT_SIZE_MIN);
+        app.set_text_size(100.0);
+        assert_eq!(app.text_size, annot::TEXT_SIZE_MAX);
+        app.set_text_size(30.0);
+        app.step_text_size(1);
+        assert_eq!(app.text_size, 32.0);
+        app.step_text_size(-1);
+        app.step_text_size(-1);
+        assert_eq!(app.text_size, 18.0);
+        app.set_text_size(12.0);
+        // A note in a box drawn wider than its words: fitting grows them to fill it.
+        app.set_tool(Tool::Text);
+        // (Drawn no taller than a line: no height of its own, so the text fills the width.)
+        let (from, to) = (app.page_to_screen(0, pos2(100.0, 100.0)), app.page_to_screen(0, pos2(500.0, 115.0)));
+        drag(&mut app, from, to, Mods::default());
+        let id = app.editing.unwrap();
+        app.find_mut(id).unwrap().kind = Kind::Text { pos: pos2(100.0, 100.0), box_w: 400.0, text: "Seal the sill".into(), size: 12.0 };
+        app.commit_edit();
+        app.selected = vec![id];
+        app.fit_text_to_box();
+        let a = app.find(id).unwrap();
+        let size = a.text_size().unwrap();
+        assert!(size > 24.0, "grew to {size}");
+        assert!(a.text_box().unwrap().width() <= 400.0 && a.wrap_w == Some(400.0));
+        let lines = annot::NoteLayout::new("Seal the sill", size, a.text_box().unwrap().width(), &a.style).lines.len();
+        assert_eq!(lines, 1, "still on one line");
+        assert_eq!(app.text_size, size, "the toolbar shows it");
+        app.undo();
+        assert_eq!(app.find(id).unwrap().text_size(), Some(12.0));
+    }
+
+    /// A click with T puts the first line of text where it was clicked, not the box's corner.
+    #[test]
+    fn a_clicked_note_starts_where_it_was_clicked() {
+        let mut app = app();
+        app.set_tool(Tool::Text);
+        let at = pos2(200.0, 300.0);
+        app.click(app.page_to_screen(0, at), false, Mods::default());
+        let a = app.find(app.editing.unwrap()).unwrap();
+        let Kind::Text { pos, size, .. } = a.kind else { panic!() };
+        let first_line_mid = pos + vec2(annot::pad(size), annot::pad(size) + annot::line_h(size) / 2.0);
+        assert!((first_line_mid - at).length() < 0.01);
+    }
+
+    #[test]
+    fn copied_markups_paste_where_the_pointer_is_and_text_becomes_a_note() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        let a = rect(&mut app, 100.0, 100.0);
+        app.selected = vec![a];
+        app.copy_selection(&ctx, false);
+        let (text, _) = app.clip.clone().unwrap();
+        assert_eq!(text, "Rectangle");
+        let bb = app.find(a).unwrap().bounds();
+        let at = app.page_to_screen(0, pos2(300.0, 400.0));
+        app.paste(text.clone(), Some(at));
+        assert_eq!(app.annots.len(), 2);
+        let b = app.selected[0];
+        assert_ne!(a, b);
+        assert!((app.find(b).unwrap().bounds().min - pos2(300.0, 400.0)).length() < 0.01);
+        assert_eq!(app.find(b).unwrap().bounds().size(), bb.size());
+        // Pointer off the sheets: beside the original, a step further each time.
+        app.paste(text.clone(), None);
+        app.paste(text, None);
+        let mins: Vec<Pos2> = app.annots[2..].iter().map(|a| a.bounds().min).collect();
+        assert!(mins[0] != bb.min && mins[1] != mins[0]);
+        // Cut takes them away.
+        app.selected = vec![a];
+        app.copy_selection(&ctx, true);
+        assert!(app.find(a).is_none());
+        // Text copied in another program: a note with it, at the pointer.
+        app.paste("Check flashing\r".into(), Some(at));
+        let n = app.find(app.selected[0]).unwrap();
+        assert_eq!(n.text(), "Check flashing");
+        assert!(n.text_box().unwrap().contains(pos2(300.0, 400.0)));
+        assert!(app.editing.is_none());
+    }
+
+    /// A note's box given a height (its bottom edge dragged) keeps its size,
+    /// and fitting finds the biggest text that wraps into it.
+    #[test]
+    fn a_box_with_a_height_keeps_it_and_fits_its_text() {
+        let mut app = app();
+        let id = app.add(0, Kind::Text { pos: pos2(100.0, 100.0), box_w: 200.0, text: "Seal the head flashing to the jamb at each window".into(), size: 12.0 });
+        app.selected = vec![id];
+        let r = app.find(id).unwrap().text_box().unwrap();
+        // Drag the bottom edge down to make it 150 tall.
+        let (h, _) = App::handles(app.find(id).unwrap()).into_iter().find(|(h, _)| matches!(h, Handle::BoxHeight)).unwrap();
+        App::apply_handle(app.find_mut(id).unwrap(), h, pos2(r.center().x, r.min.y + 150.0));
+        let a = app.find_mut(id).unwrap();
+        a.fit_box_w();
+        assert_eq!(a.text_box().unwrap().size(), vec2(200.0, 150.0), "kept, not shrunk to the text");
+        app.fit_text_to_box();
+        let a = app.find(id).unwrap();
+        let size = a.text_size().unwrap();
+        assert!(size > 12.0, "grew to {size}");
+        assert_eq!(a.text_box().unwrap().size(), vec2(200.0, 150.0), "the box stays as it was");
+        // The biggest: half a point more wouldn't fit.
+        let mut bigger = a.clone();
+        if let Kind::Text { size: s, .. } = &mut bigger.kind {
+            *s += 0.5;
+        }
+        assert!(bigger.text_box().unwrap().height() > 150.0 || {
+            let l = annot::NoteLayout::new(bigger.text(), size + 0.5, 200.0, &bigger.style);
+            (0..l.lines.len()).any(|i| l.line_width(i) + 2.0 * annot::pad(size + 0.5) > 200.0)
+        });
+    }
+
+    /// Text set left, centre or right across its box, top, middle or bottom down it.
+    #[test]
+    fn note_text_aligns_in_its_box() {
+        use annot::{HAlign, VAlign};
+        let mut app = app();
+        let id = app.add(0, Kind::Text { pos: pos2(100.0, 100.0), box_w: 300.0, text: "Short".into(), size: 12.0 });
+        app.find_mut(id).unwrap().style.box_h = Some(120.0);
+        app.selected = vec![id];
+        let first = |app: &App| {
+            app.find(id).unwrap().prims().iter().find_map(|p| match p {
+                Prim::Text { origin, .. } => Some(*origin),
+                _ => None,
+            })
+        };
+        let left = first(&app).unwrap();
+        app.set_align(Some(HAlign::Right), Some(VAlign::Bottom));
+        let right = first(&app).unwrap();
+        let w = annot::text_width("Short", 12.0);
+        assert!((right.x - (100.0 + 300.0 - annot::pad(12.0) - w)).abs() < 0.01);
+        assert!((right.y - (100.0 + 120.0 - annot::pad(12.0) - annot::line_h(12.0) + annot::ascent(12.0))).abs() < 0.01);
+        app.set_align(Some(HAlign::Center), Some(VAlign::Middle));
+        let mid = first(&app).unwrap();
+        assert!((mid.x - (left.x + right.x) / 2.0).abs() < 0.01);
+        assert!((mid.y - (left.y + right.y) / 2.0).abs() < 0.01);
+        // New notes take it too, and it's saved with the markups.
+        assert_eq!(app.text_align, (HAlign::Center, VAlign::Middle));
+        let json = serde_json::to_string(app.find(id).unwrap()).unwrap();
+        assert!(json.contains("\"align\":\"center\"") && json.contains("\"valign\":\"middle\""), "{json}");
+        let back: Annot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.style, app.find(id).unwrap().style);
+    }
+
+    #[test]
+    fn arrange_lines_markups_up_with_each_other_or_the_page() {
+        let mut app = app();
+        let a = rect(&mut app, 100.0, 100.0);
+        let b = rect(&mut app, 300.0, 400.0);
+        app.selected = vec![a, b];
+        let left = |app: &App, id| app.find(id).unwrap().bounds().min.x;
+        app.arrange_markups(Arrange::Left);
+        assert_eq!(left(&app, a), left(&app, b));
+        app.arrange_markups(Arrange::Bottom);
+        assert_eq!(app.find(a).unwrap().bounds().max.y, app.find(b).unwrap().bounds().max.y);
+        // One on its own: with the page.
+        app.selected = vec![a];
+        app.arrange_markups(Arrange::Right);
+        assert!((app.find(a).unwrap().bounds().max.x - 600.0).abs() < 0.01);
+        // The selection as a whole in the middle of the page, laid out as it was.
+        app.selected = vec![a, b];
+        let gap = app.find(b).unwrap().bounds().min - app.find(a).unwrap().bounds().min;
+        app.arrange_markups(Arrange::PageCenter);
+        let all = app.find(a).unwrap().bounds().union(app.find(b).unwrap().bounds());
+        assert!((all.center() - pos2(300.0, 400.0)).length() < 0.01);
+        assert_eq!(app.find(b).unwrap().bounds().min - app.find(a).unwrap().bounds().min, gap);
+        app.undo();
+        assert!((app.find(a).unwrap().bounds().max.x - 600.0).abs() < 0.01, "one undo step");
+    }
+
+    #[test]
+    fn shift_keeps_lines_and_moves_straight() {
+        assert_eq!(straight(pos2(0.0, 0.0), pos2(100.0, 8.0)), pos2(100.0, 0.0));
+        assert_eq!(straight(pos2(0.0, 0.0), pos2(-6.0, 50.0)).x.abs() < 1e-4, true);
+        let d = straight(pos2(0.0, 0.0), pos2(90.0, 110.0));
+        assert!((d.x - d.y).abs() < 1e-3 && d.x > 90.0, "45 degrees: {d:?}");
+        let mut app = app();
+        app.set_tool(Tool::Line);
+        app.shift = true;
+        let (from, to) = (app.page_to_screen(0, pos2(100.0, 100.0)), app.page_to_screen(0, pos2(300.0, 120.0)));
+        drag(&mut app, from, to, Mods { shift: true, add: true, ..Default::default() });
+        let Kind::Line { a, b } = app.annots[0].kind else { panic!() };
+        assert_eq!(a.y, b.y, "level");
+        // Moving with Shift: straight across from where it started.
+        app.set_tool(Tool::Select);
+        let id = app.annots[0].id;
+        app.selected = vec![id];
+        let before = app.annots[0].bounds().min;
+        let (from, to) = (app.page_to_screen(0, pos2(200.0, 100.0)), app.page_to_screen(0, pos2(205.0, 180.0)));
+        drag(&mut app, from, to, Mods { shift: true, add: true, ..Default::default() });
+        let after = app.annots[0].bounds().min;
+        assert!((after.x - before.x).abs() < 0.01 && (after.y - before.y - 80.0).abs() < 1.0, "{before:?} → {after:?}");
     }
 
     /// An image dropped on split screen goes to the pane it was dropped on,
@@ -8137,7 +9116,7 @@ mod tests {
         let mut parked = app.park();
         app.leaving_shown_doc(&mut parked);
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(PathBuf::from("/b.pdf"));
         app.generation = 2;
@@ -8177,7 +9156,7 @@ mod tests {
         let mut p = app.park();
         p.pages.clear();
         app.tabs[0].parked = Some(p);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.generation = 6;
         // What the worker sends for the first tab's document arrives while the second is shown.
@@ -8363,6 +9342,24 @@ mod tests {
                 Src::File { page, .. } => format!("f{page}"),
             })
             .collect()
+    }
+
+    /// A document's other tabs follow it when its pages are moved or added,
+    /// staying on the page they showed.
+    #[test]
+    fn other_tabs_on_a_document_follow_its_pages() {
+        let sizes = [vec2(600.0, 800.0); 3];
+        let mut app = with_pages(app(), &sizes);
+        app.path = Some(PathBuf::from("/nowhere/set.pdf"));
+        app.zoom = 2.0;
+        app.open_page_in_tab(2);
+        app.switch_tab(0);
+        assert_eq!(app.tab_page(1), Some(2));
+        app.insert_blank(0, false);
+        assert_eq!(app.tabs[1].view_of.as_ref().map(|v| v.0), Some(app.generation), "on the document's new generation");
+        assert_eq!(app.tab_page(1), Some(3), "still on the page it showed, now page 4");
+        app.switch_tab(1);
+        assert_eq!((app.cur_tab, app.current_page(), app.pages.len()), (1, 3, 4));
     }
 
     #[test]
@@ -8688,13 +9685,16 @@ mod tests {
         assert!(!app.markups_saved(), "not saving: the app exports what it has");
         app.cli_done.0.send((CliJob::Export, Ok(serde_json::json!({"file": "/x/doc_markup.pdf", "markups": 1, "characters_without_font": 0})))).unwrap();
         app.poll_cli();
-        assert!(app.status.contains("Exported → /x/doc_markup.pdf"), "{}", app.status);
+        let n = app.notice.take().unwrap();
+        assert!(n.ok && n.file == Some(PathBuf::from("/x/doc_markup.pdf")), "{}", n.body);
         app.cli_done.0.send((CliJob::Shrink, Ok(serde_json::json!({"file": "/x/doc_smaller.pdf", "bytes_before": 10_485_760, "bytes_after": 2_097_152, "images_recompressed": 3, "images_kept": 1, "check_pages": [2]})))).unwrap();
         app.poll_cli();
-        assert!(app.status.contains("10.0 MB → 2.0 MB (3 images); check page 2"), "{}", app.status);
+        let n = app.notice.take().unwrap();
+        assert!(n.body.contains("10.0 MB → 2.0 MB (3 images); check page 2"), "{}", n.body);
         app.cli_done.0.send((CliJob::Export, Err("disk full".into()))).unwrap();
         app.poll_cli();
-        assert!(app.status.contains("Export failed: disk full"), "{}", app.status);
+        let n = app.notice.take().unwrap();
+        assert!(!n.ok && n.title == "Export failed" && n.body == "disk full");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -8919,7 +9919,7 @@ mod tests {
         let mut parked = app.park();
         app.leaving_shown_doc(&mut parked);
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(PathBuf::from("/b.pdf"));
         app.generation = 2;
@@ -8954,7 +9954,7 @@ mod tests {
         let mut parked = app.park();
         app.leaving_shown_doc(&mut parked);
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(dir.join("b.pdf"));
         app.markups_file = Some(dir.join("b.json"));
@@ -8977,7 +9977,7 @@ mod tests {
         let mut parked = app.park();
         parked.path = Some(dir.join("b.pdf"));
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(dir.join("a.pdf"));
         app.markups_file = Some(dir.join("blocker").join("a.json"));
@@ -9003,7 +10003,7 @@ mod tests {
         let mut parked = app.park();
         app.leaving_shown_doc(&mut parked);
         app.tabs[0].parked = Some(parked);
-        app.tabs.push(Tab { parked: None });
+        app.tabs.push(Tab::default());
         app.cur_tab = 1;
         app.path = Some(PathBuf::from("/a.pdf"));
         app.generation = 2;

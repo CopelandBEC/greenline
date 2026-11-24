@@ -60,10 +60,43 @@ pub struct Style {
     /// is also how a version without runs shows it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<Run>,
+    /// Where a note's lines sit across its box, and its text up and down it.
+    #[serde(skip_serializing_if = "is_default")]
+    pub align: HAlign,
+    #[serde(skip_serializing_if = "is_default")]
+    pub valign: VAlign,
+    /// A note box's height as the user set it (the box is never shorter than
+    /// its text); `None`: as tall as the text. A box with a height keeps its width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_h: Option<f32>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// A note's lines: against the box's left, centred, or against its right.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// A note's text in a box taller than it: at the top, in the middle, or at the bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
 }
 
 /// How a character of a note is set: bold, italic, underlined.
@@ -371,6 +404,10 @@ impl NoteLayout {
     }
 }
 
+/// The text sizes a note or label may have, in points.
+pub const TEXT_SIZE_MIN: f32 = 4.0;
+pub const TEXT_SIZE_MAX: f32 = 72.0;
+
 pub fn default_box_w(size: f32) -> f32 {
     16.0 * size
 }
@@ -382,7 +419,11 @@ impl Annot {
     pub fn text_box(&self) -> Option<Rect> {
         match &self.kind {
             Kind::Callout { pos, box_w, text, size, .. } | Kind::Text { pos, box_w, text, size } => {
-                Some(box_of(*pos, *box_w, NoteLayout::new(text, *size, *box_w, &self.style).lines.len().max(1) as f32, *size))
+                let r = box_of(*pos, *box_w, NoteLayout::new(text, *size, *box_w, &self.style).lines.len().max(1) as f32, *size);
+                Some(match self.style.box_h {
+                    Some(h) if h > r.height() => Rect::from_min_size(r.min, vec2(r.width(), h)),
+                    _ => r,
+                })
             }
             _ => None,
         }
@@ -404,6 +445,10 @@ impl Annot {
 
     /// Shrink a text box to its widest wrapped line.
     pub fn fit_box_w(&mut self) {
+        // A box sized by hand keeps its size.
+        if self.style.box_h.is_some() {
+            return;
+        }
         let (Some(r), Some(size)) = (self.text_box(), self.text_size()) else { return };
         let text = match &self.kind {
             Kind::Callout { text, .. } | Kind::Text { text, .. } => text.clone(),
@@ -415,6 +460,64 @@ impl Annot {
         let fit = (widest + 2.0 * pad(size) + 0.5).max(4.0 * size);
         if fit < r.width() {
             self.set_box_w(fit);
+        }
+    }
+
+    /// Sizes a note's text to the biggest that fits its box. A box with a
+    /// height set: the text wraps in its width and fits its height. Otherwise
+    /// it fills the width it was given (else the box as it is), each line as
+    /// typed on one line. False if it isn't a note with text.
+    pub fn fit_text_to_box(&mut self) -> bool {
+        let (Some(r), Some(size)) = (self.text_box(), self.text_size()) else { return false };
+        let text = match &self.kind {
+            Kind::Callout { text, .. } | Kind::Text { text, .. } if !text.trim().is_empty() => text.clone(),
+            _ => return false,
+        };
+        let fit = if let Some(h) = self.style.box_h {
+            let w = r.width();
+            // Fits: as many lines as wrap at size s, none wider than the box (a long word can't wrap).
+            let fits = |s: f32| {
+                let l = NoteLayout::new(&text, s, w, &self.style);
+                let widest = (0..l.lines.len()).map(|i| l.line_width(i)).fold(0.0, f32::max);
+                2.0 * pad(s) + l.lines.len().max(1) as f32 * line_h(s) <= h + 0.01 && widest + 2.0 * pad(s) <= w + 0.01
+            };
+            // Half points, from the largest down: wrapping makes it no simple formula.
+            let mut s = TEXT_SIZE_MAX;
+            while s > TEXT_SIZE_MIN && !fits(s) {
+                s -= 0.5;
+            }
+            s
+        } else {
+            let target = self.wrap_w.unwrap_or(r.width());
+            // Widths go with the size: measure at this one, unwrapped, and scale.
+            let layout = NoteLayout::new(&text, size, 1e7, &self.style);
+            let widest = (0..layout.lines.len()).map(|i| layout.line_width(i)).fold(0.0, f32::max);
+            if widest <= 0.0 {
+                return false;
+            }
+            let per_pt = widest / size + 2.0 * pad(1.0);
+            self.set_box_w(target);
+            self.wrap_w = Some(target);
+            ((((target - 0.5) / per_pt) * 2.0).floor() / 2.0).clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX)
+        };
+        if let Kind::Callout { size, .. } | Kind::Text { size, .. } = &mut self.kind {
+            *size = fit;
+        }
+        self.fit_box_w();
+        true
+    }
+
+    /// How far down its box a note's first line starts, past the padding (its
+    /// text set top, middle or bottom in a box taller than the text).
+    pub fn text_drop(&self) -> f32 {
+        let (Some(r), Some(size)) = (self.text_box(), self.text_size()) else { return 0.0 };
+        let (Kind::Callout { text, box_w, .. } | Kind::Text { text, box_w, .. }) = &self.kind else { return 0.0 };
+        let lines = NoteLayout::new(text, size, *box_w, &self.style).lines.len().max(1) as f32;
+        let room = (r.height() - 2.0 * pad(size) - lines * line_h(size)).max(0.0);
+        match self.style.valign {
+            VAlign::Top => 0.0,
+            VAlign::Middle => room / 2.0,
+            VAlign::Bottom => room,
         }
     }
 
@@ -584,6 +687,8 @@ impl Annot {
         s.hatch.as_ref().map(|x| x.scale.to_bits()).hash(&mut h);
         (s.bold, s.italic, s.underline).hash(&mut h);
         s.runs.hash(&mut h);
+        (s.align, s.valign).hash(&mut h);
+        s.box_h.map(f32::to_bits).hash(&mut h);
         h.finish()
     }
 
@@ -796,12 +901,12 @@ impl Annot {
                 }
                 let fill = self.style.fill.unwrap_or(Fill { color: WHITE, alpha: 255 });
                 out.push(Prim::Fill { pts: rect_pts(r), color: fill.color, alpha: fill.alpha, outline: Some((c, w)) });
-                text_prims(&mut out, r, text, *size, c, &self.style);
+                text_prims(&mut out, r, self.text_drop(), text, *size, c, &self.style);
             }
             Kind::Text { text, size, .. } => {
                 let r = self.text_box().unwrap();
                 self.fill_prims(&mut out, rect_pts(r));
-                text_prims(&mut out, r, text, *size, c, &self.style);
+                text_prims(&mut out, r, self.text_drop(), text, *size, c, &self.style);
             }
             Kind::Cloud { rect } => {
                 let pts = cloud_pts(*rect);
@@ -916,15 +1021,22 @@ impl Annot {
     }
 }
 
-fn text_prims(out: &mut Vec<Prim>, r: Rect, text: &str, size: f32, color: Rgb, style: &Style) {
-    let x0 = r.min.x + pad(size);
+fn text_prims(out: &mut Vec<Prim>, r: Rect, drop: f32, text: &str, size: f32, color: Rgb, style: &Style) {
     let note = NoteLayout::new(text, size, r.width(), style);
+    let inner = r.width() - 2.0 * pad(size);
     for (i, line) in note.lines.iter().enumerate() {
         let chars = &note.chars[line.clone()];
         if chars.iter().all(|c| c.is_whitespace()) {
             continue;
         }
-        let y = r.min.y + pad(size) + i as f32 * line_h(size) + ascent(size);
+        let x0 = r.min.x
+            + pad(size)
+            + match style.align {
+                HAlign::Left => 0.0,
+                HAlign::Center => ((inner - note.line_width(i)) / 2.0).max(0.0),
+                HAlign::Right => (inner - note.line_width(i)).max(0.0),
+            };
+        let y = r.min.y + pad(size) + drop + i as f32 * line_h(size) + ascent(size);
         // Spaces at the end of a line aren't underlined.
         let ink_end = line.start + chars.iter().rposition(|c| !c.is_whitespace()).map_or(0, |k| k + 1);
         // One text prim per stretch set alike.
