@@ -1095,7 +1095,7 @@ impl App {
             return;
         }
         // Its document has another tab: only this view goes.
-        if let Some(g) = self.tab_doc(i) {
+        if self.tab_doc(i).is_some() {
             if let Some(k) = (0..self.tabs.len()).find(|&k| self.same_doc(i, k)) {
                 if i == self.cur_tab {
                     // The other tab is shown instead, this one left holding only its view.
@@ -3373,6 +3373,10 @@ impl App {
     /// or just beside where they were; text from elsewhere becomes a note.
     fn paste(&mut self, text: String, at: Option<Pos2>) {
         self.commit_edit();
+        // Split screen: into the pane the pointer is over, whichever is active.
+        if let Some(p) = at {
+            self.activate_pane_at(p);
+        }
         let target = at.filter(|p| self.canvas.contains(*p)).and_then(|p| self.page_at(p).map(|page| (page, self.screen_to_page(page, p))));
         // What's on the clipboard is still what was copied here: the markups.
         if let Some((_, copies)) = self.clip.as_ref().filter(|c| c.0 == text) {
@@ -4104,7 +4108,8 @@ impl App {
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
         // Kept straight, a line stopped at the page's edge stays straight: cut short along itself.
-        let end = if self.shift && matches!(self.tool, Tool::Line | Tool::Arrow) { clip_along(start, straight(start, end), bounds) } else { bounds.clamp(end) };
+        let straightened = matches!(self.tool, Tool::Line | Tool::Arrow | Tool::Length | Tool::Calibrate | Tool::Polyline) && self.building.is_none();
+        let end = if self.shift && straightened { straight_on(self.pages[page], start, end) } else { bounds.clamp(end) };
         if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion | Tool::Polyline | Tool::Polygon) {
             self.create_measure(page, start, end);
             return;
@@ -4195,7 +4200,7 @@ impl App {
             return;
         }
         let last = *pts.last().unwrap();
-        let p = if shift { straight(last, p) } else { p };
+        let p = if shift { straight_on(self.pages[page], last, p) } else { p };
         // egui counts any two clicks within 0.3 s as a double-click, wherever they
         // land: clicking corners out quickly would finish the line and start
         // another. Only a second click on the point just placed finishes it.
@@ -4260,7 +4265,7 @@ impl App {
             }
             return;
         }
-        let squared = if self.shift { straight(start, end) } else { end };
+        let squared = if self.shift { straight_on(self.pages[page], start, end) } else { end };
         match self.tool {
             Tool::Length => self.add_measure(page, vec![start, squared], false),
             Tool::Area => {
@@ -5080,7 +5085,7 @@ impl App {
             let drag = if self.inactive { &Drag::None } else { &self.drag };
             match drag {
                 Drag::Create { page, start, cur } if *page == i && self.building.is_none() => {
-                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline | Tool::Line | Tool::Arrow) { straight(*start, *cur) } else { *cur };
+                    let cur = if self.shift && matches!(self.tool, Tool::Length | Tool::Calibrate | Tool::Polyline | Tool::Line | Tool::Arrow) { straight_on(self.pages[i], *start, *cur) } else { *cur };
                     let preview = self.preview_kind(*start, cur);
                     if let Some(kind) = preview {
                         let color = if matches!(self.tool, Tool::Calibrate | Tool::ScaleRegion) { [0, 150, 255] } else { self.color() };
@@ -5119,7 +5124,7 @@ impl App {
                 let mut closing = false;
                 if let Some(h) = self.hover.filter(|h| self.page_at(*h) == Some(*page)) {
                     let h = self.screen_to_page(i, h);
-                    let h = if self.shift { straight(*pts.last().unwrap(), h) } else { h };
+                    let h = if self.shift { straight_on(self.pages[i], *pts.last().unwrap(), h) } else { h };
                     closing = self.closes_on(&pts, h);
                     if !closing {
                         pts.push(h);
@@ -7371,7 +7376,6 @@ fn cached_triangles(pts: &[Pos2]) -> Option<Triangles> {
     })
 }
 
-/// `p` moved onto the horizontal or vertical through `from`, whichever is nearer.
 /// The point on the way from `from` (on the page) to `to` where it leaves
 /// `bounds`, or `to` if it stays inside.
 fn clip_along(from: Pos2, to: Pos2, bounds: Rect) -> Pos2 {
@@ -7386,6 +7390,12 @@ fn clip_along(from: Pos2, to: Pos2, bounds: Rect) -> Pos2 {
         }
     }
     from + d * t.max(0.0)
+}
+
+/// `straight`, stopped where it leaves a page of `size` (cut short along itself,
+/// so it keeps its angle).
+fn straight_on(size: Vec2, from: Pos2, p: Pos2) -> Pos2 {
+    clip_along(from, straight(from, p), Rect::from_min_size(Pos2::ZERO, size))
 }
 
 /// `p` brought round to the nearest of across, up and down, or a 45° diagonal
@@ -9134,6 +9144,59 @@ mod tests {
         let Kind::Line { a, b } = app.annots[0].kind else { panic!() };
         assert!(((b.x - a.x) - (b.y - a.y)).abs() < 0.01, "45 degrees: {a:?} {b:?}");
         assert!((b.x - 600.0).abs() < 0.01, "stopped at the edge");
+    }
+
+    #[test]
+    fn a_straight_measurement_stops_at_the_page_edge() {
+        let mut app = app();
+        app.set_tool(Tool::Length);
+        app.shift = true;
+        let (from, to) = (app.page_to_screen(0, pos2(300.0, 100.0)), app.page_to_screen(0, pos2(590.0, 600.0)));
+        drag(&mut app, from, to, Mods { shift: true, add: true, ..Default::default() });
+        let Some(Kind::Measure { pts, .. }) = app.annots.last().map(|a| &a.kind) else { panic!("a measurement") };
+        let (a, b) = (pts[0], pts[1]);
+        assert!(((b.x - a.x) - (b.y - a.y)).abs() < 0.01, "45 degrees: {a:?} {b:?}");
+        assert!((b.x - 600.0).abs() < 0.01, "stopped at the edge: {b:?}");
+        // Clicked out point by point, the next point stops at the edge too.
+        assert!((straight_on(vec2(600.0, 800.0), pos2(300.0, 100.0), pos2(590.0, 600.0)) - pos2(600.0, 400.0)).length() < 0.01);
+    }
+
+    /// Ctrl+V on split screen goes to the pane under the pointer, even when
+    /// that isn't the active one.
+    #[test]
+    fn paste_goes_to_the_pane_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.toggle_split();
+        let (left, right) = (Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 800.0)), Rect::from_min_max(pos2(402.0, 0.0), pos2(800.0, 800.0)));
+        app.canvas = left;
+        app.other.as_mut().unwrap().view.canvas = right;
+        // a in the other pane on the right, b here on the left.
+        app.activate_other();
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab::default());
+        app.cur_tab = 1;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.pages = vec![vec2(600.0, 800.0)];
+        app.page_y = vec![0.0];
+        app.canvas = left;
+        app.with_other(|o| o.canvas = right);
+        let r = rect(&mut app, 100.0, 100.0);
+        app.selected = vec![r];
+        app.copy_selection(&ctx, false);
+        let text = app.clip.clone().unwrap().0;
+        let b_count = app.annots.len();
+        let over_a = pos2(500.0, 100.0);
+        app.paste(text, Some(over_a));
+        assert_eq!(app.path, Some(PathBuf::from("/a.pdf")), "a is the active one now");
+        assert_eq!(app.annots.len(), 1, "pasted into a");
+        app.activate_other();
+        assert_eq!((app.path.clone(), app.annots.len()), (Some(PathBuf::from("/b.pdf")), b_count), "b unchanged");
     }
 
     #[test]
