@@ -1101,12 +1101,10 @@ impl App {
                     // The other tab is shown instead, this one left holding only its view.
                     self.trade_view(k);
                 } else if let Some(mut p) = self.tabs[i].parked.take() {
-                    // It holds the document's state: hand that on (with the other tab's view,
-                    // unless the other pane shows the document, whose view this is).
+                    // It holds the document's state: hand that on, the other tab keeping its
+                    // own view (split screen's other pane, if it showed this tab, shows that).
                     if let Some((_, v)) = self.tabs[k].view_of.take() {
-                        if !self.other.as_ref().is_some_and(|o| o.doc == Some(g)) {
-                            p.view = v;
-                        }
+                        p.view = v;
                     }
                     self.tabs[k].parked = Some(p);
                 }
@@ -3346,7 +3344,7 @@ impl App {
             let mut b = Annot { id, group, ..a };
             // Into another document: onto a page it has.
             b.page = page.unwrap_or(b.page).min(last);
-            b.translate(d);
+            b.translate_whole(d);
             self.annots.push(b);
             self.selected.push(id);
         }
@@ -3387,7 +3385,7 @@ impl App {
                     let d = vec2(12.0, 12.0) / self.zoom.max(0.1);
                     // Each paste a step further on, so they don't stack.
                     if let Some(c) = self.clip.as_mut() {
-                        c.1.iter_mut().for_each(|a| a.translate(d));
+                        c.1.iter_mut().for_each(|a| a.translate_whole(d));
                     }
                     self.add_copies(copies, None, d);
                 }
@@ -3462,7 +3460,7 @@ impl App {
                 Arrange::PageCenter => to.center() - b.center(),
             };
             for a in self.annots.iter_mut().filter(|a| ids.contains(&a.id)) {
-                a.translate(d);
+                a.translate_whole(d);
             }
         }
         self.changed();
@@ -4105,8 +4103,8 @@ impl App {
 
     fn create(&mut self, page: usize, start: Pos2, end: Pos2, dragged: bool) {
         let bounds = Rect::from_min_size(Pos2::ZERO, self.pages[page]);
-        let end = if self.shift && matches!(self.tool, Tool::Line | Tool::Arrow) { straight(start, end) } else { end };
-        let end = bounds.clamp(end);
+        // Kept straight, a line stopped at the page's edge stays straight: cut short along itself.
+        let end = if self.shift && matches!(self.tool, Tool::Line | Tool::Arrow) { clip_along(start, straight(start, end), bounds) } else { bounds.clamp(end) };
         if matches!(self.tool, Tool::Length | Tool::Area | Tool::Calibrate | Tool::ScaleRegion | Tool::Polyline | Tool::Polygon) {
             self.create_measure(page, start, end);
             return;
@@ -7374,6 +7372,22 @@ fn cached_triangles(pts: &[Pos2]) -> Option<Triangles> {
 }
 
 /// `p` moved onto the horizontal or vertical through `from`, whichever is nearer.
+/// The point on the way from `from` (on the page) to `to` where it leaves
+/// `bounds`, or `to` if it stays inside.
+fn clip_along(from: Pos2, to: Pos2, bounds: Rect) -> Pos2 {
+    let from = bounds.clamp(from);
+    let d = to - from;
+    let mut t: f32 = 1.0;
+    for (dv, lo, hi, f) in [(d.x, bounds.min.x, bounds.max.x, from.x), (d.y, bounds.min.y, bounds.max.y, from.y)] {
+        if dv > 0.0 {
+            t = t.min((hi - f) / dv);
+        } else if dv < 0.0 {
+            t = t.min((lo - f) / dv);
+        }
+    }
+    from + d * t.max(0.0)
+}
+
 /// `p` brought round to the nearest of across, up and down, or a 45° diagonal
 /// from `from` (Shift while drawing, measuring or moving).
 fn straight(from: Pos2, p: Pos2) -> Pos2 {
@@ -9055,6 +9069,71 @@ mod tests {
         assert_eq!(app.find(b).unwrap().bounds().min - app.find(a).unwrap().bounds().min, gap);
         app.undo();
         assert!((app.find(a).unwrap().bounds().max.x - 600.0).abs() < 0.01, "one undo step");
+    }
+
+    /// Codex's review: the three things it found, each staying fixed.
+    #[test]
+    fn a_tab_left_when_its_other_closes_keeps_its_own_view() {
+        let mut app = app();
+        three_pages(&mut app);
+        app.path = Some(PathBuf::from("/a.pdf"));
+        app.generation = 1;
+        app.last_generation = 1;
+        app.zoom = 2.0;
+        app.open_page_in_tab(2);
+        app.switch_tab(0);
+        // a's first tab in the other pane, b shown in this one.
+        app.toggle_split();
+        let mut parked = app.park();
+        app.leaving_shown_doc(&mut parked);
+        app.tabs[0].parked = Some(parked);
+        app.tabs.push(Tab::default());
+        app.cur_tab = 2;
+        app.path = Some(PathBuf::from("/b.pdf"));
+        app.generation = 2;
+        app.close_tab(0);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tab_page(0), None);
+        assert_eq!(app.with_other(|o| o.current_page()), Some(2), "a's remaining tab, on its own page, in the pane");
+    }
+
+    #[test]
+    fn pasted_and_arranged_callouts_take_their_arrows_along() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.path = Some(PathBuf::from("/a.pdf"));
+        let id = callout(&mut app, pos2(100.0, 100.0), pos2(200.0, 50.0));
+        app.commit_edit();
+        if let Some(Kind::Callout { text, .. }) = app.find_mut(id).map(|a| &mut a.kind) {
+            *text = "Seal".into();
+        }
+        let anchor = |a: &Annot| match a.kind {
+            Kind::Callout { anchor, pos, .. } => anchor - pos,
+            _ => panic!(),
+        };
+        let before = anchor(app.find(id).unwrap());
+        app.selected = vec![id];
+        app.copy_selection(&ctx, false);
+        let text = app.clip.clone().unwrap().0;
+        app.paste(text, Some(app.page_to_screen(0, pos2(300.0, 500.0))));
+        let copy = app.selected[0];
+        assert_eq!(anchor(app.find(copy).unwrap()), before, "arrow and box moved together");
+        app.selected = vec![copy];
+        app.arrange_markups(Arrange::Left);
+        assert_eq!(anchor(app.find(copy).unwrap()), before);
+        assert!(app.find(copy).unwrap().bounds().min.x.abs() < 0.01);
+    }
+
+    #[test]
+    fn a_straight_line_stopped_at_the_page_edge_stays_straight() {
+        let mut app = app();
+        app.set_tool(Tool::Line);
+        app.shift = true;
+        let (from, to) = (app.page_to_screen(0, pos2(300.0, 100.0)), app.page_to_screen(0, pos2(590.0, 600.0)));
+        drag(&mut app, from, to, Mods { shift: true, add: true, ..Default::default() });
+        let Kind::Line { a, b } = app.annots[0].kind else { panic!() };
+        assert!(((b.x - a.x) - (b.y - a.y)).abs() < 0.01, "45 degrees: {a:?} {b:?}");
+        assert!((b.x - 600.0).abs() < 0.01, "stopped at the edge");
     }
 
     #[test]

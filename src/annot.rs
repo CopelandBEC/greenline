@@ -765,6 +765,16 @@ impl Annot {
         }
     }
 
+    /// Moves the whole markup, a callout's arrow tips too (`translate` moves
+    /// only its box, so dragging a note leaves its arrows on what they point at).
+    pub fn translate_whole(&mut self, d: Vec2) {
+        if let Kind::Callout { anchor, leaders, .. } = &mut self.kind {
+            *anchor += d;
+            leaders.iter_mut().for_each(|t| *t += d);
+        }
+        self.translate(d);
+    }
+
     /// Distance (view points) from `p` to the annotation; 0 when inside a filled area.
     pub fn distance(&self, p: Pos2) -> f32 {
         if let Some(r) = self.text_box() {
